@@ -8,6 +8,8 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"regexp"
+	"runtime"
 	"strings"
 
 	"github.com/google/syzkaller/pkg/config"
@@ -16,6 +18,25 @@ import (
 	_ "github.com/google/syzkaller/sys" // most mgrconfig users want targets too
 	"github.com/google/syzkaller/sys/targets"
 )
+
+// Derived config values that are handy to keep with the config, filled after reading user config.
+type Derived struct {
+	Target    *prog.Target
+	SysTarget *targets.Target
+
+	// Parsed Target:
+	TargetOS     string
+	TargetArch   string
+	TargetVMArch string
+
+	// Full paths to binaries we are going to use:
+	FuzzerBin   string
+	ExecprogBin string
+	ExecutorBin string
+
+	Syscalls []int
+	Timeouts targets.Timeouts
+}
 
 func LoadData(data []byte) (*Config, error) {
 	cfg, err := LoadPartialData(data)
@@ -57,30 +78,45 @@ func LoadPartialFile(filename string) (*Config, error) {
 
 func defaultValues() *Config {
 	return &Config{
-		SSHUser:   "root",
-		Cover:     true,
-		Reproduce: true,
-		Sandbox:   "none",
-		RPC:       ":0",
-		Procs:     1,
+		SSHUser:      "root",
+		Cover:        true,
+		Reproduce:    true,
+		Sandbox:      "none",
+		RPC:          ":0",
+		MaxCrashLogs: 100,
+		Procs:        6,
 	}
 }
 
 func loadPartial(cfg *Config) (*Config, error) {
 	var err error
-	cfg.TargetOS, cfg.TargetVMArch, cfg.TargetArch, err = splitTarget(cfg.Target)
+	cfg.TargetOS, cfg.TargetVMArch, cfg.TargetArch, err = splitTarget(cfg.RawTarget)
 	if err != nil {
 		return nil, err
+	}
+	cfg.Target, err = prog.GetTarget(cfg.TargetOS, cfg.TargetArch)
+	if err != nil {
+		return nil, err
+	}
+	cfg.SysTarget = targets.Get(cfg.TargetOS, cfg.TargetVMArch)
+	if cfg.SysTarget == nil {
+		return nil, fmt.Errorf("unsupported OS/arch: %v/%v", cfg.TargetOS, cfg.TargetVMArch)
 	}
 	return cfg, nil
 }
 
 func Complete(cfg *Config) error {
-	if cfg.TargetOS == "" || cfg.TargetVMArch == "" || cfg.TargetArch == "" {
-		return fmt.Errorf("target parameters are not filled in")
-	}
-	if cfg.Workdir == "" {
-		return fmt.Errorf("config param workdir is empty")
+	if err := checkNonEmpty(
+		cfg.TargetOS, "target",
+		cfg.TargetVMArch, "target",
+		cfg.TargetArch, "target",
+		cfg.Workdir, "workdir",
+		cfg.Syzkaller, "syzkaller",
+		cfg.HTTP, "http",
+		cfg.Type, "type",
+		cfg.SSHUser, "ssh_user",
+	); err != nil {
+		return err
 	}
 	cfg.Workdir = osutil.Abs(cfg.Workdir)
 	if cfg.WorkdirTemplate != "" {
@@ -89,40 +125,82 @@ func Complete(cfg *Config) error {
 			return fmt.Errorf("failed to read workdir_template: %v", err)
 		}
 	}
-	if cfg.Syzkaller == "" {
-		return fmt.Errorf("config param syzkaller is empty")
+	if cfg.Image != "" {
+		if !osutil.IsExist(cfg.Image) {
+			return fmt.Errorf("bad config param image: can't find %v", cfg.Image)
+		}
+		cfg.Image = osutil.Abs(cfg.Image)
 	}
-	if err := completeBinaries(cfg); err != nil {
+	if err := cfg.completeBinaries(); err != nil {
 		return err
 	}
-	if cfg.HTTP == "" {
-		return fmt.Errorf("config param http is empty")
-	}
-	if cfg.Type == "" {
-		return fmt.Errorf("config param type is empty")
-	}
-	if cfg.Procs < 1 || cfg.Procs > 32 {
-		return fmt.Errorf("bad config param procs: '%v', want [1, 32]", cfg.Procs)
+	if cfg.Procs < 1 || cfg.Procs > prog.MaxPids {
+		return fmt.Errorf("bad config param procs: '%v', want [1, %v]", cfg.Procs, prog.MaxPids)
 	}
 	switch cfg.Sandbox {
 	case "none", "setuid", "namespace", "android":
 	default:
 		return fmt.Errorf("config param sandbox must contain one of none/setuid/namespace/android")
 	}
-	if err := checkSSHParams(cfg); err != nil {
+	if err := cfg.checkSSHParams(); err != nil {
 		return err
 	}
 	cfg.CompleteKernelDirs()
 
-	if cfg.HubClient != "" && (cfg.Name == "" || cfg.HubAddr == "" || cfg.HubKey == "") {
-		return fmt.Errorf("hub_client is set, but name/hub_addr/hub_key is empty")
+	if cfg.HubClient != "" {
+		if err := checkNonEmpty(
+			cfg.Name, "name",
+			cfg.HubAddr, "hub_addr",
+			cfg.HubKey, "hub_key",
+		); err != nil {
+			return err
+		}
 	}
-	if cfg.DashboardClient != "" && (cfg.Name == "" ||
-		cfg.DashboardAddr == "" ||
-		cfg.DashboardKey == "") {
-		return fmt.Errorf("dashboard_client is set, but name/dashboard_addr/dashboard_key is empty")
+	if cfg.HubDomain != "" &&
+		!regexp.MustCompile(`^[a-zA-Z0-9-_.]{2,50}(/[a-zA-Z0-9-_.]{2,50})?$`).MatchString(cfg.HubDomain) {
+		return fmt.Errorf("bad value for hub_domain")
 	}
+	if cfg.DashboardClient != "" {
+		if err := checkNonEmpty(
+			cfg.Name, "name",
+			cfg.DashboardAddr, "dashboard_addr",
+			cfg.DashboardKey, "dashboard_key",
+		); err != nil {
+			return err
+		}
+	}
+	var err error
+	cfg.Syscalls, err = ParseEnabledSyscalls(cfg.Target, cfg.EnabledSyscalls, cfg.DisabledSyscalls)
+	if err != nil {
+		return err
+	}
+	cfg.initTimeouts()
+	return nil
+}
 
+func (cfg *Config) initTimeouts() {
+	slowdown := 1
+	switch {
+	case cfg.Type == "qemu" && runtime.GOARCH != cfg.SysTarget.Arch && runtime.GOARCH != cfg.SysTarget.VMArch:
+		// Assuming qemu emulation.
+		// Quick tests of mmap syscall on arm64 show ~9x slowdown.
+		slowdown = 10
+	case cfg.Type == "gvisor" && cfg.Cover && strings.Contains(cfg.Name, "-race"):
+		// Go coverage+race has insane slowdown of ~350x. We can't afford such large value,
+		// but a smaller value should be enough to finish at least some syscalls.
+		// Note: the name check is a hack.
+		slowdown = 10
+	}
+	// Note: we could also consider heavy debug tools (KASAN/KMSAN/KCSAN/KMEMLEAK) if necessary.
+	cfg.Timeouts = cfg.SysTarget.Timeouts(slowdown)
+}
+
+func checkNonEmpty(fields ...string) error {
+	for i := 0; i < len(fields); i += 2 {
+		if fields[i] == "" {
+			return fmt.Errorf("config param %v is empty", fields[i+1])
+		}
+	}
 	return nil
 }
 
@@ -135,12 +213,10 @@ func (cfg *Config) CompleteKernelDirs() {
 	if cfg.KernelBuildSrc == "" {
 		cfg.KernelBuildSrc = cfg.KernelSrc
 	}
+	cfg.KernelBuildSrc = osutil.Abs(cfg.KernelBuildSrc)
 }
 
-func checkSSHParams(cfg *Config) error {
-	if cfg.SSHUser == "" {
-		return fmt.Errorf("bad config syzkaller param: ssh user is empty")
-	}
+func (cfg *Config) checkSSHParams() error {
 	if cfg.SSHKey == "" {
 		return nil
 	}
@@ -151,30 +227,31 @@ func checkSSHParams(cfg *Config) error {
 	if info.Mode()&0077 != 0 {
 		return fmt.Errorf("sshkey %v is unprotected, ssh will reject it, do chmod 0600", cfg.SSHKey)
 	}
+	cfg.SSHKey = osutil.Abs(cfg.SSHKey)
 	return nil
 }
 
-func completeBinaries(cfg *Config) error {
-	sysTarget := targets.Get(cfg.TargetOS, cfg.TargetArch)
-	if sysTarget == nil {
-		return fmt.Errorf("unsupported OS/arch: %v/%v", cfg.TargetOS, cfg.TargetArch)
-	}
+func (cfg *Config) completeBinaries() error {
 	cfg.Syzkaller = osutil.Abs(cfg.Syzkaller)
-	exe := sysTarget.ExeExtension
+	exe := cfg.SysTarget.ExeExtension
 	targetBin := func(name, arch string) string {
 		return filepath.Join(cfg.Syzkaller, "bin", cfg.TargetOS+"_"+arch, name+exe)
 	}
-	cfg.SyzFuzzerBin = targetBin("syz-fuzzer", cfg.TargetVMArch)
-	cfg.SyzExecprogBin = targetBin("syz-execprog", cfg.TargetVMArch)
-	cfg.SyzExecutorBin = targetBin("syz-executor", cfg.TargetArch)
-	if !osutil.IsExist(cfg.SyzFuzzerBin) {
-		return fmt.Errorf("bad config syzkaller param: can't find %v", cfg.SyzFuzzerBin)
+	cfg.FuzzerBin = targetBin("syz-fuzzer", cfg.TargetVMArch)
+	cfg.ExecprogBin = targetBin("syz-execprog", cfg.TargetVMArch)
+	cfg.ExecutorBin = targetBin("syz-executor", cfg.TargetArch)
+	// If the target already provides an executor binary, we don't need to copy it.
+	if cfg.SysTarget.ExecutorBin != "" {
+		cfg.ExecutorBin = ""
 	}
-	if !osutil.IsExist(cfg.SyzExecprogBin) {
-		return fmt.Errorf("bad config syzkaller param: can't find %v", cfg.SyzExecprogBin)
+	if !osutil.IsExist(cfg.FuzzerBin) {
+		return fmt.Errorf("bad config syzkaller param: can't find %v", cfg.FuzzerBin)
 	}
-	if !osutil.IsExist(cfg.SyzExecutorBin) {
-		return fmt.Errorf("bad config syzkaller param: can't find %v", cfg.SyzExecutorBin)
+	if !osutil.IsExist(cfg.ExecprogBin) {
+		return fmt.Errorf("bad config syzkaller param: can't find %v", cfg.ExecprogBin)
+	}
+	if cfg.ExecutorBin != "" && !osutil.IsExist(cfg.ExecutorBin) {
+		return fmt.Errorf("bad config syzkaller param: can't find %v", cfg.ExecutorBin)
 	}
 	return nil
 }
@@ -202,7 +279,7 @@ func ParseEnabledSyscalls(target *prog.Target, enabled, disabled []string) ([]in
 		for _, c := range enabled {
 			n := 0
 			for _, call := range target.Syscalls {
-				if matchSyscall(call.Name, c) {
+				if MatchSyscall(call.Name, c) {
 					syscalls[call.ID] = true
 					n++
 				}
@@ -224,7 +301,7 @@ func ParseEnabledSyscalls(target *prog.Target, enabled, disabled []string) ([]in
 	for _, c := range disabled {
 		n := 0
 		for _, call := range target.Syscalls {
-			if matchSyscall(call.Name, c) {
+			if MatchSyscall(call.Name, c) {
 				delete(syscalls, call.ID)
 				n++
 			}
@@ -243,7 +320,7 @@ func ParseEnabledSyscalls(target *prog.Target, enabled, disabled []string) ([]in
 	return arr, nil
 }
 
-func matchSyscall(name, pattern string) bool {
+func MatchSyscall(name, pattern string) bool {
 	if pattern == name || strings.HasPrefix(name, pattern+"$") {
 		return true
 	}

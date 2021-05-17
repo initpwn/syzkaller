@@ -8,6 +8,8 @@ at [BlueHatIL 2020](https://www.bluehatil.com)
 * [Bugs on the Windshield: Fuzzing the Windows Kernel](https://www.youtube.com/watch?v=__7PAzgbprw)
 at [BlueHatIL 2020](https://www.bluehatil.com)
 [[slides]](https://msrnd-cdn-stor.azureedge.net/bluehat/bluehatil/2019/assets/doc/Bugs%20on%20the%20Windshield%20Fuzzing%20the%20Windows%20Kernel.pdf)
+* [Fuzzing the OpenBSD Kernel](https://www.openbsd.org/papers/fuzz-slides.pdf)
+* [syzkaller in FreeBSD](https://papers.freebsd.org/2019/octvendorsummit/johnston-syzkaller/)
 * [Фаззинг ядра Linux на практике](http://0x1.tv/20191206AG) at ISPRASOPEN-2019 (in Russian)
 * [syzbot: update and open problems](https://linuxplumbersconf.org/event/4/contributions/428/attachments/308/515/syzbot__Plumbers_2019.pdf)
 at [Linux Plumbers 2019](https://linuxplumbersconf.org/event/4/contributions/428/)
@@ -39,12 +41,17 @@ at Linux Collaboration Summit 2013
 
 ## Articles
 
+* From [Collabora](https://twitter.com/Collabora):
+  * [syzkaller: fuzzing the kernel](https://www.collabora.com/news-and-blog/blog/2020/03/26/syzkaller-fuzzing-the-kernel/)
+  * [Using syzkaller to detect programming bugs in the Linux kernel](https://www.collabora.com/news-and-blog/blog/2020/04/17/using-syzkaller-to-detect-programming-bugs-in-linux/)
+  * [Using syzkaller: fuzzing your changes](https://www.collabora.com/news-and-blog/blog/2020/05/12/using-syzkaller-fuzzing-your-changes/)
 * From [HardenedLinux](https://github.com/hardenedlinux) project:
   * [Kernel QA with syzkaller and qemu](https://github.com/hardenedlinux/Debian-GNU-Linux-Profiles/blob/master/docs/harbian_qa/fuzz_testing/syzkaller_general.md) (tutorial on how to setup syzkaller with qemu)
   * [Syzkaller crash DEMO](https://github.com/hardenedlinux/Debian-GNU-Linux-Profiles/blob/master/docs/harbian_qa/fuzz_testing/syzkaller_crash_demo.md) (tutorial on how to extend syzkaller with new syscalls)
   * [Kernel debug tool with syzkaller](https://github.com/hardenedlinux/Debian-GNU-Linux-Profiles/blob/master/docs/harbian_qa/fuzz_testing/syz_debug.md) (debugging qemu VM created by syz-manager with gdb)
   * [Explanation of some syzkaller internals](https://github.com/hardenedlinux/Debian-GNU-Linux-Profiles/blob/master/docs/harbian_qa/fuzz_testing/syz_analysis.md)
   * [A example of fuzzing the ceph filesystem](https://github.com/hardenedlinux/Debian-GNU-Linux-Profiles/tree/master/docs/harbian_qa/fuzz_testing/syz_for_ceph)
+* [Exploiting the Linux kernel via packet sockets](https://googleprojectzero.blogspot.com/2017/05/exploiting-linux-kernel-via-packet.html)
 * [Coverage-guided kernel fuzzing with syzkaller](https://lwn.net/Articles/677764/) (by David Drysdale)
 * [Debugging a kernel crash found by syzkaller](http://vegardno.blogspot.de/2016/08/sync-debug.html) (by Quentin Casasnovas)
 

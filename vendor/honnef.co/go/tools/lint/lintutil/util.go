@@ -5,7 +5,7 @@
 // https://developers.google.com/open-source/licenses/bsd.
 
 // Package lintutil provides helpers for writing linter command lines.
-package lintutil
+package lintutil // import "honnef.co/go/tools/lint/lintutil"
 
 import (
 	"crypto/sha256"

@@ -10,13 +10,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/syzkaller/pkg/build"
 	"github.com/google/syzkaller/pkg/compiler"
 	"github.com/google/syzkaller/pkg/osutil"
+	"github.com/google/syzkaller/sys/targets"
 )
 
 type linux struct{}
 
-func (*linux) prepare(sourcedir string, build bool, arches []string) error {
+func (*linux) prepare(sourcedir string, build bool, arches []*Arch) error {
 	if sourcedir == "" {
 		return fmt.Errorf("provide path to kernel checkout via -sourcedir flag (or make extract SOURCEDIR)")
 	}
@@ -24,14 +26,19 @@ func (*linux) prepare(sourcedir string, build bool, arches []string) error {
 		// Run 'make mrproper', otherwise out-of-tree build fails.
 		// However, it takes unreasonable amount of time,
 		// so first check few files and if they are missing hope for best.
-		if osutil.IsExist(filepath.Join(sourcedir, ".config")) ||
-			osutil.IsExist(filepath.Join(sourcedir, "init/main.o")) ||
-			osutil.IsExist(filepath.Join(sourcedir, "include/generated/compile.h")) {
-			fmt.Printf("make mrproper\n")
-			out, err := osutil.RunCmd(time.Hour, sourcedir, "make", "mrproper",
-				"-j", fmt.Sprint(runtime.NumCPU()))
-			if err != nil {
-				return fmt.Errorf("make mrproper failed: %v\n%s", err, out)
+		for _, a := range arches {
+			arch := a.target.KernelArch
+			if osutil.IsExist(filepath.Join(sourcedir, ".config")) ||
+				osutil.IsExist(filepath.Join(sourcedir, "init/main.o")) ||
+				osutil.IsExist(filepath.Join(sourcedir, "include/config")) ||
+				osutil.IsExist(filepath.Join(sourcedir, "include/generated/compile.h")) ||
+				osutil.IsExist(filepath.Join(sourcedir, "arch", arch, "include", "generated")) {
+				fmt.Printf("make mrproper ARCH=%v\n", arch)
+				out, err := osutil.RunCmd(time.Hour, sourcedir, "make", "mrproper", "ARCH="+arch,
+					"-j", fmt.Sprint(runtime.NumCPU()))
+				if err != nil {
+					return fmt.Errorf("make mrproper failed: %v\n%s", err, out)
+				}
 			}
 		}
 	} else {
@@ -47,17 +54,20 @@ func (*linux) prepareArch(arch *Arch) error {
 	// So we create empty stubs in buildDir/syzkaller and add -IbuildDir/syzkaller
 	// as the last flag so it won't override real kernel headers.
 	for hdr, data := range map[string]string{
+		// This is the only compiler header kernel uses,
+		// need to provide it since we use -nostdinc below.
+		"stdarg.h": `
+#pragma once
+#define va_list __builtin_va_list
+#define va_start __builtin_va_start
+#define va_end __builtin_va_end
+#define va_arg __builtin_va_arg
+#define va_copy __builtin_va_copy
+#define __va_copy __builtin_va_copy
+`,
 		"asm/a.out.h": "",
 		"asm/prctl.h": "",
 		"asm/mce.h":   "",
-		"asm/kvm_host.h": `
-#define KVM_USER_MEM_SLOTS 1
-#define KVM_MAX_VCPUS 1
-struct kvm_vm_stat {};
-struct kvm_vcpu_stat {};
-struct kvm_arch {};
-struct kvm_vcpu_arch {};
-`,
 	} {
 		fullPath := filepath.Join(arch.buildDir, "syzkaller", hdr)
 		if err := osutil.MkdirAll(filepath.Dir(fullPath)); err != nil {
@@ -70,27 +80,13 @@ struct kvm_vcpu_arch {};
 	if !arch.build {
 		return nil
 	}
-	target := arch.target
-	var cflags []string
-	for _, flag := range target.CrossCFlags {
-		if !strings.HasPrefix(flag, "-W") {
-			cflags = append(cflags, flag)
-		}
-	}
 	kernelDir := arch.sourceDir
-	buildDir := arch.buildDir
-	makeArgs := []string{
-		"ARCH=" + target.KernelArch,
-		"CROSS_COMPILE=" + target.CCompilerPrefix,
-		"CFLAGS=" + strings.Join(cflags, " "),
-		"O=" + buildDir,
-		"-j", fmt.Sprint(runtime.NumCPU()),
-	}
+	makeArgs := build.LinuxMakeArgs(arch.target, "", "", arch.buildDir)
 	out, err := osutil.RunCmd(time.Hour, kernelDir, "make", append(makeArgs, "defconfig")...)
 	if err != nil {
 		return fmt.Errorf("make defconfig failed: %v\n%s", err, out)
 	}
-	_, err = osutil.RunCmd(time.Minute, buildDir, filepath.Join(kernelDir, "scripts", "config"),
+	_, err = osutil.RunCmd(time.Minute, arch.buildDir, filepath.Join(kernelDir, "scripts", "config"),
 		// powerpc arch is configured to be big-endian by default, but we want little-endian powerpc.
 		// Since all of our archs are little-endian for now, we just blindly switch it.
 		"-d", "CPU_BIG_ENDIAN", "-e", "CPU_LITTLE_ENDIAN",
@@ -102,6 +98,8 @@ struct kvm_vcpu_arch {};
 		// security/smack/smack.h requires this to build.
 		"-e", "SECURITY",
 		"-e", "SECURITY_SMACK",
+		// include/net/nl802154.h does not define some consts without this.
+		"-e", "IEEE802154", "-e", "IEEE802154_NL802154_EXPERIMENTAL",
 	)
 	if err != nil {
 		return err
@@ -118,13 +116,20 @@ struct kvm_vcpu_arch {};
 }
 
 func (*linux) processFile(arch *Arch, info *compiler.ConstInfo) (map[string]uint64, map[string]bool, error) {
+	if strings.HasSuffix(info.File, "_kvm.txt") &&
+		(arch.target.Arch == targets.ARM || arch.target.Arch == targets.RiscV64) {
+		// Hack: KVM is not supported on ARM anymore. We may want some more official support
+		// for marking descriptions arch-specific, but so far this combination is the only
+		// one. For riscv64, KVM is not supported yet but might be in the future.
+		// Note: syz-sysgen also ignores this file for arm and riscv64.
+		return nil, nil, nil
+	}
 	headerArch := arch.target.KernelHeaderArch
 	sourceDir := arch.sourceDir
 	buildDir := arch.buildDir
 	args := []string{
-		// This would be useful to ensure that we don't include any host headers,
-		// but kernel includes at least <stdarg.h>
-		// "-nostdinc",
+		// This makes the build completely hermetic, only kernel headers are used.
+		"-nostdinc",
 		"-w", "-fmessage-length=0",
 		"-O3", // required to get expected values for some __builtin_constant_p
 		"-I.",
@@ -133,6 +138,8 @@ func (*linux) processFile(arch *Arch, info *compiler.ConstInfo) (map[string]uint
 		"-I" + sourceDir + "/arch/" + headerArch + "/include",
 		"-I" + buildDir + "/arch/" + headerArch + "/include/generated/uapi",
 		"-I" + buildDir + "/arch/" + headerArch + "/include/generated",
+		"-I" + sourceDir + "/arch/" + headerArch + "/include/asm/mach-malta",
+		"-I" + sourceDir + "/arch/" + headerArch + "/include/asm/mach-generic",
 		"-I" + buildDir + "/include",
 		"-I" + sourceDir + "/include",
 		"-I" + sourceDir + "/arch/" + headerArch + "/include/uapi",
@@ -140,12 +147,11 @@ func (*linux) processFile(arch *Arch, info *compiler.ConstInfo) (map[string]uint
 		"-I" + sourceDir + "/include/uapi",
 		"-I" + buildDir + "/include/generated/uapi",
 		"-I" + sourceDir,
+		"-I" + sourceDir + "/include/linux",
 		"-I" + buildDir + "/syzkaller",
-		"-I" + sourceDir + "/arch/" + headerArch + "/include/asm/mach-malta",
-		"-I" + sourceDir + "/arch/" + headerArch + "/include/asm/mach-generic",
 		"-include", sourceDir + "/include/linux/kconfig.h",
 	}
-	args = append(args, arch.target.CrossCFlags...)
+	args = append(args, arch.target.CFlags...)
 	for _, incdir := range info.Incdirs {
 		args = append(args, "-I"+sourceDir+"/"+incdir)
 	}
@@ -157,8 +163,9 @@ func (*linux) processFile(arch *Arch, info *compiler.ConstInfo) (map[string]uint
 	params := &extractParams{
 		AddSource:      "#include <asm/unistd.h>",
 		ExtractFromELF: true,
+		TargetEndian:   arch.target.HostEndian,
 	}
-	cc := arch.target.CCompilerPrefix + "gcc"
+	cc := arch.target.CCompiler
 	res, undeclared, err := extract(info, cc, args, params)
 	if err != nil {
 		return nil, nil, err

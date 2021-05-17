@@ -153,7 +153,7 @@ func (b *builder) logicalBinop(fn *Function, e *ast.BinaryExpr) Value {
 	emitJump(fn, done, e)
 	fn.currentBlock = done
 
-	phi := &Phi{Edges: edges, Comment: e.Op.String()}
+	phi := &Phi{Edges: edges}
 	phi.typ = t
 	return done.emit(phi, e)
 }
@@ -223,7 +223,6 @@ func (b *builder) builtin(fn *Function, obj *types.Builtin, args []ast.Expr, typ
 				cap := m.Int64()
 				at := types.NewArray(typ.Underlying().(*types.Slice).Elem(), cap)
 				alloc := emitNew(fn, at, source)
-				alloc.Comment = "makeslice"
 				v := &Slice{
 					X:    alloc,
 					High: n,
@@ -259,7 +258,6 @@ func (b *builder) builtin(fn *Function, obj *types.Builtin, args []ast.Expr, typ
 
 	case "new":
 		alloc := emitNew(fn, deref(typ), source)
-		alloc.Comment = "new"
 		return alloc
 
 	case "len", "cap":
@@ -330,7 +328,6 @@ func (b *builder) addr(fn *Function, e ast.Expr, escaping bool) lvalue {
 		} else {
 			v = fn.addLocal(t, e)
 		}
-		v.Comment = "complit"
 		var sb storebuf
 		b.compLit(fn, v, e, true, &sb)
 		sb.emit(fn)
@@ -515,11 +512,12 @@ func (b *builder) expr0(fn *Function, e ast.Expr, tv types.TypeAndValue) Value {
 
 	case *ast.FuncLit:
 		fn2 := &Function{
-			name:      fmt.Sprintf("%s$%d", fn.Name(), 1+len(fn.AnonFuncs)),
-			Signature: fn.Pkg.typeOf(e.Type).Underlying().(*types.Signature),
-			parent:    fn,
-			Pkg:       fn.Pkg,
-			Prog:      fn.Prog,
+			name:         fmt.Sprintf("%s$%d", fn.Name(), 1+len(fn.AnonFuncs)),
+			Signature:    fn.Pkg.typeOf(e.Type).Underlying().(*types.Signature),
+			parent:       fn,
+			Pkg:          fn.Pkg,
+			Prog:         fn.Prog,
+			functionBody: new(functionBody),
 		}
 		fn2.source = e
 		fn.AnonFuncs = append(fn.AnonFuncs, fn2)
@@ -893,7 +891,6 @@ func (b *builder) emitCallArgs(fn *Function, sig *types.Signature, e *ast.CallEx
 			at := types.NewArray(vt, int64(len(varargs)))
 			a := emitNew(fn, at, e)
 			a.source = e
-			a.Comment = "varargs"
 			for i, arg := range varargs {
 				iaddr := &IndexAddr{
 					X:     a,
@@ -1093,7 +1090,6 @@ func (b *builder) compLit(fn *Function, addr Value, e *ast.CompositeLit, isZero 
 		case *types.Slice:
 			at = types.NewArray(t.Elem(), b.arrayLen(fn, e.Elts))
 			alloc := emitNew(fn, at, e)
-			alloc.Comment = "slicelit"
 			array = alloc
 		case *types.Array:
 			at = t
@@ -1306,7 +1302,6 @@ func (b *builder) switchStmtDynamic(fn *Function, s *ast.SwitchStmt, label *lblo
 	// sigma nodes for the different comparisons. use a temporary and
 	// load it in every branch.
 	tag := fn.addLocal(tagv.Type(), tagSource)
-	tag.Comment = "switch.tag"
 	emitStore(fn, tag, tagv, tagSource)
 
 	done := fn.newBasicBlock("switch.done")
@@ -2317,6 +2312,7 @@ func (b *builder) buildFunction(fn *Function) {
 	b.addUnreachables(fn)
 	fn.finishBody()
 	b.blocksets = fn.blocksets
+	fn.functionBody = nil
 }
 
 // buildFuncDecl builds IR code for the function or method declared

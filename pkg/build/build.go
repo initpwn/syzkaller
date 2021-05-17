@@ -7,11 +7,16 @@ package build
 import (
 	"bytes"
 	"fmt"
+	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/google/syzkaller/pkg/osutil"
+	"github.com/google/syzkaller/pkg/report"
+	"github.com/google/syzkaller/pkg/vcs"
+	"github.com/google/syzkaller/sys/targets"
 )
 
 // Params is input arguments for the Image function.
@@ -22,6 +27,7 @@ type Params struct {
 	KernelDir    string
 	OutputDir    string
 	Compiler     string
+	Ccache       string
 	UserspaceDir string
 	CmdlineFile  string
 	SysctlFile   string
@@ -61,7 +67,12 @@ func Image(params *Params) (string, error) {
 	}
 	err = builder.build(params)
 	if err != nil {
-		return "", extractRootCause(err)
+		return "", extractRootCause(err, params.TargetOS, params.KernelDir)
+	}
+	if key := filepath.Join(params.OutputDir, "key"); osutil.IsExist(key) {
+		if err := os.Chmod(key, 0600); err != nil {
+			return "", fmt.Errorf("failed to chmod 0600 %v: %v", key, err)
+		}
 	}
 	sign := ""
 	if signer, ok := builder.(signer); ok {
@@ -81,8 +92,15 @@ func Clean(targetOS, targetArch, vmType, kernelDir string) error {
 	return builder.clean(kernelDir, targetArch)
 }
 
-type KernelBuildError struct {
-	*osutil.VerboseError
+type KernelError struct {
+	Report     []byte
+	Output     []byte
+	Recipients vcs.Recipients
+	guiltyFile string
+}
+
+func (err *KernelError) Error() string {
+	return string(err.Report)
 }
 
 type builder interface {
@@ -96,27 +114,31 @@ type signer interface {
 
 func getBuilder(targetOS, targetArch, vmType string) (builder, error) {
 	var supported = []struct {
-		OS   string
-		arch string
-		vms  []string
-		b    builder
+		OS    string
+		archs []string
+		vms   []string
+		b     builder
 	}{
-		{"linux", "amd64", []string{"gvisor"}, gvisor{}},
-		{"linux", "amd64", []string{"gce", "qemu"}, linux{}},
-		{"linux", "ppc64le", []string{"qemu"}, linux{}},
-		{"fuchsia", "amd64", []string{"qemu"}, fuchsia{}},
-		{"fuchsia", "arm64", []string{"qemu"}, fuchsia{}},
-		{"akaros", "amd64", []string{"qemu"}, akaros{}},
-		{"openbsd", "amd64", []string{"gce", "vmm"}, openbsd{}},
-		{"netbsd", "amd64", []string{"gce", "qemu"}, netbsd{}},
-		{"freebsd", "amd64", []string{"gce", "qemu"}, freebsd{}},
-		{"test", "64", []string{"qemu"}, test{}},
+		{targets.Linux, []string{targets.AMD64}, []string{"gvisor"}, gvisor{}},
+		{targets.Linux, []string{targets.AMD64}, []string{"gce", "qemu"}, linux{}},
+		{targets.Linux, []string{targets.ARM, targets.ARM64, targets.I386, targets.MIPS64LE,
+			targets.PPC64LE, targets.S390x, targets.RiscV64}, []string{"qemu"}, linux{}},
+		{targets.Fuchsia, []string{targets.AMD64, targets.ARM64}, []string{"qemu"}, fuchsia{}},
+		{targets.Akaros, []string{targets.AMD64}, []string{"qemu"}, akaros{}},
+		{targets.OpenBSD, []string{targets.AMD64}, []string{"gce", "vmm"}, openbsd{}},
+		{targets.NetBSD, []string{targets.AMD64}, []string{"gce", "qemu"}, netbsd{}},
+		{targets.FreeBSD, []string{targets.AMD64}, []string{"gce", "qemu"}, freebsd{}},
+		{targets.TestOS, []string{targets.TestArch64}, []string{"qemu"}, test{}},
 	}
 	for _, s := range supported {
-		if targetOS == s.OS && targetArch == s.arch {
-			for _, vm := range s.vms {
-				if vmType == vm {
-					return s.b, nil
+		if targetOS == s.OS {
+			for _, arch := range s.archs {
+				if targetArch == arch {
+					for _, vm := range s.vms {
+						if vmType == vm {
+							return s.b, nil
+						}
+					}
 				}
 			}
 		}
@@ -158,7 +180,7 @@ func CompilerIdentity(compiler string) (string, error) {
 	return "", fmt.Errorf("no output from compiler --version")
 }
 
-func extractRootCause(err error) error {
+func extractRootCause(err error, OS, kernelSrc string) error {
 	if err == nil {
 		return nil
 	}
@@ -166,25 +188,70 @@ func extractRootCause(err error) error {
 	if !ok {
 		return err
 	}
-	cause := extractCauseInner(verr.Output)
-	if cause != "" {
-		verr.Title = cause
+	reason, file := extractCauseInner(verr.Output, kernelSrc)
+	if len(reason) == 0 {
+		return err
 	}
-	return KernelBuildError{verr}
+	kernelErr := &KernelError{
+		Report:     reason,
+		Output:     verr.Output,
+		guiltyFile: file,
+	}
+	if file != "" && OS == targets.Linux {
+		maintainers, err := report.GetLinuxMaintainers(kernelSrc, file)
+		if err != nil {
+			kernelErr.Output = append(kernelErr.Output, err.Error()...)
+		}
+		kernelErr.Recipients = maintainers
+	}
+	return kernelErr
 }
 
-func extractCauseInner(s []byte) string {
+func extractCauseInner(s []byte, kernelSrc string) ([]byte, string) {
 	lines := extractCauseRaw(s)
-	const maxLines = 10
+	const maxLines = 20
 	if len(lines) > maxLines {
 		lines = lines[:maxLines]
+	}
+	var stripPrefix []byte
+	if kernelSrc != "" {
+		stripPrefix = []byte(kernelSrc)
+		if stripPrefix[len(stripPrefix)-1] != filepath.Separator {
+			stripPrefix = append(stripPrefix, filepath.Separator)
+		}
+	}
+	file := ""
+	for i := range lines {
+		if stripPrefix != nil {
+			lines[i] = bytes.Replace(lines[i], stripPrefix, nil, -1)
+		}
+		if file == "" {
+			for _, fileRe := range fileRes {
+				match := fileRe.FindSubmatch(lines[i])
+				if match != nil {
+					file = string(match[1])
+					if file[0] != '/' {
+						break
+					}
+					// We already removed kernel source prefix,
+					// if we still have an absolute path, it's probably pointing
+					// to compiler/system libraries (not going to work).
+					file = ""
+				}
+			}
+		}
+	}
+	file = strings.TrimPrefix(file, "./")
+	if strings.HasSuffix(file, ".o") {
+		// Linker may point to object files instead.
+		file = strings.TrimSuffix(file, ".o") + ".c"
 	}
 	res := bytes.Join(lines, []byte{'\n'})
 	// gcc uses these weird quotes around identifiers, which may be
 	// mis-rendered by systems that don't understand utf-8.
 	res = bytes.Replace(res, []byte("‘"), []byte{'\''}, -1)
 	res = bytes.Replace(res, []byte("’"), []byte{'\''}, -1)
-	return string(res)
+	return res, file
 }
 
 func extractCauseRaw(s []byte) [][]byte {
@@ -193,7 +260,7 @@ func extractCauseRaw(s []byte) [][]byte {
 	dedup := make(map[string]bool)
 	for _, line := range bytes.Split(s, []byte{'\n'}) {
 		for _, pattern := range buildFailureCauses {
-			if !bytes.Contains(line, pattern.pattern) {
+			if !pattern.pattern.Match(line) {
 				continue
 			}
 			if weak && !pattern.weak {
@@ -215,17 +282,27 @@ func extractCauseRaw(s []byte) [][]byte {
 }
 
 type buildFailureCause struct {
-	pattern []byte
+	pattern *regexp.Regexp
 	weak    bool
 }
 
 var buildFailureCauses = [...]buildFailureCause{
-	{pattern: []byte(": error: ")},
-	{pattern: []byte("ERROR: ")},
-	{pattern: []byte(": fatal error: ")},
-	{pattern: []byte(": undefined reference to")},
-	{pattern: []byte(": Permission denied")},
-	{weak: true, pattern: []byte(": final link failed: ")},
-	{weak: true, pattern: []byte("collect2: error: ")},
-	{weak: true, pattern: []byte("FAILED: Build did NOT complete")},
+	{pattern: regexp.MustCompile(`: error: `)},
+	{pattern: regexp.MustCompile(`ERROR: `)},
+	{pattern: regexp.MustCompile(`: fatal error: `)},
+	{pattern: regexp.MustCompile(`: undefined reference to`)},
+	{pattern: regexp.MustCompile(`: multiple definition of`)},
+	{pattern: regexp.MustCompile(`: Permission denied`)},
+	{pattern: regexp.MustCompile(`: not found`)},
+	{pattern: regexp.MustCompile(`^([a-zA-Z0-9_\-/.]+):[0-9]+:([0-9]+:)?.*(error|invalid|fatal|wrong)`)},
+	{pattern: regexp.MustCompile(`FAILED unresolved symbol`)},
+	{weak: true, pattern: regexp.MustCompile(`: final link failed: `)},
+	{weak: true, pattern: regexp.MustCompile(`collect2: error: `)},
+	{weak: true, pattern: regexp.MustCompile(`FAILED: Build did NOT complete`)},
+}
+
+var fileRes = []*regexp.Regexp{
+	regexp.MustCompile(`^([a-zA-Z0-9_\-/.]+):[0-9]+:([0-9]+:)? `),
+	regexp.MustCompile(`^(?:ld: )?(([a-zA-Z0-9_\-/.]+?)\.o):`),
+	regexp.MustCompile(`; (([a-zA-Z0-9_\-/.]+?)\.o):`),
 }

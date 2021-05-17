@@ -18,13 +18,14 @@ var (
 	flagSignal   = flag.Bool("cover", false, "collect feedback signals (coverage)")
 	flagSandbox  = flag.String("sandbox", "none", "sandbox for fuzzing (none/setuid/namespace/android)")
 	flagDebug    = flag.Bool("debug", false, "debug output from executor")
-	flagTimeout  = flag.Duration("timeout", 0, "execution timeout")
+	flagSlowdown = flag.Int("slowdown", 1, "execution slowdown caused by emulation/instrumentation")
 )
 
 func Default(target *prog.Target) (*ipc.Config, *ipc.ExecOpts, error) {
+	sysTarget := targets.Get(target.OS, target.Arch)
 	c := &ipc.Config{
 		Executor: *flagExecutor,
-		Timeout:  *flagTimeout,
+		Timeouts: sysTarget.Timeouts(*flagSlowdown),
 	}
 	if *flagSignal {
 		c.Flags |= ipc.FlagSignal
@@ -37,7 +38,6 @@ func Default(target *prog.Target) (*ipc.Config, *ipc.ExecOpts, error) {
 		return nil, nil, err
 	}
 	c.Flags |= sandboxFlags
-	sysTarget := targets.Get(target.OS, target.Arch)
 	c.UseShmem = sysTarget.ExecutorUsesShmem
 	c.UseForkServer = sysTarget.ExecutorUsesForkServer
 	opts := &ipc.ExecOpts{

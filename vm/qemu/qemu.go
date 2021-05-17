@@ -4,8 +4,11 @@
 package qemu
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,38 +19,53 @@ import (
 	"github.com/google/syzkaller/pkg/config"
 	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/pkg/osutil"
+	"github.com/google/syzkaller/pkg/report"
 	"github.com/google/syzkaller/sys/targets"
 	"github.com/google/syzkaller/vm/vmimpl"
 )
 
-const (
-	hostAddr = "10.0.2.10"
-)
-
 func init() {
+	var _ vmimpl.Infoer = (*instance)(nil)
 	vmimpl.Register("qemu", ctor, true)
 }
 
 type Config struct {
-	Count    int    `json:"count"`     // number of VMs to run in parallel
-	Qemu     string `json:"qemu"`      // qemu binary name (qemu-system-arch by default)
-	QemuArgs string `json:"qemu_args"` // additional command line arguments for qemu binary
+	// Number of VMs to run in parallel (1 by default).
+	Count int `json:"count"`
+	// QEMU binary name (optional).
+	// If not specified, qemu-system-arch is used by default.
+	Qemu string `json:"qemu"`
+	// Additional command line arguments for the QEMU binary.
+	// If not specified, the default value specifies machine type, cpu and usually contains -enable-kvm.
+	// If you provide this parameter, it needs to contain the desired machine, cpu
+	// and include -enable-kvm if necessary.
+	// "{{INDEX}}" is replaced with 0-based index of the VM (from 0 to Count-1).
+	// "{{TEMPLATE}}" is replaced with the path to a copy of workdir/template dir.
+	// "{{TCP_PORT}}" is replaced with a random free TCP port
+	QemuArgs string `json:"qemu_args"`
 	// Location of the kernel for injected boot (e.g. arch/x86/boot/bzImage, optional).
-	// This is passed to qemu as the -kernel option.
+	// This is passed to QEMU as the -kernel option.
 	Kernel string `json:"kernel"`
 	// Additional command line options for the booting kernel, for example `root=/dev/sda1`.
 	// Can only be specified with kernel.
 	Cmdline string `json:"cmdline"`
-	Initrd  string `json:"initrd"` // linux initial ramdisk. (optional)
-	// qemu image device.
-	// The default value "hda" is transformed to "-hda image" for qemu.
-	// The modern way of describing qemu hard disks is supported, so the value
-	// "drive index=0,media=disk,file=" is transformed to "-drive index=0,media=disk,file=image"
-	// for qemu.
+	// Initial ramdisk, passed via -initrd QEMU flag (optional).
+	Initrd string `json:"initrd"`
+	// QEMU image device.
+	// The default value "hda" is transformed to "-hda image" for QEMU.
+	// The modern way of describing QEMU hard disks is supported, so the value
+	// "drive index=0,media=disk,file=" is transformed to "-drive index=0,media=disk,file=image" for QEMU.
 	ImageDevice string `json:"image_device"`
-	CPU         int    `json:"cpu"`      // number of VM CPUs
-	Mem         int    `json:"mem"`      // amount of VM memory in MiB
-	Snapshot    bool   `json:"snapshot"` // For building kernels without -snapshot (for pkg/build)
+	// QEMU network device type to use.
+	// If not specified, some default per-arch value will be used.
+	// See the full list with qemu-system-x86_64 -device help.
+	NetDev string `json:"network_device"`
+	// Number of VM CPUs (1 by default).
+	CPU int `json:"cpu"`
+	// Amount of VM memory in MiB (1024 by default).
+	Mem int `json:"mem"`
+	// For building kernels without -snapshot for pkg/build (true by default).
+	Snapshot bool `json:"snapshot"`
 }
 
 type Pool struct {
@@ -55,144 +73,157 @@ type Pool struct {
 	cfg        *Config
 	target     *targets.Target
 	archConfig *archConfig
+	version    string
 }
 
 type instance struct {
-	cfg        *Config
-	target     *targets.Target
-	archConfig *archConfig
-	image      string
-	debug      bool
-	os         string
-	workdir    string
-	sshkey     string
-	sshuser    string
-	port       int
-	rpipe      io.ReadCloser
-	wpipe      io.WriteCloser
-	qemu       *exec.Cmd
-	merger     *vmimpl.OutputMerger
-	files      map[string]string
-	diagnose   chan bool
+	index       int
+	cfg         *Config
+	target      *targets.Target
+	archConfig  *archConfig
+	version     string
+	args        []string
+	image       string
+	debug       bool
+	os          string
+	workdir     string
+	sshkey      string
+	sshuser     string
+	timeouts    targets.Timeouts
+	port        int
+	monport     int
+	forwardPort int
+	mon         net.Conn
+	monEnc      *json.Encoder
+	monDec      *json.Decoder
+	rpipe       io.ReadCloser
+	wpipe       io.WriteCloser
+	qemu        *exec.Cmd
+	merger      *vmimpl.OutputMerger
+	files       map[string]string
+	diagnose    chan bool
 }
 
 type archConfig struct {
 	Qemu      string
 	QemuArgs  string
-	TargetDir string
-	NicModel  string
-	CmdLine   []string
+	TargetDir string // "/" by default
+	NetDev    string // default network device type (see the full list with qemu-system-x86_64 -device help)
+	RngDev    string // default rng device (optional)
+	// UseNewQemuImageOptions specifies whether the arch uses "new" QEMU image device options.
+	UseNewQemuImageOptions bool
+	CmdLine                []string
 }
 
 var archConfigs = map[string]*archConfig{
 	"linux/amd64": {
-		Qemu:      "qemu-system-x86_64",
-		QemuArgs:  "-enable-kvm -cpu host,migratable=off",
-		TargetDir: "/",
+		Qemu:     "qemu-system-x86_64",
+		QemuArgs: "-enable-kvm -cpu host,migratable=off",
 		// e1000e fails on recent Debian distros with:
 		// Initialization of device e1000e failed: failed to find romfile "efi-e1000e.rom
 		// But other arches don't use e1000e, e.g. arm64 uses virtio by default.
-		NicModel: ",model=e1000",
-		CmdLine: append(linuxCmdline,
+		NetDev: "e1000",
+		RngDev: "virtio-rng-pci",
+		CmdLine: []string{
 			"root=/dev/sda",
 			"console=ttyS0",
-			"kvm-intel.nested=1",
-			"kvm-intel.unrestricted_guest=1",
-			"kvm-intel.vmm_exclusive=1",
-			"kvm-intel.fasteoi=1",
-			"kvm-intel.ept=1",
-			"kvm-intel.flexpriority=1",
-			"kvm-intel.vpid=1",
-			"kvm-intel.emulate_invalid_guest_state=1",
-			"kvm-intel.eptad=1",
-			"kvm-intel.enable_shadow_vmcs=1",
-			"kvm-intel.pml=1",
-			"kvm-intel.enable_apicv=1",
-		),
+		},
 	},
 	"linux/386": {
-		Qemu:      "qemu-system-i386",
-		TargetDir: "/",
-		NicModel:  ",model=e1000",
-		CmdLine: append(linuxCmdline,
+		Qemu:   "qemu-system-i386",
+		NetDev: "e1000",
+		RngDev: "virtio-rng-pci",
+		CmdLine: []string{
 			"root=/dev/sda",
 			"console=ttyS0",
-		),
+		},
 	},
 	"linux/arm64": {
-		Qemu:      "qemu-system-aarch64",
-		QemuArgs:  "-machine virt,virtualization=on -cpu cortex-a57",
-		TargetDir: "/",
-		CmdLine: append(linuxCmdline,
+		Qemu:     "qemu-system-aarch64",
+		QemuArgs: "-machine virt,virtualization=on -cpu cortex-a57",
+		NetDev:   "virtio-net-pci",
+		RngDev:   "virtio-rng-pci",
+		CmdLine: []string{
 			"root=/dev/vda",
 			"console=ttyAMA0",
-		),
+		},
 	},
 	"linux/arm": {
-		Qemu:      "qemu-system-arm",
-		TargetDir: "/",
-		CmdLine: append(linuxCmdline,
+		Qemu:                   "qemu-system-arm",
+		QemuArgs:               "-machine vexpress-a15 -cpu max",
+		NetDev:                 "virtio-net-device",
+		RngDev:                 "virtio-rng-device",
+		UseNewQemuImageOptions: true,
+		CmdLine: []string{
 			"root=/dev/vda",
 			"console=ttyAMA0",
-		),
+		},
 	},
 	"linux/mips64le": {
-		Qemu:      "qemu-system-mips64el",
-		TargetDir: "/",
-		QemuArgs:  "-M malta -cpu MIPS64R2-generic -nodefaults",
-		NicModel:  ",model=e1000",
-		CmdLine: append(linuxCmdline,
+		Qemu:     "qemu-system-mips64el",
+		QemuArgs: "-M malta -cpu MIPS64R2-generic -nodefaults",
+		NetDev:   "e1000",
+		RngDev:   "virtio-rng-pci",
+		CmdLine: []string{
 			"root=/dev/sda",
 			"console=ttyS0",
-		),
+		},
 	},
 	"linux/ppc64le": {
-		Qemu:      "qemu-system-ppc64",
-		TargetDir: "/",
-		QemuArgs:  "-enable-kvm -vga none",
-		CmdLine:   linuxCmdline,
+		Qemu:     "qemu-system-ppc64",
+		QemuArgs: "-enable-kvm -vga none",
+		NetDev:   "virtio-net-pci",
+		RngDev:   "virtio-rng-pci",
+	},
+	"linux/riscv64": {
+		Qemu:                   "qemu-system-riscv64",
+		QemuArgs:               "-machine virt",
+		NetDev:                 "virtio-net-pci",
+		RngDev:                 "virtio-rng-pci",
+		UseNewQemuImageOptions: true,
+		CmdLine: []string{
+			"root=/dev/vda",
+			"console=ttyS0",
+		},
+	},
+	"linux/s390x": {
+		Qemu:     "qemu-system-s390x",
+		QemuArgs: "-M s390-ccw-virtio -cpu max,zpci=on",
+		NetDev:   "virtio-net-pci",
+		RngDev:   "virtio-rng-ccw",
+		CmdLine: []string{
+			"root=/dev/vda",
+		},
 	},
 	"freebsd/amd64": {
-		Qemu:      "qemu-system-x86_64",
-		TargetDir: "/",
-		QemuArgs:  "-enable-kvm",
-		NicModel:  ",model=e1000",
+		Qemu:     "qemu-system-x86_64",
+		QemuArgs: "-enable-kvm",
+		NetDev:   "e1000",
+		RngDev:   "virtio-rng-pci",
 	},
 	"netbsd/amd64": {
-		Qemu:      "qemu-system-x86_64",
-		TargetDir: "/",
-		QemuArgs:  "-enable-kvm",
-		NicModel:  ",model=e1000",
+		Qemu:     "qemu-system-x86_64",
+		QemuArgs: "-enable-kvm",
+		NetDev:   "e1000",
+		RngDev:   "virtio-rng-pci",
 	},
 	"fuchsia/amd64": {
 		Qemu:      "qemu-system-x86_64",
 		QemuArgs:  "-enable-kvm -machine q35 -cpu host,migratable=off",
 		TargetDir: "/tmp",
-		NicModel:  ",model=e1000",
+		NetDev:    "e1000",
+		RngDev:    "virtio-rng-pci",
 		CmdLine: []string{
 			"kernel.serial=legacy",
 			"kernel.halt-on-panic=true",
 		},
 	},
 	"akaros/amd64": {
-		Qemu:      "qemu-system-x86_64",
-		QemuArgs:  "-enable-kvm -cpu host,migratable=off",
-		TargetDir: "/",
-		NicModel:  ",model=e1000",
+		Qemu:     "qemu-system-x86_64",
+		QemuArgs: "-enable-kvm -cpu host,migratable=off",
+		NetDev:   "e1000",
+		RngDev:   "virtio-rng-pci",
 	},
-}
-
-var linuxCmdline = []string{
-	"earlyprintk=serial",
-	"oops=panic",
-	"nmi_watchdog=panic",
-	"panic_on_warn=1",
-	"panic=1",
-	"ftrace_dump_on_oops=orig_cpu",
-	"rodata=n",
-	"vsyscall=native",
-	"net.ifnames=0",
-	"biosdevname=0",
 }
 
 func ctor(env *vmimpl.Env) (vmimpl.Pool, error) {
@@ -200,9 +231,11 @@ func ctor(env *vmimpl.Env) (vmimpl.Pool, error) {
 	cfg := &Config{
 		Count:       1,
 		CPU:         1,
+		Mem:         1024,
 		ImageDevice: "hda",
 		Qemu:        archConfig.Qemu,
 		QemuArgs:    archConfig.QemuArgs,
+		NetDev:      archConfig.NetDev,
 		Snapshot:    true,
 	}
 	if err := config.LoadData(env.Config, cfg); err != nil {
@@ -219,7 +252,7 @@ func ctor(env *vmimpl.Env) (vmimpl.Pool, error) {
 		return nil, err
 	}
 	if env.Image == "9p" {
-		if env.OS != "linux" {
+		if env.OS != targets.Linux {
 			return nil, fmt.Errorf("9p image is supported for linux only")
 		}
 		if cfg.Kernel == "" {
@@ -238,9 +271,17 @@ func ctor(env *vmimpl.Env) (vmimpl.Pool, error) {
 	}
 	cfg.Kernel = osutil.Abs(cfg.Kernel)
 	cfg.Initrd = osutil.Abs(cfg.Initrd)
+
+	output, err := osutil.RunCmd(time.Minute, "", cfg.Qemu, "--version")
+	if err != nil {
+		return nil, err
+	}
+	version := string(bytes.Split(output, []byte{'\n'})[0])
+
 	pool := &Pool{
 		env:        env,
 		cfg:        cfg,
+		version:    version,
 		target:     targets.Get(env.OS, env.Arch),
 		archConfig: archConfig,
 	}
@@ -282,12 +323,15 @@ func (pool *Pool) Create(workdir string, index int) (vmimpl.Instance, error) {
 
 func (pool *Pool) ctor(workdir, sshkey, sshuser string, index int) (vmimpl.Instance, error) {
 	inst := &instance{
+		index:      index,
 		cfg:        pool.cfg,
 		target:     pool.target,
 		archConfig: pool.archConfig,
+		version:    pool.version,
 		image:      pool.env.Image,
 		debug:      pool.env.Debug,
 		os:         pool.env.OS,
+		timeouts:   pool.env.Timeouts,
 		workdir:    workdir,
 		sshkey:     sshkey,
 		sshuser:    sshuser,
@@ -334,35 +378,54 @@ func (inst *instance) Close() {
 	if inst.wpipe != nil {
 		inst.wpipe.Close()
 	}
+	if inst.mon != nil {
+		inst.mon.Close()
+	}
 }
 
 func (inst *instance) boot() error {
 	inst.port = vmimpl.UnusedTCPPort()
+	inst.monport = vmimpl.UnusedTCPPort()
 	args := []string{
 		"-m", strconv.Itoa(inst.cfg.Mem),
 		"-smp", strconv.Itoa(inst.cfg.CPU),
-		"-net", "nic" + inst.archConfig.NicModel,
-		"-net", fmt.Sprintf("user,host=%v,hostfwd=tcp::%v-:22", hostAddr, inst.port),
+		"-chardev", fmt.Sprintf("socket,id=SOCKSYZ,server,nowait,host=localhost,port=%v", inst.monport),
+		"-mon", "chardev=SOCKSYZ,mode=control",
 		"-display", "none",
 		"-serial", "stdio",
 		"-no-reboot",
+		"-name", fmt.Sprintf("VM-%v", inst.index),
 	}
-	args = append(args, splitArgs(inst.cfg.QemuArgs, filepath.Join(inst.workdir, "template"))...)
+	if inst.archConfig.RngDev != "" {
+		args = append(args, "-device", inst.archConfig.RngDev)
+	}
+	templateDir := filepath.Join(inst.workdir, "template")
+	args = append(args, splitArgs(inst.cfg.QemuArgs, templateDir, inst.index)...)
+	args = append(args,
+		"-device", inst.cfg.NetDev+",netdev=net0",
+		"-netdev", fmt.Sprintf("user,id=net0,restrict=on,hostfwd=tcp:127.0.0.1:%v-:22", inst.port))
 	if inst.image == "9p" {
 		args = append(args,
 			"-fsdev", "local,id=fsdev0,path=/,security_model=none,readonly",
 			"-device", "virtio-9p-pci,fsdev=fsdev0,mount_tag=/dev/root",
 		)
 	} else if inst.image != "" {
-		// inst.cfg.ImageDevice can contain spaces
-		imgline := strings.Split(inst.cfg.ImageDevice, " ")
-		imgline[0] = "-" + imgline[0]
-		if strings.HasSuffix(imgline[len(imgline)-1], "file=") {
-			imgline[len(imgline)-1] = imgline[len(imgline)-1] + inst.image
+		if inst.archConfig.UseNewQemuImageOptions {
+			args = append(args,
+				"-device", "virtio-blk-device,drive=hd0",
+				"-drive", fmt.Sprintf("file=%v,if=none,format=raw,id=hd0", inst.image),
+			)
 		} else {
-			imgline = append(imgline, inst.image)
+			// inst.cfg.ImageDevice can contain spaces
+			imgline := strings.Split(inst.cfg.ImageDevice, " ")
+			imgline[0] = "-" + imgline[0]
+			if strings.HasSuffix(imgline[len(imgline)-1], "file=") {
+				imgline[len(imgline)-1] = imgline[len(imgline)-1] + inst.image
+			} else {
+				imgline = append(imgline, inst.image)
+			}
+			args = append(args, imgline...)
 		}
-		args = append(args, imgline...)
 		if inst.cfg.Snapshot {
 			args = append(args, "-snapshot")
 		}
@@ -391,6 +454,7 @@ func (inst *instance) boot() error {
 	if inst.debug {
 		log.Logf(0, "running command: %v %#v", inst.cfg.Qemu, args)
 	}
+	inst.args = args
 	qemu := osutil.Command(inst.cfg.Qemu, args...)
 	qemu.Stdout = inst.wpipe
 	qemu.Stderr = inst.wpipe
@@ -424,7 +488,7 @@ func (inst *instance) boot() error {
 			}
 		}
 	}()
-	if err := vmimpl.WaitForSSH(inst.debug, 10*time.Minute, "localhost",
+	if err := vmimpl.WaitForSSH(inst.debug, 10*time.Minute*inst.timeouts.Scale, "localhost",
 		inst.sshkey, inst.sshuser, inst.os, inst.port, inst.merger.Err); err != nil {
 		bootOutputStop <- true
 		<-bootOutputStop
@@ -434,27 +498,41 @@ func (inst *instance) boot() error {
 	return nil
 }
 
-func splitArgs(str, template string) (args []string) {
+func splitArgs(str, templateDir string, index int) (args []string) {
 	for _, arg := range strings.Split(str, " ") {
 		if arg == "" {
 			continue
 		}
-		args = append(args, strings.Replace(arg, "{{TEMPLATE}}", template, -1))
+		arg = strings.ReplaceAll(arg, "{{INDEX}}", fmt.Sprint(index))
+		arg = strings.ReplaceAll(arg, "{{TEMPLATE}}", templateDir)
+		const tcpPort = "{{TCP_PORT}}"
+		if strings.Contains(arg, tcpPort) {
+			arg = strings.ReplaceAll(arg, tcpPort, fmt.Sprint(vmimpl.UnusedTCPPort()))
+		}
+		args = append(args, arg)
 	}
 	return
 }
 
 func (inst *instance) Forward(port int) (string, error) {
-	addr := hostAddr
-	if inst.target.HostFuzzer {
-		addr = "127.0.0.1"
+	if port == 0 {
+		return "", fmt.Errorf("vm/qemu: forward port is zero")
 	}
-	return fmt.Sprintf("%v:%v", addr, port), nil
+	if !inst.target.HostFuzzer {
+		if inst.forwardPort != 0 {
+			return "", fmt.Errorf("vm/qemu: forward port already set")
+		}
+		inst.forwardPort = port
+	}
+	return fmt.Sprintf("localhost:%v", port), nil
 }
 
 func (inst *instance) targetDir() string {
 	if inst.image == "9p" {
 		return "/tmp"
+	}
+	if inst.archConfig.TargetDir == "" {
+		return "/"
 	}
 	return inst.archConfig.TargetDir
 }
@@ -477,7 +555,7 @@ func (inst *instance) Copy(hostSrc string) (string, error) {
 	if inst.debug {
 		log.Logf(0, "running command: scp %#v", args)
 	}
-	_, err := osutil.RunCmd(3*time.Minute, "", "scp", args...)
+	_, err := osutil.RunCmd(10*time.Minute*inst.timeouts.Scale, "", "scp", args...)
 	if err != nil {
 		return "", err
 	}
@@ -492,11 +570,11 @@ func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command strin
 	}
 	inst.merger.Add("ssh", rpipe)
 
-	sshArgs := vmimpl.SSHArgs(inst.debug, inst.sshkey, inst.port)
+	sshArgs := vmimpl.SSHArgsForward(inst.debug, inst.sshkey, inst.port, inst.forwardPort)
 	args := strings.Split(command, " ")
 	if bin := filepath.Base(args[0]); inst.target.HostFuzzer &&
 		(bin == "syz-fuzzer" || bin == "syz-execprog") {
-		// Weird mode for akaros.
+		// Weird mode for fuchsia and akaros.
 		// Fuzzer and execprog are on host (we did not copy them), so we will run them as is,
 		// but we will also wrap executor with ssh invocation.
 		for i, arg := range args {
@@ -559,12 +637,40 @@ func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command strin
 	return inst.merger.Output, errc, nil
 }
 
-func (inst *instance) Diagnose() ([]byte, bool) {
-	select {
-	case inst.diagnose <- true:
-	default:
+func (inst *instance) Info() ([]byte, error) {
+	info := fmt.Sprintf("%v\n%v %q\n", inst.version, inst.cfg.Qemu, inst.args)
+	return []byte(info), nil
+}
+
+func (inst *instance) Diagnose(rep *report.Report) ([]byte, bool) {
+	if inst.target.OS == targets.Linux {
+		if output, wait, handled := vmimpl.DiagnoseLinux(rep, inst.ssh); handled {
+			return output, wait
+		}
 	}
-	return nil, false
+	// TODO: we don't need registers on all reports. Probably only relevant for "crashes"
+	// (NULL derefs, paging faults, etc), but is not useful for WARNING/BUG/HANG (?).
+	ret := []byte(fmt.Sprintf("%s Registers:\n", time.Now().Format("15:04:05 ")))
+	for cpu := 0; cpu < inst.cfg.CPU; cpu++ {
+		regs, err := inst.hmp("info registers", cpu)
+		if err == nil {
+			ret = append(ret, []byte(fmt.Sprintf("info registers vcpu %v\n", cpu))...)
+			ret = append(ret, []byte(regs)...)
+		} else {
+			log.Logf(0, "VM-%v failed reading regs: %v", inst.index, err)
+			ret = append(ret, []byte(fmt.Sprintf("Failed reading regs: %v\n", err))...)
+		}
+	}
+	return ret, false
+}
+
+func (inst *instance) ssh(args ...string) ([]byte, error) {
+	return osutil.RunCmd(time.Minute*inst.timeouts.Scale, "", "ssh", inst.sshArgs(args...)...)
+}
+
+func (inst *instance) sshArgs(args ...string) []string {
+	sshArgs := append(vmimpl.SSHArgs(inst.debug, inst.sshkey, inst.port), inst.sshuser+"@localhost")
+	return append(sshArgs, args...)
 }
 
 // nolint: lll

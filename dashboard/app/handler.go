@@ -92,10 +92,12 @@ func serveTemplate(w http.ResponseWriter, name string, data interface{}) error {
 
 type uiHeader struct {
 	Admin               bool
+	URLPath             string
 	LoginLink           string
 	AnalyticsTrackingID string
 	Subpage             string
 	Namespace           string
+	Cached              *Cached
 	Namespaces          []uiNamespace
 }
 
@@ -111,6 +113,7 @@ type cookieData struct {
 func commonHeaderRaw(c context.Context, r *http.Request) *uiHeader {
 	h := &uiHeader{
 		Admin:               accessLevel(c, r) == AccessAdmin,
+		URLPath:             r.URL.Path,
 		AnalyticsTrackingID: config.AnalyticsTrackingID,
 	}
 	if user.Current(c) == nil {
@@ -169,6 +172,11 @@ func commonHeader(c context.Context, r *http.Request, w http.ResponseWriter, ns 
 		h.Namespace = ns
 		cookie.Namespace = ns
 		encodeCookie(w, cookie)
+		cached, err := CacheGet(c, r, ns)
+		if err != nil {
+			return nil, err
+		}
+		h.Cached = cached
 	}
 	return h, nil
 }

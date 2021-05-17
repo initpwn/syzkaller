@@ -6,6 +6,7 @@ package build
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -15,6 +16,7 @@ import (
 	"github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/pkg/report"
+	"github.com/google/syzkaller/sys/targets"
 	"github.com/google/syzkaller/vm"
 )
 
@@ -29,25 +31,25 @@ func (ctx netbsd) build(params *Params) error {
 		return err
 	}
 
-	// Clear the tools
+	// Clear the tools.
 	if _, err := osutil.RunCmd(5*time.Minute, params.KernelDir, "rm", "-rf", "obj/"); err != nil {
 		return err
 	}
 
-	// Clear the build files
+	// Clear the build files.
 	if _, err := osutil.RunCmd(5*time.Minute, params.KernelDir, "rm", "-rf", compileDir); err != nil {
 		return err
 	}
 
 	if strings.HasSuffix(params.Compiler, "clang++") {
-		// Build tools before building kernel
+		// Build tools before building kernel.
 		if _, err := osutil.RunCmd(60*time.Minute, params.KernelDir, "./build.sh", "-m", params.TargetArch,
 			"-U", "-j"+strconv.Itoa(runtime.NumCPU()), "-V", "MKCTF=no",
 			"-V", "MKLLVM=yes", "-V", "MKGCC=no", "-V", "HAVE_LLVM=yes", "tools"); err != nil {
 			return err
 		}
 
-		// Build kernel
+		// Build kernel.
 		if _, err := osutil.RunCmd(20*time.Minute, params.KernelDir, "./build.sh", "-m", params.TargetArch,
 			"-U", "-j"+strconv.Itoa(runtime.NumCPU()), "-V", "MKCTF=no",
 			"-V", "MKLLVM=yes", "-V", "MKGCC=no", "-V", "HAVE_LLVM=yes", "kernel="+kernelName); err != nil {
@@ -76,6 +78,10 @@ func (ctx netbsd) build(params *Params) error {
 			return fmt.Errorf("failed to copy %v -> %v: %v", fullSrc, fullDst, err)
 		}
 	}
+	keyFile := filepath.Join(params.OutputDir, "key")
+	if err := os.Chmod(keyFile, 0600); err != nil {
+		return fmt.Errorf("failed to chmod 0600 %v: %v", keyFile, err)
+	}
 	return ctx.copyKernelToDisk(params.TargetArch, params.VMType, params.OutputDir,
 		filepath.Join(compileDir, "netbsd"))
 }
@@ -95,15 +101,17 @@ func (ctx netbsd) copyKernelToDisk(targetArch, vmType, outputDir, kernel string)
 }`
 	// Create config for booting the disk image.
 	cfg := &mgrconfig.Config{
-		Workdir:      outputDir,
-		Image:        filepath.Join(outputDir, "image"),
-		SSHKey:       filepath.Join(outputDir, "key"),
-		SSHUser:      "root",
-		TargetOS:     "netbsd",
-		TargetArch:   targetArch,
-		TargetVMArch: targetArch,
-		Type:         "qemu",
-		VM:           json.RawMessage([]byte(vmConfig)),
+		Workdir: outputDir,
+		Image:   filepath.Join(outputDir, "image"),
+		SSHKey:  filepath.Join(outputDir, "key"),
+		SSHUser: "root",
+		Type:    "qemu",
+		VM:      json.RawMessage([]byte(vmConfig)),
+		Derived: mgrconfig.Derived{
+			TargetOS:     targets.NetBSD,
+			TargetArch:   targetArch,
+			TargetVMArch: targetArch,
+		},
 	}
 	// Create a VM pool.
 	pool, err := vm.Create(cfg, false)
@@ -121,7 +129,7 @@ func (ctx netbsd) copyKernelToDisk(targetArch, vmType, outputDir, kernel string)
 		return fmt.Errorf("failed to create the VM Instance: %v", err)
 	}
 	defer inst.Close()
-	// Copy the kernel into the disk image and replace it
+	// Copy the kernel into the disk image and replace it.
 	kernel, err = inst.Copy(kernel)
 	if err != nil {
 		return fmt.Errorf("error copying the kernel: %v", err)
@@ -140,6 +148,7 @@ func (ctx netbsd) copyKernelToDisk(targetArch, vmType, outputDir, kernel string)
 			`echo 'mtu 1460' >> /etc/ifconfig.vioif0`,
 		}...)
 	}
+	commands = append(commands, "mknod /dev/vhci c 355 0")
 	commands = append(commands, "sync") // Run sync so that the copied image is stored properly.
 	outc, errc, err := inst.Run(time.Minute, nil, strings.Join(commands, ";"))
 	if err != nil {

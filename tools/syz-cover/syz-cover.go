@@ -23,13 +23,13 @@ import (
 	"io/ioutil"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
 
 	"github.com/google/syzkaller/pkg/cover"
 	"github.com/google/syzkaller/pkg/osutil"
+	"github.com/google/syzkaller/pkg/tool"
 	"github.com/google/syzkaller/sys/targets"
 )
 
@@ -37,11 +37,13 @@ func main() {
 	var (
 		flagOS             = flag.String("os", runtime.GOOS, "target os")
 		flagArch           = flag.String("arch", runtime.GOARCH, "target arch")
+		flagVM             = flag.String("vm", "", "VM type")
 		flagKernelSrc      = flag.String("kernel_src", "", "path to kernel sources")
 		flagKernelBuildSrc = flag.String("kernel_build_src", "", "path to kernel image's build dir (optional)")
 		flagKernelObj      = flag.String("kernel_obj", "", "path to kernel build/obj dir")
+		flagExport         = flag.String("csv", "", "export coverage data in csv format (optional)")
 	)
-	flag.Parse()
+	defer tool.Init()()
 
 	if len(flag.Args()) == 0 {
 		fmt.Fprintf(os.Stderr, "usage: syz-cover [flags] rawcover.file\n")
@@ -59,32 +61,41 @@ func main() {
 	}
 	target := targets.Get(*flagOS, *flagArch)
 	if target == nil {
-		failf("unknown target %v/%v", *flagOS, *flagArch)
+		tool.Failf("unknown target %v/%v", *flagOS, *flagArch)
 	}
 	pcs, err := readPCs(flag.Args())
 	if err != nil {
-		failf("%v", err)
+		tool.Fail(err)
 	}
-	kernelObj := filepath.Join(*flagKernelObj, target.KernelObject)
-	rg, err := cover.MakeReportGenerator(kernelObj, *flagKernelSrc, *flagKernelBuildSrc, *flagArch)
+	rg, err := cover.MakeReportGenerator(target, *flagVM, *flagKernelObj,
+		*flagKernelSrc, *flagKernelBuildSrc, nil, nil, nil)
 	if err != nil {
-		failf("%v", err)
+		tool.Fail(err)
 	}
 	progs := []cover.Prog{{PCs: pcs}}
 	buf := new(bytes.Buffer)
-	if err := rg.Do(buf, progs); err != nil {
-		failf("%v", err)
+	if *flagExport != "" {
+		if err := rg.DoCSV(buf, progs); err != nil {
+			tool.Fail(err)
+		}
+		if err := osutil.WriteFile(*flagExport, buf.Bytes()); err != nil {
+			tool.Fail(err)
+		}
+		return
+	}
+	if err := rg.DoHTML(buf, progs); err != nil {
+		tool.Fail(err)
 	}
 	fn, err := osutil.TempFile("syz-cover")
 	if err != nil {
-		failf("%v", err)
+		tool.Fail(err)
 	}
 	fn += ".html"
 	if err := osutil.WriteFile(fn, buf.Bytes()); err != nil {
-		failf("%v", err)
+		tool.Fail(err)
 	}
 	if err := exec.Command("xdg-open", fn).Start(); err != nil {
-		failf("failed to start browser: %v", err)
+		tool.Failf("failed to start browser: %v", err)
 	}
 }
 
@@ -108,9 +119,4 @@ func readPCs(files []string) ([]uint64, error) {
 		}
 	}
 	return pcs, nil
-}
-
-func failf(msg string, args ...interface{}) {
-	fmt.Fprintf(os.Stderr, msg+"\n", args...)
-	os.Exit(1)
 }

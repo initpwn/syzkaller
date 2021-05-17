@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/google/syzkaller/pkg/debugtracer"
 )
 
 func init() {
@@ -28,7 +29,7 @@ func TestGitRepo(t *testing.T) {
 	defer os.RemoveAll(baseDir)
 	repo1 := CreateTestRepo(t, baseDir, "repo1")
 	repo2 := CreateTestRepo(t, baseDir, "repo2")
-	repo := newGit(filepath.Join(baseDir, "repo"), nil)
+	repo := newGit(filepath.Join(baseDir, "repo"), nil, nil)
 	{
 		com, err := repo.Poll(repo1.Dir, "master")
 		if err != nil {
@@ -106,6 +107,35 @@ func TestGitRepo(t *testing.T) {
 			t.Fatal(diff)
 		}
 	}
+	{
+		type Test struct {
+			head     *Commit
+			commit   *Commit
+			contains bool
+		}
+		tests := []Test{
+			{repo2.Commits["branch2"]["1"], repo2.Commits["branch2"]["1"], true},
+			{repo2.Commits["branch2"]["1"], repo2.Commits["branch2"]["0"], true},
+			{repo2.Commits["branch2"]["1"], repo2.Commits["master"]["0"], true},
+			{repo2.Commits["branch2"]["1"], repo2.Commits["master"]["1"], false},
+			{repo2.Commits["branch2"]["1"], repo2.Commits["branch1"]["0"], false},
+			{repo2.Commits["branch2"]["1"], repo2.Commits["branch1"]["1"], false},
+			{repo2.Commits["branch2"]["0"], repo2.Commits["branch2"]["0"], true},
+			{repo2.Commits["branch2"]["0"], repo2.Commits["branch2"]["1"], false},
+			{repo2.Commits["branch2"]["0"], repo2.Commits["master"]["0"], true},
+			{repo2.Commits["branch2"]["0"], repo2.Commits["master"]["1"], false},
+		}
+		for i, test := range tests {
+			if _, err := repo.SwitchCommit(test.head.Hash); err != nil {
+				t.Fatal(err)
+			}
+			if contains, err := repo.Contains(test.commit.Hash); err != nil {
+				t.Fatal(err)
+			} else if contains != test.contains {
+				t.Errorf("test %v: got %v, want %v", i, contains, test.contains)
+			}
+		}
+	}
 }
 
 func TestMetadata(t *testing.T) {
@@ -167,8 +197,8 @@ func checkCommit(t *testing.T, idx int, test testCommit, com *Commit, checkTags 
 	if userName != com.AuthorName {
 		t.Errorf("#%v: want author name %q, got %q", idx, userName, com.Author)
 	}
-	if diff := cmp.Diff(test.cc, com.CC); diff != "" {
-		t.Logf("%#v", com.CC)
+	if diff := cmp.Diff(test.cc, com.Recipients.GetEmails(To)); diff != "" {
+		t.Logf("%#v", com.Recipients)
 		t.Error(diff)
 	}
 	if diff := cmp.Diff(test.tags, com.Tags); checkTags && diff != "" {
@@ -285,6 +315,16 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
 		cc:          []string{userEmail},
 		tags:        []string{"638dbf7851da8e255af5"},
 	},
+	{
+		description: `Reported-by: syzbot+3e3c7cfa8093f8de047e@my.mail.com
+
+Comment out an assertion that's now bogus and add a comment.
+`,
+		title:  "Reported-by: syzbot+3e3c7cfa8093f8de047e@my.mail.com",
+		author: userEmail,
+		cc:     []string{userEmail},
+		tags:   []string{"3e3c7cfa8093f8de047e"},
+	},
 }
 
 func TestBisect(t *testing.T) {
@@ -305,9 +345,28 @@ func TestBisect(t *testing.T) {
 		commits = append(commits, com.Hash)
 		t.Logf("%v %v", com.Hash, com.Title)
 	}
+	type predFunc func() (BisectResult, error)
 	type Test struct {
-		pred   func() (BisectResult, error)
+		pred   predFunc
 		result []string
+	}
+	makePred := func(res1, res2, res3 BisectResult) predFunc {
+		return func() (BisectResult, error) {
+			current, err := repo.repo.HeadCommit()
+			if err != nil {
+				t.Fatal(err)
+			}
+			switch current.Hash {
+			case commits[1]:
+				return res1, nil
+			case commits[2]:
+				return res2, nil
+			case commits[3]:
+				return res3, nil
+			default:
+				return 0, fmt.Errorf("unknown commit %v", current.Hash)
+			}
+		}
 	}
 	tests := []Test{
 		{
@@ -333,68 +392,23 @@ func TestBisect(t *testing.T) {
 		},
 		{
 			// Some are skipped.
-			func() (BisectResult, error) {
-				current, err := repo.repo.HeadCommit()
-				if err != nil {
-					t.Fatal(err)
-				}
-				switch current.Hash {
-				case commits[1]:
-					return BisectSkip, nil
-				case commits[2]:
-					return BisectSkip, nil
-				case commits[3]:
-					return BisectGood, nil
-				default:
-					return 0, fmt.Errorf("unknown commit %v", current.Hash)
-				}
-			},
+			makePred(BisectSkip, BisectSkip, BisectGood),
 			[]string{commits[4]},
 		},
 		{
 			// Some are skipped.
-			func() (BisectResult, error) {
-				current, err := repo.repo.HeadCommit()
-				if err != nil {
-					t.Fatal(err)
-				}
-				switch current.Hash {
-				case commits[1]:
-					return BisectGood, nil
-				case commits[2]:
-					return BisectSkip, nil
-				case commits[3]:
-					return BisectBad, nil
-				default:
-					return 0, fmt.Errorf("unknown commit %v", current.Hash)
-				}
-			},
+			makePred(BisectGood, BisectSkip, BisectBad),
 			[]string{commits[2], commits[3]},
 		},
 		{
 			// Some are skipped.
-			func() (BisectResult, error) {
-				current, err := repo.repo.HeadCommit()
-				if err != nil {
-					t.Fatal(err)
-				}
-				switch current.Hash {
-				case commits[1]:
-					return BisectSkip, nil
-				case commits[2]:
-					return BisectSkip, nil
-				case commits[3]:
-					return BisectGood, nil
-				default:
-					return 0, fmt.Errorf("unknown commit %v", current.Hash)
-				}
-			},
+			makePred(BisectSkip, BisectSkip, BisectGood),
 			[]string{commits[4]},
 		},
 	}
 	for i, test := range tests {
 		t.Logf("TEST %v", i)
-		result, err := repo.repo.Bisect(commits[4], commits[0], (*testWriter)(t), test.pred)
+		result, err := repo.repo.Bisect(commits[4], commits[0], &debugtracer.TestTracer{T: t}, test.pred)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -409,11 +423,4 @@ func TestBisect(t *testing.T) {
 			t.Fatal(diff)
 		}
 	}
-}
-
-type testWriter testing.T
-
-func (t *testWriter) Write(data []byte) (int, error) {
-	(*testing.T)(t).Log(string(data))
-	return len(data), nil
 }

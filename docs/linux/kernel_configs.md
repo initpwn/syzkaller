@@ -1,6 +1,6 @@
 # Linux kernel configs
 
-List of recommended kernel configs for `syzkaller`. See [syzbot config](/dashboard/config/upstream-kasan.config) for a reference config.
+List of recommended kernel configs for `syzkaller`. See [syzbot config](/dashboard/config/linux/upstream-apparmor-kasan.config) for a reference config.
 
 ## Syzkaller features
 
@@ -15,6 +15,13 @@ Note that `CONFIG_KCOV_ENABLE_COMPARISONS` feature also requires `gcc8+` and the
 ```
     kcov: support comparison operands collection
     kcov: fix comparison callback signature
+```
+
+To detect memory leaks using the [Kernel Memory Leak Detector
+(kmemleak)](https://www.kernel.org/doc/html/latest/dev-tools/kmemleak.html):
+
+```
+CONFIG_DEBUG_KMEMLEAK=y
 ```
 
 To show code coverage in web interface:
@@ -76,6 +83,7 @@ For testing with fault injection enable the following configs (syzkaller will pi
 ```
 CONFIG_FAULT_INJECTION=y
 CONFIG_FAULT_INJECTION_DEBUG_FS=y
+CONFIG_FAULT_INJECTION_USERCOPY=y
 CONFIG_FAILSLAB=y
 CONFIG_FAIL_PAGE_ALLOC=y
 CONFIG_FAIL_MAKE_REQUEST=y

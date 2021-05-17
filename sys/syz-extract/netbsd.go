@@ -14,7 +14,7 @@ import (
 
 type netbsd struct{}
 
-func (*netbsd) prepare(sourcedir string, build bool, arches []string) error {
+func (*netbsd) prepare(sourcedir string, build bool, arches []*Arch) error {
 	if sourcedir == "" {
 		return fmt.Errorf("provide path to kernel checkout via -sourcedir flag (or make extract SOURCEDIR)")
 	}
@@ -38,7 +38,7 @@ func (*netbsd) prepareArch(arch *Arch) error {
 	return nil
 }
 
-func machineLink(arch *Arch, machine string, dest string) error {
+func machineLink(arch *Arch, machine, dest string) error {
 	if err := os.Symlink(machineInclude(arch, machine),
 		filepath.Join(arch.buildDir, dest)); err != nil {
 		return fmt.Errorf("failed to create link: %v", err)
@@ -92,7 +92,8 @@ func (*netbsd) processFile(arch *Arch, info *compiler.ConstInfo) (map[string]uin
 		}
 	}
 	params := &extractParams{
-		AddSource: "#include <sys/syscall.h>",
+		AddSource:    "#include <sys/syscall.h>",
+		TargetEndian: arch.target.HostEndian,
 	}
 	res, undeclared, err := extract(info, "gcc", args, params)
 	for orig, compats := range compatNames {

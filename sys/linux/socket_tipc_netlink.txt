@@ -9,7 +9,7 @@ type tipc_net_addr int32be
 
 resource genl_tipc_family_id[int16]
 
-syz_genetlink_get_family_id$tipc(name ptr[in, string["TIPC"]]) genl_tipc_family_id
+syz_genetlink_get_family_id$tipc(name ptr[in, string["TIPC"]], fd sock_nl_generic) genl_tipc_family_id
 
 sendmsg$TIPC_CMD_SET_LINK_TOL(fd sock_nl_generic, msg ptr[in, msghdr_nl_tipc[TIPC_CMD_SET_LINK_TOL, tipc_tlv_desc[TIPC_TLV_LINK_CONFIG, tipc_link_config]]], f flags[send_flags])
 sendmsg$TIPC_CMD_SET_LINK_PRI(fd sock_nl_generic, msg ptr[in, msghdr_nl_tipc[TIPC_CMD_SET_LINK_PRI, tipc_tlv_desc[TIPC_TLV_LINK_CONFIG, tipc_link_config]]], f flags[send_flags])
@@ -93,8 +93,16 @@ tipc_name_table_query {
 	upbound		int32be
 }
 
+type alg_aead_name_tipc string["gcm(aes)", TIPC_AEAD_ALG_NAME]
+
+tipc_aead_key {
+	alg_name	alg_aead_name_tipc
+	keylen		len[key, int32]
+	key		array[int8, TIPC_AEAD_KEYLEN_MIN:TIPC_AEAD_KEYLEN_MAX]
+}
+
 resource genl_tipc2_family_id[int16]
-syz_genetlink_get_family_id$tipc2(name ptr[in, string["TIPCv2"]]) genl_tipc2_family_id
+syz_genetlink_get_family_id$tipc2(name ptr[in, string["TIPCv2"]], fd sock_nl_generic) genl_tipc2_family_id
 
 type msghdr_nl_tipc2[CMD] msghdr_netlink[netlink_msg_t[genl_tipc2_family_id, genlmsghdr_t[CMD], tipc_nl_policy]]
 
@@ -120,6 +128,8 @@ sendmsg$TIPC_NL_MON_GET(fd sock_nl_generic, msg ptr[in, msghdr_nl_tipc2[TIPC_NL_
 sendmsg$TIPC_NL_MON_PEER_GET(fd sock_nl_generic, msg ptr[in, msghdr_nl_tipc2[TIPC_NL_MON_PEER_GET]], f flags[send_flags])
 sendmsg$TIPC_NL_PEER_REMOVE(fd sock_nl_generic, msg ptr[in, msghdr_nl_tipc2[TIPC_NL_PEER_REMOVE]], f flags[send_flags])
 sendmsg$TIPC_NL_UDP_GET_REMOTEIP(fd sock_nl_generic, msg ptr[in, msghdr_nl_tipc2[TIPC_NL_UDP_GET_REMOTEIP]], f flags[send_flags])
+sendmsg$TIPC_NL_KEY_SET(fd sock_nl_generic, msg ptr[in, msghdr_nl_tipc2[TIPC_NL_KEY_SET]], f flags[send_flags])
+sendmsg$TIPC_NL_KEY_FLUSH(fd sock_nl_generic, msg ptr[in, msghdr_nl_tipc2[TIPC_NL_KEY_FLUSH]], f flags[send_flags])
 
 tipc_nl_policy [
 	TIPC_NLA_BEARER	nlnest[TIPC_NLA_BEARER, array[tipc_nl_bearer_policy]]
@@ -170,6 +180,8 @@ tipc_nl_media_policy [
 tipc_nl_node_policy [
 	TIPC_NLA_NODE_ADDR	nlattr[TIPC_NLA_NODE_ADDR, int32]
 	TIPC_NLA_NODE_UP	nlattr[TIPC_NLA_NODE_UP, void]
+	TIPC_NLA_NODE_ID	nlattr[TIPC_NLA_NODE_ID, array[int8]]
+	TIPC_NLA_NODE_KEY	nlattr[TIPC_NLA_NODE_KEY, tipc_aead_key]
 ] [varlen]
 
 tipc_nl_net_policy [

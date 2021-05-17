@@ -15,6 +15,7 @@ import (
 	db "google.golang.org/appengine/datastore"
 )
 
+// nolint: funlen
 func TestJob(t *testing.T) {
 	c := NewCtx(t)
 	defer c.Close()
@@ -58,14 +59,16 @@ func TestJob(t *testing.T) {
 	c.expectEQ(strings.Contains(body, "syzbot has found a reproducer"), true)
 
 	c.incomingEmail(sender, "#syz test: repo",
-		EmailOptFrom("test@requester.com"), EmailOptCC([]string{mailingList}))
-	body = c.pollEmailBug().Body
-	c.expectEQ(strings.Contains(body, "want 2 args"), true)
+		EmailOptFrom("test@requester.com"), EmailOptSubject("my-subject"), EmailOptCC([]string{mailingList}))
+	msg := c.pollEmailBug()
+	c.expectEQ(strings.Contains(msg.Body, "want 2 args"), true)
+	c.expectEQ(msg.Subject, "Re: my-subject")
 
 	c.incomingEmail(sender, "#syz test: repo branch commit",
-		EmailOptFrom("test@requester.com"), EmailOptCC([]string{mailingList}))
-	body = c.pollEmailBug().Body
-	c.expectEQ(strings.Contains(body, "want 2 args"), true)
+		EmailOptFrom("test@requester.com"), EmailOptSubject("Re: my-subject"), EmailOptCC([]string{mailingList}))
+	msg = c.pollEmailBug()
+	c.expectEQ(strings.Contains(msg.Body, "want 2 args"), true)
+	c.expectEQ(msg.Subject, "Re: my-subject")
 
 	c.incomingEmail(sender, "#syz test: repo branch",
 		EmailOptFrom("test@requester.com"), EmailOptCC([]string{mailingList}))
@@ -73,7 +76,7 @@ func TestJob(t *testing.T) {
 	c.expectEQ(strings.Contains(body, "does not look like a valid git repo"), true)
 
 	c.incomingEmail(sender, "#syz test: git://git.git/git.git kernel-branch\n"+patch,
-		EmailOptFrom("\"foo\" <blAcklisteD@dOmain.COM>"))
+		EmailOptFrom("\"foo\" <blOcKed@dOmain.COM>"))
 	c.expectNoEmail()
 	pollResp := c.client2.pollJobs(build.Manager)
 	c.expectEQ(pollResp.ID, "")
@@ -102,7 +105,10 @@ func TestJob(t *testing.T) {
 	c.expectEQ(pollResp.SyzkallerCommit, build.SyzkallerCommit)
 	c.expectEQ(pollResp.Patch, []byte(patch))
 	c.expectEQ(pollResp.ReproOpts, []byte("repro opts"))
-	c.expectEQ(pollResp.ReproSyz, []byte("repro syz"))
+	c.expectEQ(pollResp.ReproSyz, []byte(
+		"# See https://goo.gl/kgGztJ for information about syzkaller reproducers.\n"+
+			"#repro opts\n"+
+			"repro syz"))
 	c.expectEQ(pollResp.ReproC, []byte("repro C"))
 
 	pollResp2 := c.client2.pollJobs(build.Manager)
@@ -125,11 +131,11 @@ func TestJob(t *testing.T) {
 		msg := c.pollEmailBug()
 		to := email.MergeEmailLists([]string{"test@requester.com", "somebody@else.com", mailingList})
 		c.expectEQ(msg.To, to)
-		c.expectEQ(msg.Subject, "Re: "+crash.Title)
+		c.expectEQ(msg.Subject, "Re: [syzbot] "+crash.Title)
 		c.expectEQ(len(msg.Attachments), 0)
 		c.expectEQ(msg.Body, fmt.Sprintf(`Hello,
 
-syzbot has tested the proposed patch but the reproducer still triggered crash:
+syzbot has tested the proposed patch but the reproducer is still triggering an issue:
 test crash title
 
 test crash report
@@ -168,7 +174,7 @@ patch:          %[1]v
 		c.expectEQ(len(msg.Attachments), 0)
 		c.expectEQ(msg.Body, fmt.Sprintf(`Hello,
 
-syzbot tried to test the proposed patch but build/boot failed:
+syzbot tried to test the proposed patch but the build/boot failed:
 
 failed to apply patch
 
@@ -207,7 +213,7 @@ patch:          %[1]v
 		truncatedError := string(jobDoneReq.Error[len(jobDoneReq.Error)-maxInlineError:])
 		c.expectEQ(msg.Body, fmt.Sprintf(`Hello,
 
-syzbot tried to test the proposed patch but build/boot failed:
+syzbot tried to test the proposed patch but the build/boot failed:
 
 %[1]v
 
@@ -246,7 +252,7 @@ patch:          %[3]v
 		c.expectEQ(len(msg.Attachments), 0)
 		c.expectEQ(msg.Body, fmt.Sprintf(`Hello,
 
-syzbot has tested the proposed patch and the reproducer did not trigger crash:
+syzbot has tested the proposed patch and the reproducer did not trigger any issue:
 
 Reported-and-tested-by: syzbot+%v@testapp.appspotmail.com
 
@@ -309,7 +315,7 @@ func TestJobWithoutPatch(t *testing.T) {
 		c.expectEQ(len(msg.Attachments), 0)
 		c.expectEQ(msg.Body, fmt.Sprintf(`Hello,
 
-syzbot has tested the proposed patch and the reproducer did not trigger crash:
+syzbot has tested the proposed patch and the reproducer did not trigger any issue:
 
 Reported-and-tested-by: syzbot+%v@testapp.appspotmail.com
 
@@ -336,7 +342,7 @@ func TestJobRestrictedManager(t *testing.T) {
 	defer c.Close()
 
 	build := testBuild(1)
-	build.Manager = "restricted-manager"
+	build.Manager = restrictedManager
 	c.client2.UploadBuild(build)
 
 	crash := testCrash(build, 1)
@@ -360,19 +366,19 @@ func TestJobRestrictedManager(t *testing.T) {
 	c.expectEQ(pollResp.KernelRepo, "git://restricted.git/restricted.git")
 }
 
-// Test that JobBisectFix is returned only after 30 days
+// Test that JobBisectFix is returned only after 30 days.
 func TestBisectFixJob(t *testing.T) {
 	c := NewCtx(t)
 	defer c.Close()
 
-	// Upload a crash report
+	// Upload a crash report.
 	build := testBuild(1)
 	c.client2.UploadBuild(build)
 	crash := testCrashWithRepro(build, 1)
 	c.client2.ReportCrash(crash)
 	c.client2.pollEmailBug()
 
-	// Receive the JobBisectCause
+	// Receive the JobBisectCause.
 	resp := c.client2.pollJobs(build.Manager)
 	c.client2.expectNE(resp.ID, "")
 	c.client2.expectEQ(resp.Type, dashapi.JobBisectCause)
@@ -382,11 +388,11 @@ func TestBisectFixJob(t *testing.T) {
 	}
 	c.client2.expectOK(c.client2.JobDone(done))
 
-	// Ensure no more jobs
+	// Ensure no more jobs.
 	resp = c.client2.pollJobs(build.Manager)
 	c.client2.expectEQ(resp.ID, "")
 
-	// Advance time by 30 days and read out any notification emails
+	// Advance time by 30 days and read out any notification emails.
 	{
 		c.advanceTime(30 * 24 * time.Hour)
 		msg := c.client2.pollEmailBug()
@@ -394,11 +400,11 @@ func TestBisectFixJob(t *testing.T) {
 		c.expectTrue(strings.Contains(msg.Body, "Sending this report upstream."))
 
 		msg = c.client2.pollEmailBug()
-		c.expectEQ(msg.Subject, "title1")
-		c.expectTrue(strings.Contains(msg.Body, "syzbot found the following crash"))
+		c.expectEQ(msg.Subject, "[syzbot] title1")
+		c.expectTrue(strings.Contains(msg.Body, "syzbot found the following issue"))
 	}
 
-	// Ensure that we get a JobBisectFix
+	// Ensure that we get a JobBisectFix.
 	resp = c.client2.pollJobs(build.Manager)
 	c.client2.expectNE(resp.ID, "")
 	c.client2.expectEQ(resp.Type, dashapi.JobBisectFix)
@@ -409,19 +415,19 @@ func TestBisectFixJob(t *testing.T) {
 	c.client2.expectOK(c.client2.JobDone(done))
 }
 
-// Test that JobBisectFix jobs are re-tried if crash occurs on ToT
+// Test that JobBisectFix jobs are re-tried if crash occurs on ToT.
 func TestBisectFixRetry(t *testing.T) {
 	c := NewCtx(t)
 	defer c.Close()
 
-	// Upload a crash report
+	// Upload a crash report.
 	build := testBuild(1)
 	c.client2.UploadBuild(build)
 	crash := testCrashWithRepro(build, 1)
 	c.client2.ReportCrash(crash)
 	c.client2.pollEmailBug()
 
-	// Receive the JobBisectCause
+	// Receive the JobBisectCause.
 	resp := c.client2.pollJobs(build.Manager)
 	c.client2.expectNE(resp.ID, "")
 	c.client2.expectEQ(resp.Type, dashapi.JobBisectCause)
@@ -431,7 +437,7 @@ func TestBisectFixRetry(t *testing.T) {
 	}
 	c.client2.expectOK(c.client2.JobDone(done))
 
-	// Advance time by 30 days and read out any notification emails
+	// Advance time by 30 days and read out any notification emails.
 	{
 		c.advanceTime(30 * 24 * time.Hour)
 		msg := c.client2.pollEmailBug()
@@ -439,11 +445,11 @@ func TestBisectFixRetry(t *testing.T) {
 		c.expectTrue(strings.Contains(msg.Body, "Sending this report upstream."))
 
 		msg = c.client2.pollEmailBug()
-		c.expectEQ(msg.Subject, "title1")
-		c.expectTrue(strings.Contains(msg.Body, "syzbot found the following crash"))
+		c.expectEQ(msg.Subject, "[syzbot] title1")
+		c.expectTrue(strings.Contains(msg.Body, "syzbot found the following issue"))
 	}
 
-	// Ensure that we get a JobBisectFix. We send back a crashlog, no error, no commits
+	// Ensure that we get a JobBisectFix. We send back a crashlog, no error, no commits.
 	resp = c.client2.pollJobs(build.Manager)
 	c.client2.expectNE(resp.ID, "")
 	c.client2.expectEQ(resp.Type, dashapi.JobBisectFix)
@@ -457,12 +463,12 @@ func TestBisectFixRetry(t *testing.T) {
 	}
 	c.client2.expectOK(c.client2.JobDone(done))
 
-	// Advance time by 30 days. No notification emails
+	// Advance time by 30 days. No notification emails.
 	{
 		c.advanceTime(30 * 24 * time.Hour)
 	}
 
-	// Ensure that we get a JobBisectFix retry
+	// Ensure that we get a JobBisectFix retry.
 	resp = c.client2.pollJobs(build.Manager)
 	c.client2.expectNE(resp.ID, "")
 	c.client2.expectEQ(resp.Type, dashapi.JobBisectFix)
@@ -504,8 +510,8 @@ func TestNotReportingAlreadyFixed(t *testing.T) {
 		c.expectTrue(strings.Contains(msg.Body, "Sending this report upstream."))
 
 		msg = c.client2.pollEmailBug()
-		c.expectEQ(msg.Subject, "title1")
-		c.expectTrue(strings.Contains(msg.Body, "syzbot found the following crash"))
+		c.expectEQ(msg.Subject, "[syzbot] title1")
+		c.expectTrue(strings.Contains(msg.Body, "syzbot found the following issue"))
 		sender = msg.Sender
 	}
 
@@ -560,7 +566,7 @@ func TestFixBisectionsListed(t *testing.T) {
 	c := NewCtx(t)
 	defer c.Close()
 
-	// Upload a crash report
+	// Upload a crash report.
 	build := testBuild(1)
 	c.client2.UploadBuild(build)
 	crash := testCrashWithRepro(build, 1)
@@ -595,8 +601,8 @@ func TestFixBisectionsListed(t *testing.T) {
 		c.expectTrue(strings.Contains(msg.Body, "Sending this report upstream."))
 
 		msg = c.client2.pollEmailBug()
-		c.expectEQ(msg.Subject, "title1")
-		c.expectTrue(strings.Contains(msg.Body, "syzbot found the following crash"))
+		c.expectEQ(msg.Subject, "[syzbot] title1")
+		c.expectTrue(strings.Contains(msg.Body, "syzbot found the following issue"))
 	}
 
 	// Ensure that we get a JobBisectFix. We send back a crashlog, no error,
@@ -647,9 +653,9 @@ func TestFixBisectionsDisabled(t *testing.T) {
 	c := NewCtx(t)
 	defer c.Close()
 
-	// Upload a crash report
+	// Upload a crash report.
 	build := testBuild(1)
-	build.Manager = "no-fix-bisection-manager"
+	build.Manager = noFixBisectionManager
 	c.client2.UploadBuild(build)
 	crash := testCrashWithRepro(build, 20)
 	c.client2.ReportCrash(crash)
@@ -673,8 +679,8 @@ func TestFixBisectionsDisabled(t *testing.T) {
 		c.expectTrue(strings.Contains(msg.Body, "Sending this report upstream."))
 
 		msg = c.client2.pollEmailBug()
-		c.expectEQ(msg.Subject, "title20")
-		c.expectTrue(strings.Contains(msg.Body, "syzbot found the following crash"))
+		c.expectEQ(msg.Subject, "[syzbot] title20")
+		c.expectTrue(strings.Contains(msg.Body, "syzbot found the following issue"))
 	}
 
 	// Ensure that we do not get a JobBisectFix.

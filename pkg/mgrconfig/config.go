@@ -3,13 +3,15 @@
 
 package mgrconfig
 
-import "encoding/json"
+import (
+	"encoding/json"
+)
 
 type Config struct {
 	// Instance name (used for identification and as GCE instance prefix).
 	Name string `json:"name"`
 	// Target OS/arch, e.g. "linux/arm64" or "linux/amd64/386" (amd64 OS with 386 test process).
-	Target string `json:"target"`
+	RawTarget string `json:"target"`
 	// URL that will display information about the running syz-manager process (e.g. "localhost:50000").
 	HTTP string `json:"http"`
 	// TCP address to serve RPC for fuzzer processes (optional).
@@ -35,12 +37,23 @@ type Config struct {
 	//	"qemu_args": "-fda {{TEMPLATE}}/fd"
 	WorkdirTemplate string `json:"workdir_template"`
 	// Directory with kernel object files (e.g. `vmlinux` for linux)
-	// (used for report symbolization and coverage reports, optional).
+	// (used for report symbolization, coverage reports and in tree modules finding, optional).
 	KernelObj string `json:"kernel_obj"`
+	// Directories with out-of-free kernel module object files (optional).
+	// KernelObj is also scanned for in-tree kernel modules and does not need to be duplicated here.
+	// Note: KASLR needs to be disabled and modules need to be pre-loaded at fixed addressses by init process.
+	// Note: the modules need to be unstripped and contain debug info.
+	ModuleObj []string `json:"module_obj"`
 	// Kernel source directory (if not set defaults to KernelObj).
 	KernelSrc string `json:"kernel_src,omitempty"`
 	// Location of the driectory where the kernel was built (if not set defaults to KernelSrc)
 	KernelBuildSrc string `json:"kernel_build_src"`
+	// Kernel subsystem with paths to each subsystem
+	//	"kernel_subsystem": [
+	//		{ "name": "sound", "path": ["sound", "techpack/audio"]},
+	//		{ "name": "mydriver": "path": ["mydriver_path"]}
+	//	]
+	KernelSubsystem []Subsystem `json:"kernel_subsystem,omitempty"`
 	// Arbitrary optional tag that is saved along with crash reports (e.g. branch/commit).
 	Tag string `json:"tag,omitempty"`
 	// Location of the disk image file.
@@ -54,6 +67,27 @@ type Config struct {
 	HubClient string `json:"hub_client,omitempty"`
 	HubAddr   string `json:"hub_addr,omitempty"`
 	HubKey    string `json:"hub_key,omitempty"`
+	// Hub input domain identifier (optional).
+	// The domain is used to avoid duplicate work (input minimization, smashing)
+	// across multiple managers testing similar kernels and connected to the same hub.
+	// If two managers are in the same domain, they will not do input minimization after each other.
+	// If additionally they are in the same smashing sub-domain, they will also not do smashing
+	// after each other.
+	// By default (empty domain) all managers testing the same OS are placed into the same domain,
+	// this is a reasonable setting if managers test roughly the same kernel. In this case they
+	// will not do minimization nor smashing after each other.
+	// The setting can be either a single identifier (e.g. "foo") which will affect both minimization
+	// and smashing; or two identifiers separated with '/' (e.g. "foo/bar"), in this case the first
+	// identifier affects minimization and both affect smashing.
+	// For example, if managers test different Linux kernel versions with different tools,
+	// a reasonable use of domains on these managers can be:
+	//  - "upstream/kasan"
+	//  - "upstream/kmsan"
+	//  - "upstream/kcsan"
+	//  - "5.4/kasan"
+	//  - "5.4/kcsan"
+	//  - "4.19/kasan"
+	HubDomain string `json:"hub_domain,omitempty"`
 
 	// List of email addresses to receive notifications when bugs are encountered for the first time (optional).
 	// Mailx is the only supported mailer. Please set it up prior to using this function.
@@ -69,8 +103,13 @@ type Config struct {
 	Syzkaller string `json:"syzkaller"`
 
 	// Number of parallel test processes inside of each VM.
-	// 1 by default, 4 or 8 would be reasonable numbers too.
+	// Allowed values are 1-32, recommended range is ~4-8, default value is 6.
+	// It should be chosen to saturate CPU inside of the VM and maximize number of test executions,
+	// but to not oversubscribe CPU and memory too severe to not cause OOMs and false hangs/stalls.
 	Procs int `json:"procs"`
+
+	// Maximum number of logs to store per crash (default: 100).
+	MaxCrashLogs int `json:"max_crash_logs"`
 
 	// Type of sandbox to use during fuzzing:
 	// "none": don't do anything special beyond resource sandboxing, default
@@ -83,6 +122,16 @@ type Config struct {
 
 	// Use KCOV coverage (default: true).
 	Cover bool `json:"cover"`
+	// Use coverage filter. Supported types of filter:
+	// "files": support specifying kernel source files, support regular expression.
+	// eg. "files": ["^net/core/tcp.c$", "^net/sctp/", "tcp"].
+	// "functions": support specifying kernel functions, support regular expression.
+	// eg. "functions": ["^foo$", "^bar", "baz"].
+	// "pcs": specify raw PC table files name.
+	// Each line of the file should be: "64-bit-pc:32-bit-weight\n".
+	// eg. "0xffffffff81000000:0x10\n"
+	CovFilter covFilterCfg `json:"cover_filter"`
+
 	// Reproduce, localize and minimize crashers (default: true).
 	Reproduce bool `json:"reproduce"`
 
@@ -105,13 +154,17 @@ type Config struct {
 	// Parameters for concrete types are in Config type in vm/TYPE/TYPE.go, e.g. vm/qemu/qemu.go.
 	VM json.RawMessage `json:"vm"`
 
-	// Implementation details beyond this point.
-	// Parsed Target:
-	TargetOS     string `json:"-"`
-	TargetArch   string `json:"-"`
-	TargetVMArch string `json:"-"`
-	// Syzkaller binaries that we are going to use:
-	SyzFuzzerBin   string `json:"-"`
-	SyzExecprogBin string `json:"-"`
-	SyzExecutorBin string `json:"-"`
+	// Implementation details beyond this point. Filled after parsing.
+	Derived `json:"-"`
+}
+
+type Subsystem struct {
+	Name  string   `json:"name"`
+	Paths []string `json:"path"`
+}
+
+type covFilterCfg struct {
+	Files     []string `json:"files"`
+	Functions []string `json:"functions"`
+	RawPCs    []string `json:"pcs"`
 }

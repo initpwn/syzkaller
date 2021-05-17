@@ -124,7 +124,7 @@ ip_set_type_create_policy [
 	IPSET_ATTR_HASHSIZE	nlnetw[IPSET_ATTR_HASHSIZE, int32be]
 	IPSET_ATTR_MAXELEM	nlnetw[IPSET_ATTR_MAXELEM, int32be]
 	IPSET_ATTR_NETMASK	nlattr[IPSET_ATTR_NETMASK, int8]
-	IPSET_ATTR_PROBES	nlattr[IPSET_ATTR_PROBES, int8]
+	IPSET_ATTR_BUCKETSIZE	nlattr[IPSET_ATTR_BUCKETSIZE, int8]
 	IPSET_ATTR_SIZE		nlnetw[IPSET_ATTR_SIZE, int32be]
 ] [varlen]
 
@@ -156,7 +156,7 @@ ip_set_type_adt_policy [
 ] [varlen]
 
 ipaddr_policy [
-# TODO: should ipv4_addr be in reverse byte order here? 
+# TODO: should ipv4_addr be in reverse byte order here?
 	IPSET_ATTR_IPADDR_IPV4	nlnetw[IPSET_ATTR_IPADDR_IPV4, ipv4_addr]
 	IPSET_ATTR_IPADDR_IPV6	nlnetw[IPSET_ATTR_IPADDR_IPV6, ipv6_addr]
 ] [varlen]

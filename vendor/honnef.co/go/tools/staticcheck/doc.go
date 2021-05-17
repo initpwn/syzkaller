@@ -41,7 +41,7 @@ large durations. These can be combined with arithmetic to express
 arbitrary durations, for example '5 * time.Second' for 5 seconds.
 
 If you truly meant to sleep for a tiny amount of time, use
-'n * time.Nanosecond' to signal to staticcheck that you did mean to sleep
+'n * time.Nanosecond' to signal to Staticcheck that you did mean to sleep
 for some amount of nanoseconds.`,
 		Since: "2017.1",
 	},
@@ -248,7 +248,7 @@ in a struct.`,
 	"SA1028": {
 		Title: `sort.Slice can only be used on slices`,
 		Text:  `The first argument of sort.Slice must be a slice.`,
-		Since: "Unreleased",
+		Since: "2020.1",
 	},
 
 	"SA1029": {
@@ -262,7 +262,7 @@ To avoid allocating when assigning to an interface{},
 context keys often have concrete type struct{}. Alternatively,
 exported context key variables' static type should be a pointer or
 interface.`,
-		Since: "Unreleased",
+		Since: "2020.1",
 	},
 
 	"SA2000": {
@@ -495,7 +495,7 @@ and therefore doSomething()'s return value implements both.`,
 	"SA4022": {
 		Title: `Comparing the address of a variable against nil`,
 		Text:  `Code such as 'if &x == nil' is meaningless, because taking the address of a variable always yields a non-nil pointer.`,
-		Since: "Unreleased",
+		Since: "2020.1",
 	},
 
 	"SA5000": {
@@ -588,9 +588,9 @@ then the type assertion can never succeed.
 This check applies the same logic when asserting from one interface to
 another. If both interface types contain the same method but with
 different signatures, then the type assertion can never succeed,
-either. `,
+either.`,
 
-		Since: "Unreleased",
+		Since: "2020.1",
 	},
 
 	"SA5011": {
@@ -619,8 +619,46 @@ statements. Consider the following examples:
 
         // t.Errorf does not abort the test, so if x is nil, the next line will panic.
         foo(*x)
-    }`,
-		Since: "Unreleased",
+    }
+
+Staticcheck tries to deduce which functions abort control flow.
+For example, it is aware that a function will not continue
+execution after a call to panic or log.Fatal. However, sometimes
+this detection fails, in particular in the presence of
+conditionals. Consider the following example:
+
+    func Log(msg string, level int) {
+        fmt.Println(msg)
+        if level == levelFatal {
+            os.Exit(1)
+        }
+    }
+
+    func Fatal(msg string) {
+        Log(msg, levelFatal)
+    }
+
+    func fn(x *int) {
+        if x == nil {
+            Fatal("unexpected nil pointer")
+        }
+        fmt.Println(*x)
+    }
+
+Staticcheck will flag the dereference of x, even though it is perfectly
+safe. Staticcheck is not able to deduce that a call to
+Fatal will exit the program. For the time being, the easiest
+workaround is to modify the definition of Fatal like so:
+
+    func Fatal(msg string) {
+        Log(msg, levelFatal)
+        panic("unreachable")
+    }
+
+We also hard-code functions from common logging packages such as
+logrus. Please file an issue if we're missing support for a
+popular package.`,
+		Since: "2020.1",
 	},
 
 	"SA6000": {

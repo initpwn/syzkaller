@@ -37,6 +37,10 @@ about its final title, in particular, you don't need to wait for the commit to
 be merged into upstream tree. `syzbot` only needs to know the title by which
 it will appear in tested trees. In case of an error or a title change, you can
 override the commit simply by sending another `#syz fix` command.
+- to undo a previous fix command and remove any fixing commits:
+```
+#syz unfix
+````
 - to mark the bug as a duplicate of another `syzbot` bug:
 ```
 #syz dup: exact-subject-of-another-report
@@ -53,8 +57,15 @@ override the commit simply by sending another `#syz fix` command.
 
 **Note**: all commands must start from beginning of the line.
 
-**Note**: please keep `syzkaller-bugs@googlegroups.com` mailing list in CC.
-It serves as a history of what happened with each bug report.
+**Note**: please keep at least `syzkaller-bugs@googlegroups.com` mailing list in CC.
+It serves as a history of what happened with each bug report. Keepint the main kernel
+mailing list (e.g. `linux-kernel@vger.kernel.org `) in CC is useful as well so that
+it's searchable in those archives as well.
+
+**Note**: `syzbot` identifies bugs by the `HASH` in the `syzbot+HASH@` receiver email address.
+So, strictly saying, you don't need to *reply* to emails (e.g. if you did not receive them),
+you can send a new email to the `syzbot+HASH@` email address, which you can find as `Sender`
+in email archives or as `Reported-by` email on the dashboard page for each bug.
 
 <div id="testing-patches"/>
 
@@ -80,7 +91,9 @@ If you don't provide a patch, `syzbot` will test the tree as is.
 This is useful if this is your own tree which already contains the patch,
 or to check if the bug is already fixed by some recent commit.
 
-After sending an email you should get a reply email with results within an hour.
+After sending an email you should typically get a reply email with results within
+an hour. In certain cases (e.g. syzbot is busy with a bisection) it might take
+singnificantly longer, up to a few days (see #1923 for details).
 
 **Note**: you may send the request only to `syzbot` email address, as patches sent
 to some mailing lists (e.g. netdev, netfilter-devel) will trigger patchwork.
@@ -174,7 +187,7 @@ Suggestions and patches that improve bisection quality for common cases are
 `syzbot` supports cause bisection (find the commit that introduces a bug) and
 fix bisection (find the commit that fixes a bug).
 
-The web UI for a specific kernel 
+The web UI for a specific kernel
 (say [upstream linux](https://syzkaller.appspot.com/upstream)) shows the
 `Bisected` status for all bugs.
 
@@ -200,14 +213,16 @@ reply with a `#syz fix: commit-title` so that syzbot can close the bug report.
 However, sometimes it can't extract a reproducer at all, or can only extract a
 syzkaller reproducer. syzkaller reproducers are programs in a special syzkaller
 notation and they can be executed on the target system with a little bit more
-effort. See [this](https://github.com/google/syzkaller/blob/master/docs/executing_syzkaller_programs.md)
-for instructions.
+effort. See [this](/docs/executing_syzkaller_programs.md) for instructions.
 
 A syskaller program can also give you an idea as to what syscalls with what
 arguments were executed (note that some calls can actually be executed in
 parallel).
 
-A syzkaller program can be converted to an almost equivalent C source using `syz-prog2c` utility. `syz-prog2c` has lots of flags in common with [syz-execprog](https://github.com/google/syzkaller/blob/master/docs/executing_syzkaller_programs.md), e.g. `-threaded`/`-collide` which control if the syscalls are executed sequentially or in parallel. An example invocation:
+A syzkaller program can be converted to an almost equivalent C source using `syz-prog2c` utility. `syz-prog2c`
+has lots of flags in common with [syz-execprog](/docs/executing_syzkaller_programs.md),
+e.g. `-threaded`/`-collide` which control if the syscalls are executed sequentially or in parallel.
+An example invocation:
 
 ```
 syz-prog2c -prog repro.syz.txt -enable=all -threaded -collide -repeat -procs=8 -sandbox=namespace -segv -tmpdir -waitrepeat
@@ -223,7 +238,7 @@ the provided crash report on the provided reproducer on a freshly-booted
 machine, so the reproducer worked for it somehow.
 
 Note: if the report contains `userspace arch: i386`,
-then the program needs to be built with `-m32` flag. 
+then the program needs to be built with `-m32` flag.
 
 `syzbot` uses GCE VMs for testing, but *usually* it is not important.
 
@@ -235,9 +250,13 @@ Exact compilers used by `syzbot` can be found here:
 - [gcc 8.0.1 20180301](https://storage.googleapis.com/syzkaller/gcc-8.0.1-20180301.tar.gz) (286MB)
 - [gcc 8.0.1 20180412](https://storage.googleapis.com/syzkaller/gcc-8.0.1-20180412.tar.gz) (33MB)
 - [gcc 9.0.0 20181231](https://storage.googleapis.com/syzkaller/gcc-9.0.0-20181231.tar.gz) (30MB)
+- [gcc 10.1.0-syz (20200507)](https://storage.googleapis.com/syzkaller/gcc-10.1.0-syz.tar.xz) (220MB)
 - [clang 7.0.0 (trunk 329060)](https://storage.googleapis.com/syzkaller/clang-kmsan-329060.tar.gz) (44MB)
 - [clang 7.0.0 (trunk 334104)](https://storage.googleapis.com/syzkaller/clang-kmsan-334104.tar.gz) (44MB)
 - [clang 8.0.0 (trunk 343298)](https://storage.googleapis.com/syzkaller/clang-kmsan-343298.tar.gz) (45MB)
+- [clang 10.0.0 (c2443155)](https://storage.googleapis.com/syzkaller/clang_install_c2443155.tar.gz)
+- [clang 11.0.0 (git ca2dcbd030e)](https://storage.googleapis.com/syzkaller/clang-11-prerelease-ca2dcbd030e.tar.xz) (682MB)
+- [clang 11.0.1](https://github.com/llvm/llvm-project/releases/tag/llvmorg-11.0.1)
 
 A QEMU-suitable Debian Stretch image can be found [here](https://storage.googleapis.com/syzkaller/stretch.img) (2 GB, compression somehow breaks it), root ssh key for it is [here](https://storage.googleapis.com/syzkaller/stretch.img.key)
 (do `chmod 0600` on it). A reference `qemu` command line to run it is as follows:
@@ -248,8 +267,8 @@ qemu-system-x86_64 -smp 2 -m 4G -enable-kvm -cpu host \
     -device virtio-scsi-pci,id=scsi \
     -device scsi-hd,bus=scsi.0,drive=d0 \
     -drive file=stretch.img,format=raw,if=none,id=d0 \
-    -append "root=/dev/sda console=ttyS0 earlyprintk=serial rodata=n \
-      oops=panic panic_on_warn=1 panic=86400 kvm-intel.nested=1 \      
+    -append "root=/dev/sda console=ttyS0 earlyprintk=serial \
+      oops=panic panic_on_warn=1 panic=86400 kvm-intel.nested=1 \
       security=apparmor ima_policy=tcb workqueue.watchdog_thresh=140 \
       nf-conntrack-ftp.ports=20000 nf-conntrack-tftp.ports=20000 \
       nf-conntrack-sip.ports=20000 nf-conntrack-irc.ports=20000 \
@@ -326,20 +345,22 @@ is the original source of uninitialized-ness.
 ## USB bugs
 
 syzkaller has an ability to perform fuzzing of the Linux kernel USB stack, see
-the details [here](/docs/linux/external_fuzzing_usb.md). This requires
-non-yet-upstreamed kernel changes, and as a result USB fuzzing is only being
-run on the `usb-fuzzer` branch of the `https://github.com/google/kasan.git` tree,
-and on the `master` branch of the `https://github.com/google/kmsan.git` tree.
+the details [here](/docs/linux/external_fuzzing_usb.md). As of now all kernel
+changes required for USB fuzzing have been merged into the mainline (the last one
+during the 5.8-rc1 merge window), so the USB fuzzing instance has been switched
+to target the [usb-testing](https://git.kernel.org/pub/scm/linux/kernel/git/gregkh/usb.git/log/?h=usb-testing) tree.
 
-If the bug report comes from the `usb-fuzzer` tree, the recommended way for
-triggering patch testing is to send an email to `syzbot+HASH` address containing
-the following line:
-```
-#syz test: https://github.com/google/kasan.git commit-hash
-```
-and attach/inline your test patch in the same email. `commit-hash` is the id
-of the kernel commit that corresponds to the **newest reproducer** listed on
-the dashboard for this bug.
+Testing kernel patches on the USB instance follows the same principle as on the
+mainline instances, with a few caveats:
+
+1. You may specify any kernel tree for `syz test` as long as it includes all
+mainline patches up to 5.8-rc1.
+
+2. Some of the bugs have reproducers generated on kernel versions with custom
+kernel (when fuzzing was performed with non-yet-mainlined kernel patches), thus
+those reproducers might no longer work. The recommended workflow is to: first,
+execute a `syz test` command on a target tree to make sure that the bug
+reproduces, and then execute a `syz test` command with a fix/debug patch.
 
 If the bug was triggered on the `KMSAN` tree, follow the [instructions above](#kmsan-bugs),
 with the exception that you must also use `commit-hash` instead of the `master`
@@ -348,7 +369,7 @@ branch when testing patches.
 ## Memory leaks
 
 `syzbot` uses `KMEMLEAK` to find memory leaks in the Linux kernel.
-`KMEMLEAK` kernel config is stored [here](/dashboard/config/upstream-leak.config).
+`KMEMLEAK` kernel config is stored [here](/dashboard/config/linux/upstream-leak.config).
 See `KMEMLEAK` [docs](https://www.kernel.org/doc/html/latest/dev-tools/kmemleak.html)
 for general info, algorithm overview and usage instructions.
 
@@ -370,13 +391,9 @@ of live objects in `/proc/slabinfo` steadily grow, most likely the leak is real.
 
 ## KCSAN bugs
 
-`KCSAN` is a dynamic data-race detector. `KCSAN` is not upstream yet, though,
-we want to upstream it later. For now, it lives in
-[github.com/google/ktsan/tree/kcsan](https://github.com/google/ktsan/tree/kcsan)
-and is based on a reasonably fresh upstream tree.
-
-Reproduction of data-races is unsupported, and syzbot is unable to test
-patches.
+[The Kernel Concurrency Sanitizer (KCSAN)](https://github.com/google/ktsan/wiki/KCSAN)
+is a dynamic data-race detector. Reproduction of data-races is currently
+unsupported, and syzbot is unable to test patches.
 
 ## No custom patches
 
@@ -401,7 +418,10 @@ ask tree maintainers for priority handling.
 However, syzbot kernel config always includes `CONFIG_DEBUG_AID_FOR_SYZBOT=y` setting,
 which is not normally present in kernel. What was used for particularly elusive bugs in the past
 is temporary merging some additional debugging code into `linux-next` under this config setting
-(e.g. more debug checks and/or debug output) and waiting for new crash reports from syzbot. 
+(e.g. more debug checks and/or debug output) and waiting for new crash reports from syzbot.
+
+One can also always run syzkaller locally on any kernel for better stress testing
+of a particular subsystem and/or patch.
 
 ## Kernel configs
 
@@ -409,4 +429,4 @@ Kernel configs, sysctls and command line arguments that `syzbot` uses are availa
 
 ## Is syzbot code available?
 
-Yes, it is [here](https://github.com/google/syzkaller/tree/master/dashboard/app).
+Yes, it is [here](/dashboard/app).

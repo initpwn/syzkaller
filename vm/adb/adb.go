@@ -20,6 +20,7 @@ import (
 	"github.com/google/syzkaller/pkg/config"
 	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/pkg/osutil"
+	"github.com/google/syzkaller/pkg/report"
 	"github.com/google/syzkaller/vm/vmimpl"
 )
 
@@ -37,6 +38,11 @@ type Config struct {
 	// This option is enabled by default. Turn it off if your devices
 	// don't have battery service, or it causes problems otherwise.
 	BatteryCheck bool `json:"battery_check"`
+	// If this option is set (default), the device is rebooted after each crash.
+	// Set it to false to disable reboots.
+	TargetReboot  bool   `json:"target_reboot"`
+	RepairScript  string `json:"repair_script"`  // script to execute before each startup
+	StartupScript string `json:"startup_script"` // script to execute after each startup
 }
 
 type Pool struct {
@@ -45,6 +51,7 @@ type Pool struct {
 }
 
 type instance struct {
+	cfg     *Config
 	adbBin  string
 	device  string
 	console string
@@ -56,6 +63,7 @@ func ctor(env *vmimpl.Env) (vmimpl.Pool, error) {
 	cfg := &Config{
 		Adb:          "adb",
 		BatteryCheck: true,
+		TargetReboot: true,
 	}
 	if err := config.LoadData(env.Config, cfg); err != nil {
 		return nil, fmt.Errorf("failed to parse adb vm config: %v", err)
@@ -88,6 +96,7 @@ func (pool *Pool) Count() int {
 
 func (pool *Pool) Create(workdir string, index int) (vmimpl.Instance, error) {
 	inst := &instance{
+		cfg:    pool.cfg,
 		adbBin: pool.cfg.Adb,
 		device: pool.cfg.Devices[index],
 		closed: make(chan bool),
@@ -256,25 +265,55 @@ func (inst *instance) adb(args ...string) ([]byte, error) {
 func (inst *instance) repair() error {
 	// Assume that the device is in a bad state initially and reboot it.
 	// Ignore errors, maybe we will manage to reboot it anyway.
+	if inst.cfg.RepairScript != "" {
+		if err := inst.runScript(inst.cfg.RepairScript); err != nil {
+			return err
+		}
+	}
 	inst.waitForSSH()
 	// History: adb reboot episodically hangs, so we used a more reliable way:
 	// using syz-executor to issue reboot syscall. However, this has stopped
 	// working, probably due to the introduction of seccomp. Therefore,
 	// we revert this to `adb shell reboot` in the meantime, until a more
 	// reliable solution can be sought out.
-	if _, err := inst.adb("shell", "reboot"); err != nil {
-		return err
-	}
-	// Now give it another 5 minutes to boot.
-	if !vmimpl.SleepInterruptible(10 * time.Second) {
-		return fmt.Errorf("shutdown in progress")
-	}
-	if err := inst.waitForSSH(); err != nil {
-		return err
+	if inst.cfg.TargetReboot {
+		if _, err := inst.adb("shell", "reboot"); err != nil {
+			return err
+		}
+		// Now give it another 5 minutes to boot.
+		if !vmimpl.SleepInterruptible(10 * time.Second) {
+			return fmt.Errorf("shutdown in progress")
+		}
+		if err := inst.waitForSSH(); err != nil {
+			return err
+		}
 	}
 	// Switch to root for userdebug builds.
 	inst.adb("root")
-	return inst.waitForSSH()
+	inst.waitForSSH()
+	if inst.cfg.StartupScript != "" {
+		if err := inst.runScript(inst.cfg.StartupScript); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (inst *instance) runScript(script string) error {
+	log.Logf(2, "adb: executing %s", script)
+	// Execute the contents of the script.
+	contents, err := ioutil.ReadFile(script)
+	if err != nil {
+		return fmt.Errorf("unable to read %s: %v", script, err)
+	}
+	c := string(contents)
+	output, err := osutil.RunCmd(5*time.Minute, "", "sh", "-c", c)
+	if err != nil {
+		return fmt.Errorf("failed to execute %s: %v", script, err)
+	}
+	log.Logf(2, "adb: execute %s output\n%s", script, output)
+	log.Logf(2, "adb: done executing %s", script)
+	return nil
 }
 
 func (inst *instance) waitForSSH() error {
@@ -322,10 +361,10 @@ func (inst *instance) checkBatteryLevel() error {
 func (inst *instance) getBatteryLevel(numRetry int) (int, error) {
 	out, err := inst.adb("shell", "dumpsys battery | grep level:")
 
-	// allow for retrying for devices that does not boot up so fast
+	// Allow for retrying for devices that does not boot up so fast.
 	for ; numRetry >= 0 && err != nil; numRetry-- {
 		if numRetry > 0 {
-			// sleep for 5 seconds before retrying
+			// Sleep for 5 seconds before retrying.
 			time.Sleep(5 * time.Second)
 			out, err = inst.adb("shell", "dumpsys battery | grep level:")
 		}
@@ -404,6 +443,6 @@ func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command strin
 	return vmimpl.Multiplex(adb, merger, tty, timeout, stop, inst.closed, inst.debug)
 }
 
-func (inst *instance) Diagnose() ([]byte, bool) {
+func (inst *instance) Diagnose(rep *report.Report) ([]byte, bool) {
 	return nil, false
 }

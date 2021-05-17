@@ -15,7 +15,7 @@
 // Package b3 contains a propagation.HTTPFormat implementation
 // for B3 propagation. See https://github.com/openzipkin/b3-propagation
 // for more details.
-package b3
+package b3 // import "go.opencensus.io/plugin/ochttp/propagation/b3"
 
 import (
 	"encoding/hex"
@@ -68,7 +68,7 @@ func ParseTraceID(tid string) (trace.TraceID, bool) {
 		return trace.TraceID{}, false
 	}
 	b, err := hex.DecodeString(tid)
-	if err != nil {
+	if err != nil || len(b) > 16 {
 		return trace.TraceID{}, false
 	}
 	var traceID trace.TraceID
@@ -90,7 +90,7 @@ func ParseSpanID(sid string) (spanID trace.SpanID, ok bool) {
 		return trace.SpanID{}, false
 	}
 	b, err := hex.DecodeString(sid)
-	if err != nil {
+	if err != nil || len(b) > 8 {
 		return trace.SpanID{}, false
 	}
 	start := 8 - len(b)

@@ -13,13 +13,14 @@ import (
 
 // Target describes target OS/arch pair.
 type Target struct {
-	OS         string
-	Arch       string
-	Revision   string // unique hash representing revision of the descriptions
-	PtrSize    uint64
-	PageSize   uint64
-	NumPages   uint64
-	DataOffset uint64
+	OS           string
+	Arch         string
+	Revision     string // unique hash representing revision of the descriptions
+	PtrSize      uint64
+	PageSize     uint64
+	NumPages     uint64
+	DataOffset   uint64
+	LittleEndian bool
 
 	Syscalls  []*Syscall
 	Resources []*ResourceDesc
@@ -45,10 +46,6 @@ type Target struct {
 	// for mutation, or nil for generation. The function returns a new value of the struct/union,
 	// and optionally any calls that need to be inserted before the arg reference.
 	SpecialTypes map[string]func(g *Gen, typ Type, dir Dir, old Arg) (Arg, []*Call)
-
-	// Special strings that can matter for the target.
-	// Used as fallback when string type does not have own dictionary.
-	StringDictionary []string
 
 	// Resources that play auxiliary role, but widely used throughout all syscalls (e.g. pid/uid).
 	AuxResources map[string]bool
@@ -275,8 +272,7 @@ func (g *Gen) MutateArg(arg0 Arg) (calls []*Call) {
 			// and updateSizes to caller so that Mutate can act accordingly.
 			return
 		}
-		idx := g.r.Intn(len(ma.args))
-		arg, ctx := ma.args[idx], ma.ctxes[idx]
+		arg, ctx := ma.chooseArg(g.r.Rand)
 		newCalls, ok := g.r.target.mutateArg(g.r, g.s, arg, ctx, &updateSizes)
 		if !ok {
 			continue
@@ -309,14 +305,12 @@ func (pg *Builder) Append(c *Call) error {
 	return nil
 }
 
-func (pg *Builder) Allocate(size uint64) uint64 {
-	return pg.ma.alloc(nil, size)
+func (pg *Builder) Allocate(size, alignment uint64) uint64 {
+	return pg.ma.alloc(nil, size, alignment)
 }
 
 func (pg *Builder) AllocateVMA(npages uint64) uint64 {
-	psize := pg.target.PageSize
-	addr := pg.ma.alloc(nil, (npages+1)*psize)
-	return (addr + psize - 1) & ^(psize - 1)
+	return pg.ma.alloc(nil, npages*pg.target.PageSize, pg.target.PageSize)
 }
 
 func (pg *Builder) Finalize() (*Prog, error) {

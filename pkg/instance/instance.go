@@ -6,7 +6,6 @@
 package instance
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -22,20 +21,21 @@ import (
 	"github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/pkg/report"
+	"github.com/google/syzkaller/pkg/tool"
 	"github.com/google/syzkaller/pkg/vcs"
-	"github.com/google/syzkaller/prog"
 	"github.com/google/syzkaller/sys/targets"
 	"github.com/google/syzkaller/vm"
 )
 
 type Env interface {
 	BuildSyzkaller(string, string) error
-	BuildKernel(string, string, string, string, []byte) (string, string, error)
+	BuildKernel(string, string, string, string, string, []byte) (string, string, error)
 	Test(numVMs int, reproSyz, reproOpts, reproC []byte) ([]error, error)
 }
 
 type env struct {
-	cfg *mgrconfig.Config
+	cfg           *mgrconfig.Config
+	optionalFlags bool
 }
 
 func NewEnv(cfg *mgrconfig.Config) (Env, error) {
@@ -55,20 +55,30 @@ func NewEnv(cfg *mgrconfig.Config) (Env, error) {
 		return nil, fmt.Errorf("failed to create tmp dir: %v", err)
 	}
 	env := &env{
-		cfg: cfg,
+		cfg:           cfg,
+		optionalFlags: true,
 	}
 	return env, nil
 }
 
-func (env *env) BuildSyzkaller(repo, commit string) error {
+func (env *env) BuildSyzkaller(repoURL, commit string) error {
 	cfg := env.cfg
 	srcIndex := strings.LastIndex(cfg.Syzkaller, "/src/")
 	if srcIndex == -1 {
 		return fmt.Errorf("syzkaller path %q is not in GOPATH", cfg.Syzkaller)
 	}
-	if _, err := vcs.NewSyzkallerRepo(cfg.Syzkaller).CheckoutCommit(repo, commit); err != nil {
+	repo := vcs.NewSyzkallerRepo(cfg.Syzkaller)
+	if _, err := repo.CheckoutCommit(repoURL, commit); err != nil {
 		return fmt.Errorf("failed to checkout syzkaller repo: %v", err)
 	}
+	// The following commit ("syz-fuzzer: support optional flags") adds support for optional flags
+	// in syz-fuzzer and syz-execprog. This is required to invoke older binaries with newer flags
+	// without failing due to unknown flags.
+	optionalFlags, err := repo.Contains("64435345f0891706a7e0c7885f5f7487581e6005")
+	if err != nil {
+		return fmt.Errorf("optional flags check failed: %v", err)
+	}
+	env.optionalFlags = optionalFlags
 	cmd := osutil.Command(MakeBin, "target")
 	cmd.Dir = cfg.Syzkaller
 	cmd.Env = append([]string{}, os.Environ()...)
@@ -84,12 +94,18 @@ func (env *env) BuildSyzkaller(repo, commit string) error {
 		"CFLAGS=-fpermissive -w",
 	)
 	if _, err := osutil.Run(time.Hour, cmd); err != nil {
-		return fmt.Errorf("syzkaller build failed: %v", err)
+		goEnvCmd := osutil.Command("go", "env")
+		goEnvCmd.Dir = cfg.Syzkaller
+		goEnvCmd.Env = append(append([]string{}, os.Environ()...), "GOPATH="+cfg.Syzkaller[:srcIndex])
+		goEnvOut, goEnvErr := osutil.Run(time.Hour, goEnvCmd)
+		gitStatusOut, gitStatusErr := osutil.RunCmd(time.Hour, cfg.Syzkaller, "git", "status")
+		return fmt.Errorf("syzkaller build failed: %v\ngo env (err=%v)\n%s\ngit status (err=%v)\n%s",
+			err, goEnvErr, goEnvOut, gitStatusErr, gitStatusOut)
 	}
 	return nil
 }
 
-func (env *env) BuildKernel(compilerBin, userspaceDir, cmdlineFile, sysctlFile string, kernelConfig []byte) (
+func (env *env) BuildKernel(compilerBin, ccacheBin, userspaceDir, cmdlineFile, sysctlFile string, kernelConfig []byte) (
 	string, string, error) {
 	imageDir := filepath.Join(env.cfg.Workdir, "image")
 	params := &build.Params{
@@ -99,6 +115,7 @@ func (env *env) BuildKernel(compilerBin, userspaceDir, cmdlineFile, sysctlFile s
 		KernelDir:    env.cfg.KernelSrc,
 		OutputDir:    imageDir,
 		Compiler:     compilerBin,
+		Ccache:       ccacheBin,
 		UserspaceDir: userspaceDir,
 		CmdlineFile:  cmdlineFile,
 		SysctlFile:   sysctlFile,
@@ -205,13 +222,14 @@ func (env *env) Test(numVMs int, reproSyz, reproOpts, reproC []byte) ([]error, e
 	res := make(chan error, numVMs)
 	for i := 0; i < numVMs; i++ {
 		inst := &inst{
-			cfg:       env.cfg,
-			reporter:  reporter,
-			vmPool:    vmPool,
-			vmIndex:   i,
-			reproSyz:  reproSyz,
-			reproOpts: reproOpts,
-			reproC:    reproC,
+			cfg:           env.cfg,
+			optionalFlags: env.optionalFlags,
+			reporter:      reporter,
+			vmPool:        vmPool,
+			vmIndex:       i,
+			reproSyz:      reproSyz,
+			reproOpts:     reproOpts,
+			reproC:        reproC,
 		}
 		go func() { res <- inst.test() }()
 	}
@@ -223,14 +241,15 @@ func (env *env) Test(numVMs int, reproSyz, reproOpts, reproC []byte) ([]error, e
 }
 
 type inst struct {
-	cfg       *mgrconfig.Config
-	reporter  report.Reporter
-	vmPool    *vm.Pool
-	vm        *vm.Instance
-	vmIndex   int
-	reproSyz  []byte
-	reproOpts []byte
-	reproC    []byte
+	cfg           *mgrconfig.Config
+	optionalFlags bool
+	reporter      report.Reporter
+	vmPool        *vm.Pool
+	vm            *vm.Instance
+	vmIndex       int
+	reproSyz      []byte
+	reproOpts     []byte
+	reproC        []byte
 }
 
 func (inst *inst) test() error {
@@ -245,11 +264,7 @@ func (inst *inst) test() error {
 			rep := inst.reporter.Parse(testErr.Output)
 			if rep != nil && rep.Type == report.UnexpectedReboot {
 				// Avoid detecting any boot crash as "unexpected kernel reboot".
-				output := testErr.Output[rep.EndPos:]
-				if pos := bytes.IndexByte(testErr.Output[rep.StartPos:], '\n'); pos != -1 {
-					output = testErr.Output[rep.StartPos+pos:]
-				}
-				rep = inst.reporter.Parse(output)
+				rep = inst.reporter.Parse(testErr.Output[rep.SkipPos:])
 			}
 			if rep == nil {
 				rep = &report.Report{
@@ -301,24 +316,24 @@ func (inst *inst) testInstance() error {
 		return fmt.Errorf("failed to setup port forwarding: %v", err)
 	}
 
-	fuzzerBin, err := inst.vm.Copy(inst.cfg.SyzFuzzerBin)
+	fuzzerBin, err := inst.vm.Copy(inst.cfg.FuzzerBin)
 	if err != nil {
 		return &TestError{Title: fmt.Sprintf("failed to copy test binary to VM: %v", err)}
 	}
 
-	// If SyzExecutorCmd is provided, it means that syz-executor is already in
-	// the image, so no need to copy it.
-	executorCmd := targets.Get(inst.cfg.TargetOS, inst.cfg.TargetArch).SyzExecutorCmd
-	if executorCmd == "" {
-		executorCmd, err = inst.vm.Copy(inst.cfg.SyzExecutorBin)
+	// If ExecutorBin is provided, it means that syz-executor is already in the image,
+	// so no need to copy it.
+	executorBin := inst.cfg.SysTarget.ExecutorBin
+	if executorBin == "" {
+		executorBin, err = inst.vm.Copy(inst.cfg.ExecutorBin)
 		if err != nil {
 			return &TestError{Title: fmt.Sprintf("failed to copy test binary to VM: %v", err)}
 		}
 	}
 
-	cmd := OldFuzzerCmd(fuzzerBin, executorCmd, "test", inst.cfg.TargetOS, inst.cfg.TargetArch, fwdAddr,
-		inst.cfg.Sandbox, 0, inst.cfg.Cover, true)
-	outc, errc, err := inst.vm.Run(10*time.Minute, nil, cmd)
+	cmd := OldFuzzerCmd(fuzzerBin, executorBin, targets.TestOS, inst.cfg.TargetOS, inst.cfg.TargetArch, fwdAddr,
+		inst.cfg.Sandbox, 0, inst.cfg.Cover, true, inst.optionalFlags, inst.cfg.Timeouts.Slowdown)
+	outc, errc, err := inst.vm.Run(10*time.Minute*inst.cfg.Timeouts.Scale, nil, cmd)
 	if err != nil {
 		return fmt.Errorf("failed to run binary in VM: %v", err)
 	}
@@ -344,15 +359,15 @@ func (inst *inst) testInstance() error {
 func (inst *inst) testRepro() error {
 	cfg := inst.cfg
 	if len(inst.reproSyz) > 0 {
-		execprogBin, err := inst.vm.Copy(cfg.SyzExecprogBin)
+		execprogBin, err := inst.vm.Copy(cfg.ExecprogBin)
 		if err != nil {
 			return &TestError{Title: fmt.Sprintf("failed to copy test binary to VM: %v", err)}
 		}
-		// If SyzExecutorCmd is provided, it means that syz-executor is already in
-		// the image, so no need to copy it.
-		executorCmd := targets.Get(cfg.TargetOS, cfg.TargetArch).SyzExecutorCmd
-		if executorCmd == "" {
-			executorCmd, err = inst.vm.Copy(inst.cfg.SyzExecutorBin)
+		// If ExecutorBin is provided, it means that syz-executor is already in the image,
+		// so no need to copy it.
+		executorBin := cfg.SysTarget.ExecutorBin
+		if executorBin == "" {
+			executorBin, err = inst.vm.Copy(inst.cfg.ExecutorBin)
 			if err != nil {
 				return &TestError{Title: fmt.Sprintf("failed to copy test binary to VM: %v", err)}
 			}
@@ -379,20 +394,17 @@ func (inst *inst) testRepro() error {
 		if !opts.Fault {
 			opts.FaultCall = -1
 		}
-		cmdSyz := ExecprogCmd(execprogBin, executorCmd, cfg.TargetOS, cfg.TargetArch, opts.Sandbox,
-			true, true, true, cfg.Procs, opts.FaultCall, opts.FaultNth, vmProgFile)
-		if err := inst.testProgram(cmdSyz, 7*time.Minute); err != nil {
+		cmdSyz := ExecprogCmd(execprogBin, executorBin, cfg.TargetOS, cfg.TargetArch, opts.Sandbox,
+			true, true, true, cfg.Procs, opts.FaultCall, opts.FaultNth, inst.optionalFlags,
+			cfg.Timeouts.Slowdown, vmProgFile)
+		if err := inst.testProgram(cmdSyz, cfg.Timeouts.NoOutputRunningTime); err != nil {
 			return err
 		}
 	}
 	if len(inst.reproC) == 0 {
 		return nil
 	}
-	target, err := prog.GetTarget(cfg.TargetOS, cfg.TargetArch)
-	if err != nil {
-		return err
-	}
-	bin, err := csource.BuildNoWarn(target, inst.reproC)
+	bin, err := csource.BuildNoWarn(cfg.Target, inst.reproC)
 	if err != nil {
 		return err
 	}
@@ -401,9 +413,9 @@ func (inst *inst) testRepro() error {
 	if err != nil {
 		return &TestError{Title: fmt.Sprintf("failed to copy test binary to VM: %v", err)}
 	}
-	// We should test for longer (e.g. 5 mins), but the problem is that
-	// reproducer does not print anything, so after 3 mins we detect "no output".
-	return inst.testProgram(vmBin, time.Minute)
+	// We should test for more than full "no output" timeout, but the problem is that C reproducers
+	// don't print anything, so we will get a false "no output" crash.
+	return inst.testProgram(vmBin, cfg.Timeouts.NoOutput/2)
 }
 
 func (inst *inst) testProgram(command string, testTime time.Duration) error {
@@ -423,7 +435,7 @@ func (inst *inst) testProgram(command string, testTime time.Duration) error {
 }
 
 func FuzzerCmd(fuzzer, executor, name, OS, arch, fwdAddr, sandbox string, procs, verbosity int,
-	cover, debug, test, runtest bool) string {
+	cover, debug, test, runtest, optionalFlags bool, slowdown int) string {
 	osArg := ""
 	if targets.Get(OS, arch).HostFuzzer {
 		// Only these OSes need the flag, because the rest assume host OS.
@@ -439,18 +451,26 @@ func FuzzerCmd(fuzzer, executor, name, OS, arch, fwdAddr, sandbox string, procs,
 	if verbosity != 0 {
 		verbosityArg = fmt.Sprintf(" -vv=%v", verbosity)
 	}
+	optionalArg := ""
+	if optionalFlags {
+		optionalArg = " " + tool.OptionalFlags([]tool.Flag{
+			{Name: "slowdown", Value: fmt.Sprint(slowdown)},
+		})
+	}
 	return fmt.Sprintf("%v -executor=%v -name=%v -arch=%v%v -manager=%v -sandbox=%v"+
-		" -procs=%v -cover=%v -debug=%v -test=%v%v%v",
+		" -procs=%v -cover=%v -debug=%v -test=%v%v%v%v",
 		fuzzer, executor, name, arch, osArg, fwdAddr, sandbox,
-		procs, cover, debug, test, runtestArg, verbosityArg)
+		procs, cover, debug, test, runtestArg, verbosityArg, optionalArg)
 }
 
-func OldFuzzerCmd(fuzzer, executor, name, OS, arch, fwdAddr, sandbox string, procs int, cover, test bool) string {
-	return FuzzerCmd(fuzzer, executor, name, OS, arch, fwdAddr, sandbox, procs, 0, cover, false, test, false)
+func OldFuzzerCmd(fuzzer, executor, name, OS, arch, fwdAddr, sandbox string, procs int,
+	cover, test, optionalFlags bool, slowdown int) string {
+	return FuzzerCmd(fuzzer, executor, name, OS, arch, fwdAddr, sandbox, procs, 0, cover, false, test, false,
+		optionalFlags, slowdown)
 }
 
 func ExecprogCmd(execprog, executor, OS, arch, sandbox string, repeat, threaded, collide bool,
-	procs, faultCall, faultNth int, progFile string) string {
+	procs, faultCall, faultNth int, optionalFlags bool, slowdown int, progFile string) string {
 	repeatCount := 1
 	if repeat {
 		repeatCount = 0
@@ -459,16 +479,22 @@ func ExecprogCmd(execprog, executor, OS, arch, sandbox string, repeat, threaded,
 	if targets.Get(OS, arch).HostFuzzer {
 		osArg = " -os=" + OS
 	}
+	optionalArg := ""
+	if optionalFlags {
+		optionalArg = " " + tool.OptionalFlags([]tool.Flag{
+			{Name: "slowdown", Value: fmt.Sprint(slowdown)},
+		})
+	}
 	return fmt.Sprintf("%v -executor=%v -arch=%v%v -sandbox=%v"+
 		" -procs=%v -repeat=%v -threaded=%v -collide=%v -cover=0"+
-		" -fault_call=%v -fault_nth=%v %v",
+		" -fault_call=%v -fault_nth=%v%v %v",
 		execprog, executor, arch, osArg, sandbox,
 		procs, repeatCount, threaded, collide,
-		faultCall, faultNth, progFile)
+		faultCall, faultNth, optionalArg, progFile)
 }
 
 var MakeBin = func() string {
-	if runtime.GOOS == "freebsd" || runtime.GOOS == "openbsd" {
+	if runtime.GOOS == targets.FreeBSD || runtime.GOOS == targets.OpenBSD {
 		return "gmake"
 	}
 	return "make"

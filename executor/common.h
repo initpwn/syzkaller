@@ -9,7 +9,7 @@
 // - NORETURN/PRINTF/debug are removed
 // - exitf/fail are replaced with exit
 // - uintN types are replaced with uintN_t
-// - /*FOO*/ placeholders are replaced by actual values
+// - /*{{{FOO}}}*/ placeholders are replaced by actual values
 
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -17,6 +17,13 @@
 
 #if GOOS_freebsd || GOOS_test && HOSTGOOS_freebsd
 #include <sys/endian.h> // for htobe*.
+#elif GOOS_windows
+#define htobe16 _byteswap_ushort
+#define htobe32 _byteswap_ulong
+#define htobe64 _byteswap_uint64
+#define le16toh(x) x
+#define htole16(x) x
+typedef signed int ssize_t;
 #else
 #include <endian.h> // for htobe*.
 #endif
@@ -30,7 +37,9 @@
 #endif
 
 #if SYZ_EXECUTOR && !GOOS_linux
+#if !GOOS_windows
 #include <unistd.h>
+#endif
 NORETURN void doexit(int status)
 {
 	_exit(status);
@@ -78,7 +87,19 @@ static void segv_handler(int sig, siginfo_t* info, void* ctx)
 	uintptr_t addr = (uintptr_t)info->si_addr;
 	const uintptr_t prog_start = 1 << 20;
 	const uintptr_t prog_end = 100 << 20;
-	if (__atomic_load_n(&skip_segv, __ATOMIC_RELAXED) && (addr < prog_start || addr > prog_end)) {
+	int skip = __atomic_load_n(&skip_segv, __ATOMIC_RELAXED) != 0;
+	int valid = addr < prog_start || addr > prog_end;
+#if GOOS_freebsd || (GOOS_test && HOSTGOOS_freebsd)
+	// FreeBSD delivers SIGBUS in response to any fault that isn't a page
+	// fault.  In this case it tries to be helpful and sets si_addr to the
+	// address of the faulting instruction rather than zero as other
+	// operating systems seem to do.  However, such faults should always be
+	// ignored.
+	if (sig == SIGBUS) {
+		valid = 1;
+	}
+#endif
+	if (skip && valid) {
 		debug("SIGSEGV on %p, skipping\n", (void*)addr);
 #if GOOS_akaros
 		struct user_context* uctx = (struct user_context*)ctx;
@@ -112,13 +133,16 @@ static void install_segv_handler(void)
 }
 
 #define NONFAILING(...)                                              \
-	{                                                            \
+	({                                                           \
+		int ok = 1;                                          \
 		__atomic_fetch_add(&skip_segv, 1, __ATOMIC_SEQ_CST); \
 		if (_setjmp(segv_env) == 0) {                        \
 			__VA_ARGS__;                                 \
-		}                                                    \
+		} else                                               \
+			ok = 0;                                      \
 		__atomic_fetch_sub(&skip_segv, 1, __ATOMIC_SEQ_CST); \
-	}
+		ok;                                                  \
+	})
 #endif
 #endif
 
@@ -139,7 +163,7 @@ static void kill_and_wait(int pid, int* status)
 
 #if !GOOS_windows
 #if SYZ_EXECUTOR || SYZ_THREADED || SYZ_REPEAT && SYZ_EXECUTOR_USES_FORK_SERVER || \
-    __NR_syz_usb_connect || __NR_syz_usb_connect_ath9k
+    __NR_syz_usb_connect || __NR_syz_usb_connect_ath9k || __NR_syz_sleep_ms
 static void sleep_ms(uint64 ms)
 {
 	usleep(ms * 1000);
@@ -185,20 +209,38 @@ static void use_temporary_dir(void)
 #endif
 
 #if GOOS_akaros || GOOS_netbsd || GOOS_freebsd || GOOS_openbsd || GOOS_test
-#if SYZ_EXECUTOR || SYZ_EXECUTOR_USES_FORK_SERVER && SYZ_REPEAT && SYZ_USE_TMP_DIR
+#if (SYZ_EXECUTOR || SYZ_REPEAT) && SYZ_EXECUTOR_USES_FORK_SERVER && (SYZ_EXECUTOR || SYZ_USE_TMP_DIR)
 #include <dirent.h>
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 
-static void remove_dir(const char* dir)
+// We need to prevent the compiler from unrolling the while loop by using the gcc's noinline attribute
+// because otherwise it could trigger the compiler warning about a potential format truncation
+// when a filename is constructed with help of snprintf. This warning occurs because by unrolling
+// the while loop, the snprintf call will try to concatenate 2 buffers of length FILENAME_MAX and put
+// the result into a buffer of length FILENAME_MAX which is apparently not possible. But this is no
+// problem in our case because file and directory names should be short enough and fit into a buffer
+// of length FILENAME_MAX.
+static void __attribute__((noinline)) remove_dir(const char* dir)
 {
-	DIR* dp;
-	struct dirent* ep;
-	dp = opendir(dir);
-	if (dp == NULL)
+	DIR* dp = opendir(dir);
+	if (dp == NULL) {
+		if (errno == EACCES) {
+			// We could end up here in a recursive call to remove_dir() below.
+			// One of executed syscall could end up creating a directory rooted
+			// in the current working directory created by loop() with zero
+			// permissions. Try to perform a best effort removal of the
+			// directory.
+			if (rmdir(dir))
+				exitf("rmdir(%s) failed", dir);
+			return;
+		}
 		exitf("opendir(%s) failed", dir);
+	}
+	struct dirent* ep = 0;
 	while ((ep = readdir(dp))) {
 		if (strcmp(ep->d_name, ".") == 0 || strcmp(ep->d_name, "..") == 0)
 			continue;
@@ -221,7 +263,7 @@ static void remove_dir(const char* dir)
 #endif
 #endif
 
-#if !GOOS_linux
+#if !GOOS_linux && !GOOS_netbsd
 #if SYZ_EXECUTOR
 static int inject_fault(int nth)
 {
@@ -248,11 +290,11 @@ static void thread_start(void* (*fn)(void*), void* arg)
 	pthread_attr_t attr;
 	pthread_attr_init(&attr);
 	pthread_attr_setstacksize(&attr, 128 << 10);
-	int i;
 	// Clone can fail spuriously with EAGAIN if there is a concurrent execve in progress.
 	// (see linux kernel commit 498052bba55ec). But it can also be a true limit imposed by cgroups.
 	// In one case we want to retry infinitely, in another -- fail immidiately...
-	for (i = 0; i < 100; i++) {
+	int i = 0;
+	for (; i < 100; i++) {
 		if (pthread_create(&th, &attr, fn, arg) == 0) {
 			pthread_attr_destroy(&attr);
 			return;
@@ -367,12 +409,12 @@ static void csum_inet_update(struct csum_inet* csum, const uint8* data, size_t l
 	if (length == 0)
 		return;
 
-	size_t i;
-	for (i = 0; i < length - 1; i += 2)
+	size_t i = 0;
+	for (; i < length - 1; i += 2)
 		csum->acc += *(uint16*)&data[i];
 
 	if (length & 1)
-		csum->acc += (uint16)data[length - 1];
+		csum->acc += le16toh((uint16)data[length - 1]);
 
 	while (csum->acc > 0xffff)
 		csum->acc = (csum->acc & 0xffff) + (csum->acc >> 16);
@@ -410,13 +452,15 @@ static long syz_execute_func(volatile long text)
 	// from the reach of the random code, otherwise it's known to reach
 	// the output region somehow. The asm block is arch-independent except
 	// for the number of available registers.
+#if defined(__GNUC__)
 	volatile long p[8] = {0};
 	(void)p;
 #if GOARCH_amd64
 	asm volatile("" ::"r"(0l), "r"(1l), "r"(2l), "r"(3l), "r"(4l), "r"(5l), "r"(6l),
 		     "r"(7l), "r"(8l), "r"(9l), "r"(10l), "r"(11l), "r"(12l), "r"(13l));
 #endif
-	NONFAILING(((void (*)(void))(text))());
+#endif
+	((void (*)(void))(text))();
 	return 0;
 }
 #endif
@@ -462,7 +506,7 @@ static void loop(void)
 	int collide = 0;
 again:
 #endif
-	for (call = 0; call < /*NUM_CALLS*/; call++) {
+	for (call = 0; call < /*{{{NUM_CALLS}}}*/; call++) {
 		for (thread = 0; thread < (int)(sizeof(threads) / sizeof(threads[0])); thread++) {
 			struct thread_t* th = &threads[thread];
 			if (!th->created) {
@@ -482,7 +526,7 @@ again:
 			if (collide && (call % 2) == 0)
 				break;
 #endif
-			event_timedwait(&th->done, /*CALL_TIMEOUT*/);
+			event_timedwait(&th->done, /*{{{CALL_TIMEOUT_MS}}}*/);
 			break;
 		}
 	}
@@ -533,11 +577,11 @@ static void loop(void)
 	if (pipe(child_pipe))
 		fail("pipe failed");
 #endif
-	int iter;
+	int iter = 0;
 #if SYZ_REPEAT_TIMES
-	for (iter = 0; iter < /*REPEAT_TIMES*/; iter++) {
+	for (; iter < /*{{{REPEAT_TIMES}}}*/; iter++) {
 #else
-	for (iter = 0;; iter++) {
+	for (;; iter++) {
 #endif
 #if SYZ_EXECUTOR || SYZ_USE_TMP_DIR
 		// Create a new private work dir for this test (removed at the end of the loop).
@@ -607,7 +651,7 @@ static void loop(void)
 			sleep_ms(1);
 #if SYZ_EXECUTOR && SYZ_EXECUTOR_USES_SHMEM
 			// Even though the test process executes exit at the end
-			// and execution time of each syscall is bounded by 20ms,
+			// and execution time of each syscall is bounded by syscall_timeout_ms (~50ms),
 			// this backup watchdog is necessary and its performance is important.
 			// The problem is that exit in the test processes can fail (sic).
 			// One observed scenario is that the test processes prohibits
@@ -615,7 +659,9 @@ static void loop(void)
 			// is that the test processes setups a userfaultfd for itself,
 			// then the main thread hangs when it wants to page in a page.
 			// Below we check if the test process still executes syscalls
-			// and kill it after 1s of inactivity.
+			// and kill it after ~1s of inactivity.
+			uint64 min_timeout_ms = program_timeout_ms * 3 / 5;
+			uint64 inactive_timeout_ms = syscall_timeout_ms * 20;
 			uint64 now = current_time_ms();
 			uint32 now_executed = __atomic_load_n(output_data, __ATOMIC_RELAXED);
 			if (executed_calls != now_executed) {
@@ -623,11 +669,16 @@ static void loop(void)
 				last_executed = now;
 			}
 			// TODO: adjust timeout for progs with syz_usb_connect call.
-			if ((now - start < 5 * 1000) && (now - start < 3 * 1000 || now - last_executed < 1000))
+			if ((now - start < program_timeout_ms) &&
+			    (now - start < min_timeout_ms || now - last_executed < inactive_timeout_ms))
+				continue;
+#elif SYZ_EXECUTOR
+			if (current_time_ms() - start < program_timeout_ms)
 				continue;
 #else
-			if (current_time_ms() - start < 5 * 1000)
-				continue;
+		if (current_time_ms() - start < /*{{{PROGRAM_TIMEOUT_MS}}}*/) {
+			continue;
+		}
 #endif
 			debug("killing hanging pid %d\n", pid);
 			kill_and_wait(pid, &status);
@@ -659,9 +710,9 @@ static void loop(void)
 #endif
 
 #if !SYZ_EXECUTOR
-/*SYSCALL_DEFINES*/
+/*{{{SYSCALL_DEFINES}}}*/
 
-/*RESULTS*/
+/*{{{RESULTS}}}*/
 
 #if SYZ_THREADED || SYZ_REPEAT || SYZ_SANDBOX_NONE || SYZ_SANDBOX_SETUID || SYZ_SANDBOX_NAMESPACE || SYZ_SANDBOX_ANDROID
 #if SYZ_THREADED
@@ -672,7 +723,7 @@ void execute_one(void)
 void loop(void)
 #endif
 {
-	/*SYSCALLS*/
+	/*{{{SYSCALLS}}}*/
 #if SYZ_HAVE_CLOSE_FDS && !SYZ_THREADED && !SYZ_REPEAT
 	close_fds();
 #endif
@@ -685,7 +736,7 @@ void loop(void)
 
 int main(int argc, char** argv)
 {
-	/*MMAP_DATA*/
+	/*{{{MMAP_DATA}}}*/
 
 	program_name = argv[0];
 	if (argc == 2 && strcmp(argv[1], "child") == 0)
@@ -693,9 +744,12 @@ int main(int argc, char** argv)
 #else
 int main(void)
 {
-	/*MMAP_DATA*/
+	/*{{{MMAP_DATA}}}*/
 #endif
 
+#if SYZ_SYSCTL
+	setup_sysctl();
+#endif
 #if SYZ_BINFMT_MISC
 	setup_binfmt_misc();
 #endif
@@ -711,18 +765,21 @@ int main(void)
 #if SYZ_USB
 	setup_usb();
 #endif
+#if SYZ_802154
+	setup_802154();
+#endif
 
 #if SYZ_HANDLE_SEGV
 	install_segv_handler();
 #endif
 #if SYZ_MULTI_PROC
-	for (procid = 0; procid < /*PROCS*/; procid++) {
+	for (procid = 0; procid < /*{{{PROCS}}}*/; procid++) {
 		if (fork() == 0) {
 #endif
 #if SYZ_USE_TMP_DIR || SYZ_SANDBOX_ANDROID
 			use_temporary_dir();
 #endif
-			/*SANDBOX_FUNC*/
+			/*{{{SANDBOX_FUNC}}}*/
 #if SYZ_HAVE_CLOSE_FDS && !SYZ_THREADED && !SYZ_REPEAT && !SYZ_SANDBOX_NONE && \
     !SYZ_SANDBOX_SETUID && !SYZ_SANDBOX_NAMESPACE && !SYZ_SANDBOX_ANDROID
 			close_fds();

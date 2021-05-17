@@ -14,10 +14,13 @@ import (
 	"math/rand"
 	"net"
 	"os/exec"
+	"strings"
 	"time"
 
 	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/pkg/osutil"
+	"github.com/google/syzkaller/pkg/report"
+	"github.com/google/syzkaller/sys/targets"
 )
 
 // Pool represents a set of test machines (VMs, physical devices, etc) of particular type.
@@ -44,31 +47,39 @@ type Instance interface {
 	// Command is terminated after timeout. Send on the stop chan can be used to terminate it earlier.
 	Run(timeout time.Duration, stop <-chan bool, command string) (outc <-chan []byte, errc <-chan error, err error)
 
-	// Diagnose retrieves additional debugging info from the VM (e.g. by
-	// sending some sys-rq's or SIGABORT'ing a Go program).
+	// Diagnose retrieves additional debugging info from the VM
+	// (e.g. by sending some sys-rq's or SIGABORT'ing a Go program).
 	//
-	// Optionally returns (some or all) of the info directly. If wait ==
-	// true, the caller must wait for the VM to output info directly to its
-	// log.
-	Diagnose() (diagnosis []byte, wait bool)
+	// Optionally returns (some or all) of the info directly. If wait == true,
+	// the caller must wait for the VM to output info directly to its log.
+	//
+	// rep describes the reason why Diagnose was called.
+	Diagnose(rep *report.Report) (diagnosis []byte, wait bool)
 
 	// Close stops and destroys the VM.
 	Close()
+}
+
+// Infoer is an optional interface that can be implemented by Instance.
+type Infoer interface {
+	// MachineInfo returns additional info about the VM, e.g. VMM version/arguments.
+	Info() ([]byte, error)
 }
 
 // Env contains global constant parameters for a pool of VMs.
 type Env struct {
 	// Unique name
 	// Can be used for VM name collision resolution if several pools share global name space.
-	Name    string
-	OS      string // target OS
-	Arch    string // target arch
-	Workdir string
-	Image   string
-	SSHKey  string
-	SSHUser string
-	Debug   bool
-	Config  []byte // json-serialized VM-type-specific config
+	Name     string
+	OS       string // target OS
+	Arch     string // target arch
+	Workdir  string
+	Image    string
+	SSHKey   string
+	SSHUser  string
+	Timeouts targets.Timeouts
+	Debug    bool
+	Config   []byte // json-serialized VM-type-specific config
 }
 
 // BootError is returned by Pool.Create when VM does not boot.
@@ -170,4 +181,44 @@ func UnusedTCPPort() int {
 			return port
 		}
 	}
+}
+
+// Escapes double quotes(and nested double quote escapes). Ignores any other escapes.
+// Reference: https://www.gnu.org/software/bash/manual/html_node/Double-Quotes.html
+func EscapeDoubleQuotes(inp string) string {
+	var ret strings.Builder
+	for pos := 0; pos < len(inp); pos++ {
+		// If inp[pos] is not a double quote or a backslash, just use
+		// as is.
+		if inp[pos] != '"' && inp[pos] != '\\' {
+			ret.WriteByte(inp[pos])
+			continue
+		}
+		// If it is a double quote, escape.
+		if inp[pos] == '"' {
+			ret.WriteString("\\\"")
+			continue
+		}
+		// If we detect a backslash, reescape only if what it's already escaping
+		// is a double-quotes.
+		temp := ""
+		j := pos
+		for ; j < len(inp); j++ {
+			if inp[j] == '\\' {
+				temp += string(inp[j])
+				continue
+			}
+			// If the escape corresponds to a double quotes, re-escape.
+			// Else, just use as is.
+			if inp[j] == '"' {
+				temp = temp + temp + "\\\""
+			} else {
+				temp += string(inp[j])
+			}
+			break
+		}
+		ret.WriteString(temp)
+		pos = j
+	}
+	return ret.String()
 }

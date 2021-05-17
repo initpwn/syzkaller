@@ -6,6 +6,62 @@ mailing list and are listed on the [dashboard](https://syzkaller.appspot.com/ope
 
 Newer bugs comes first.
 
+- [tun(4): leaking device references](https://marc.info/?l=openbsd-cvs&m=161532031720186&w=2)
+
+- [pf(4): incorrect handling of overlapping fragments](https://marc.info/?l=openbsd-cvs&m=161399910228130&w=2 ) [ERRATA-68-014](https://ftp.openbsd.org/pub/OpenBSD/patches/6.8/common/014_pffrag.patch.sig)
+
+- [if_addgroup(9): double free of interface groups](https://marc.info/?l=openbsd-cvs&m=161296812703484&w=2)
+
+- [pf(4): `pfsync_state_import()` cannot be called with the pf state lock held](https://marc.info/?l=openbsd-cvs&m=161291389116274&w=2)
+
+- [pty(4): vnode handling regression](https://marc.info/?l=openbsd-cvs&m=161244556906196&w=2)
+
+- [kqueue: too strict assertion](https://marc.info/?l=openbsd-cvs&m=161171631607161&w=2)
+
+- [pflog(4): NULL pointer dereference](https://marc.info/?l=openbsd-cvs&m=161118513631692&w=2)
+
+- [pflog(4): construction of corrupted mbufs](https://marc.info/?l=openbsd-cvs&m=161109496230236&w=2)
+
+- [sosplice(9): stack overflow while handling broadcast packets](https://marc.info/?l=openbsd-cvs&m=161020414013356&w=2)
+
+- [pf(4): lenient validation of port ranges](https://marc.info/?l=openbsd-cvs&m=160814166024961&w=2)
+
+- [wsmux(4): NULL pointer dereference due to a race](https://marc.info/?l=openbsd-cvs&m=160724154822411&w=2)
+
+- [uvm(9): deadlock while using a vnode as the backing store](https://marc.info/?l=openbsd-cvs&m=160374171822863&w=2)
+
+- [pf(4): missing call to `NET_UNLOCK()`](https://marc.info/?l=openbsd-cvs&m=160336954005266&w=2)
+
+- [pf(4): sleeping with locks held](https://marc.info/?l=openbsd-cvs&m=160326770113745&w=2)
+
+- [mmap: lenient validation of shared mappings](https://marc.info/?l=openbsd-cvs&m=160184875108341&w=2)
+
+- [kcov(4): race during remote section removal](https://marc.info/?l=openbsd-cvs&m=159869048726340&w=2)
+
+- [sysctl(2): lenient validation of integer values](https://marc.info/?l=openbsd-cvs&m=159772809607851&w=2)
+
+- [inet6(4): lenient validation in `in6_ioctl_change_ifaddr()`](https://marc.info/?l=openbsd-cvs&m=159656077206976&w=2)
+
+- [wsmux(4): use-after-free](https://marc.info/?l=openbsd-cvs&m=159600205025410&w=2)
+
+- [pty(4): machine lockup due to expensive retyping](https://marc.info/?l=openbsd-cvs&m=159473720602522&w=2)
+
+- [sysctl(2): lenient validation of `net.inet.tcp.synbucketlimit`](https://marc.info/?l=openbsd-cvs&m=159249199005451&w=2)
+
+- [tty(4): infinite sleep during close](https://marc.info/?l=openbsd-cvs&m=158892312627663&w=2)
+
+- [inet6(4): lenient validation in `ip6_pullexthdr()`](https://marc.info/?l=openbsd-cvs&m=158874895026819&w=2)
+
+- [inet6(4): mutating static routes](https://marc.info/?l=openbsd-cvs&m=158754155106430&w=2)
+
+- [pf(4): lenient validation in `pf_rulecopyin()`](https://marc.info/?l=openbsd-cvs&m=158733548829486&w=2)
+
+- [sosplice(9): socket lock already held](https://marc.info/?l=openbsd-cvs&m=158670814206616&w=2)
+
+- [vmm(4): out-of-bounds read](https://marc.info/?l=openbsd-cvs&m=158548168627386&w=2)
+
+- [VOP_LOCK(9): too strict lockcount assertion](https://marc.info/?l=openbsd-cvs&m=158529591303747&w=2)
+
 - [wsmux(4): use-after-free](https://marc.info/?l=openbsd-cvs&m=158503642507991&w=2)
 
 - [sosplice(9): unbound recursion](https://marc.info/?l=openbsd-cvs&m=158396530407996&w=2)

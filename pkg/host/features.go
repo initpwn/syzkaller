@@ -27,6 +27,9 @@ const (
 	FeatureKCSAN
 	FeatureDevlinkPCI
 	FeatureUSBEmulation
+	FeatureVhciInjection
+	FeatureWifiEmulation
+	Feature802154Emulation
 	numFeatures
 )
 
@@ -65,8 +68,11 @@ func Check(target *prog.Target) (*Features, error) {
 		FeatureKCSAN:            {Name: "concurrency sanitizer", Reason: unsupported},
 		FeatureDevlinkPCI:       {Name: "devlink PCI setup", Reason: unsupported},
 		FeatureUSBEmulation:     {Name: "USB emulation", Reason: unsupported},
+		FeatureVhciInjection:    {Name: "hci packet injection", Reason: unsupported},
+		FeatureWifiEmulation:    {Name: "wifi device emulation", Reason: unsupported},
+		Feature802154Emulation:  {Name: "802.15.4 emulation", Reason: unsupported},
 	}
-	if targets.Get(target.OS, target.Arch).HostFuzzer {
+	if noHostChecks(target) {
 		return res, nil
 	}
 	for n, check := range checkFeature {
@@ -86,7 +92,7 @@ func Check(target *prog.Target) (*Features, error) {
 // Setup enables and does any one-time setup for the requested features on the host.
 // Note: this can be called multiple times and must be idempotent.
 func Setup(target *prog.Target, features *Features, featureFlags csource.Features, executor string) error {
-	if targets.Get(target.OS, target.Arch).HostFuzzer {
+	if noHostChecks(target) {
 		return nil
 	}
 	args := strings.Split(executor, " ")
@@ -98,7 +104,7 @@ func Setup(target *prog.Target, features *Features, featureFlags csource.Feature
 	if features[FeatureFault].Enabled {
 		args = append(args, "fault")
 	}
-	if target.OS == "linux" && featureFlags["binfmt_misc"].Enabled {
+	if target.OS == targets.Linux && featureFlags["binfmt_misc"].Enabled {
 		args = append(args, "binfmt_misc")
 	}
 	if features[FeatureKCSAN].Enabled {
@@ -107,6 +113,15 @@ func Setup(target *prog.Target, features *Features, featureFlags csource.Feature
 	if features[FeatureUSBEmulation].Enabled {
 		args = append(args, "usb")
 	}
-	_, err := osutil.RunCmd(time.Minute, "", executor, args...)
+	if featureFlags["ieee802154"].Enabled && features[Feature802154Emulation].Enabled {
+		args = append(args, "802154")
+	}
+	_, err := osutil.RunCmd(5*time.Minute, "", executor, args...)
 	return err
+}
+
+func noHostChecks(target *prog.Target) bool {
+	// HostFuzzer targets can't run Go binaries on the targets,
+	// so we actually run on the host on another OS. The same for targets.TestOS OS.
+	return targets.Get(target.OS, target.Arch).HostFuzzer || target.OS == targets.TestOS
 }

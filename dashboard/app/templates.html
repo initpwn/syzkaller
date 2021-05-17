@@ -30,6 +30,8 @@ Use of this source code is governed by Apache 2 LICENSE that can be found in the
 			<tr>
 				<td>
 					<h1><a href="/{{$.Namespace}}">syzbot</a></h1>
+				</td>
+				<td class="namespace_td">
 					<select class="namespace" onchange="window.location.href = '/' + this.value + '{{.Subpage}}';">
 						{{- range $ns := .Namespaces}}
 							<option value="{{$ns.Name}}" {{if eq $.Namespace $ns.Name}}selected="1"{{end}}>
@@ -51,6 +53,20 @@ Use of this source code is governed by Apache 2 LICENSE that can be found in the
 				</td>
 			</tr>
 		</table>
+		{{if not (eq .URLPath "/admin")}}
+		<table class="position_table">
+			<tr>
+				<td class="navigation">
+					<a class="navigation_tab{{if eq .URLPath (printf "/%v" $.Namespace)}}_selected{{end}}" href='/{{$.Namespace}}'>
+						<span style="color:DeepPink;">🐞</span> Open [{{$.Cached.Open}}]</a>
+					<a class="navigation_tab{{if eq .URLPath (printf "/%v/fixed" $.Namespace)}}_selected{{end}}" href='/{{$.Namespace}}/fixed'>
+						<span style="color:ForestGreen;">🐞</span> Fixed [{{$.Cached.Fixed}}]</a>
+					<a class="navigation_tab{{if eq .URLPath (printf "/%v/invalid" $.Namespace)}}_selected{{end}}" href='/{{$.Namespace}}/invalid'>
+						<span style="color:RoyalBlue;">🐞</span> Invalid [{{$.Cached.Invalid}}]</a>
+				</td>
+			</tr>
+		</table>
+		{{end}}
 	</header>
 	<br>
 {{end}}
@@ -60,14 +76,16 @@ Use of this source code is governed by Apache 2 LICENSE that can be found in the
 {{if .}}
 {{if .Bugs}}
 <table class="list_table">
-	{{if $.Fragment}}
-		<caption id="{{$.Fragment}}"><a class="plain" href="#{{$.Fragment}}">
-	{{else}}
-		<caption>
+	{{if $.Caption}}
+		{{if $.Fragment}}
+			<caption id="{{$.Fragment}}"><a class="plain" href="#{{$.Fragment}}">
+		{{else}}
+			<caption>
+		{{end}}
+		{{$.Caption}} ({{len $.Bugs}}):
+		{{if $.Fragment}}</a>{{end}}
+		</caption>
 	{{end}}
-	{{$.Caption}} ({{len $.Bugs}}):
-	{{if $.Fragment}}</a>{{end}}
-	</caption>
 	<thead>
 	<tr>
 		{{if $.ShowNamespace}}
@@ -75,7 +93,8 @@ Use of this source code is governed by Apache 2 LICENSE that can be found in the
 		{{end}}
 		<th><a onclick="return sortTable(this, 'Title', textSort)" href="#">Title</a></th>
 		<th><a onclick="return sortTable(this, 'Repro', reproSort)" href="#">Repro</a></th>
-		<th><a onclick="return sortTable(this, 'Bisected', textSort)" href="#">Bisected</a></th>
+		<th><a onclick="return sortTable(this, 'Cause bisect', textSort)" href="#">Cause bisect</a></th>
+		<th><a onclick="return sortTable(this, 'Fix bisect', textSort)" href="#">Fix bisect</a></th>
 		<th><a onclick="return sortTable(this, 'Count', numSort)" href="#">Count</a></th>
 		<th><a onclick="return sortTable(this, 'Last', timeSort)" href="#">Last</a></th>
 		<th><a onclick="return sortTable(this, 'Reported', timeSort)" href="#">Reported</a></th>
@@ -97,15 +116,8 @@ Use of this source code is governed by Apache 2 LICENSE that can be found in the
 			{{if $.ShowNamespace}}<td>{{$b.Namespace}}</td>{{end}}
 			<td class="title"><a href="{{$b.Link}}">{{$b.Title}}</a></td>
 			<td class="stat">{{formatReproLevel $b.ReproLevel}}</td>
-			<td class="stat">
-				{{if and $b.BisectCauseDone $b.BisectFixDone}}
-					cause+fix
-				{{else if $b.BisectCauseDone}}
-					cause
-				{{else if $b.BisectFixDone}}
-					fix
-				{{end}}
-			</td>
+			<td class="bisect_status">{{print $b.BisectCause}}</td>
+			<td class="bisect_status">{{print $b.BisectFix}}</td>
 			<td class="stat {{if $b.NumCrashesBad}}bad{{end}}">{{$b.NumCrashes}}</td>
 			<td class="stat">{{formatLateness $.Now $b.LastTime}}</td>
 			<td class="stat">
@@ -241,15 +253,15 @@ Use of this source code is governed by Apache 2 LICENSE that can be found in the
 		{{else if eq .Type $fixJob}}
 			<b>Fix bisection: failed</b>
 		{{end}}
-		({{link .LogLink "bisect log"}})</b><br>
+		<b>({{link .LogLink "bisect log"}})</b><br>
 	{{else if .Commit}}
 		{{if eq .Type $causeJob}}
 			<b>Cause bisection: introduced by</b>
 		{{else if eq .Type $fixJob}}
 			<b>Fix bisection: fixed by</b>
 		{{end}}
-		<b>({{link .LogLink "bisect log"}}):</b><br>
-		<br><span class="mono">
+		<b>({{link .LogLink "bisect log"}})</b> <span class="bad">{{print .Flags}}</span>:<br>
+		<span class="mono">
 		commit {{.Commit.Hash}}<br>
 		Author: {{.Commit.Author}}<br>
 		Date:   {{formatKernelTime .Commit.Date}}<br>
@@ -263,18 +275,18 @@ Use of this source code is governed by Apache 2 LICENSE that can be found in the
 			<b>Fix bisection: the fix commit could be any of</b>
 		{{end}}
 		<b>({{link .LogLink "bisect log"}}):</b><br>
-		<br><span class="mono">
+		<span class="mono">
 		{{range $com := .Commits}}
 			&nbsp;&nbsp;{{formatTagHash $com.Hash}} {{$com.Title}}<br>
 		{{end}}
 		</span>
 	{{else}}
 		{{if eq .Type $causeJob}}
-			<b>Cause bisection: the bug happens on the oldest tested release</b>
+			<b>Cause bisection: the issue happens on the oldest tested release</b>
 		{{else if eq .Type $fixJob}}
-			<b>Fix bisection: the bug occurs on the latest tested release</b>
+			<b>Fix bisection: the issue occurs on the latest tested release</b>
 		{{end}}
-		<br>
+		<b>({{link .LogLink "bisect log"}})</b><br>
 	{{end}}
 	{{if .CrashLogLink}}
 		Crash: {{link .CrashReportLink .CrashTitle}} ({{link .CrashLogLink "log"}})<br>
@@ -305,9 +317,8 @@ Use of this source code is governed by Apache 2 LICENSE that can be found in the
 			<th><a onclick="return sortTable(this, 'Report', reproSort)" href="#">Report</a></th>
 			<th><a onclick="return sortTable(this, 'Syz repro', reproSort)" href="#">Syz repro</a></th>
 			<th><a onclick="return sortTable(this, 'C repro', textSort)" href="#">C repro</a></th>
-			{{if .HasMaintainers}}
-			<th><a onclick="return sortTable(this, 'Maintainers', textSort)" href="#">Maintainers</a></th>
-			{{end}}
+			<th><a onclick="return sortTable(this, 'VM info', textSort)" href="#">VM info</a></th>
+			<th><a onclick="return sortTable(this, 'Title', textSort)" href="#">Title</a></th>
 		</tr>
 		</thead>
 		<tbody>
@@ -324,9 +335,8 @@ Use of this source code is governed by Apache 2 LICENSE that can be found in the
 			<td class="repro">{{if $b.ReportLink}}<a href="{{$b.ReportLink}}">report</a>{{end}}</td>
 			<td class="repro">{{if $b.ReproSyzLink}}<a href="{{$b.ReproSyzLink}}">syz</a>{{end}}</td>
 			<td class="repro">{{if $b.ReproCLink}}<a href="{{$b.ReproCLink}}">C</a>{{end}}</td>
-			{{if $.HasMaintainers}}
-			<td class="maintainers" title="{{$b.Maintainers}}">{{$b.Maintainers}}</td>
-			{{end}}
+			<td class="repro">{{if $b.MachineInfoLink}}<a href="{{$b.MachineInfoLink}}">info</a>{{end}}</td>
+			<td class="manager">{{$b.Title}}</td>
 		</tr>
 		{{end}}
 		</tbody>
@@ -371,7 +381,7 @@ Use of this source code is governed by Apache 2 LICENSE that can be found in the
 					{{end}}
 				</td>
 				<td>{{optlink $job.PatchLink "patch"}}</td>
-				<td class="kernel" title="{{$job.KernelAlias}}">{{$job.KernelAlias}}</td>
+				<td class="kernel" title="{{$job.KernelAlias}}">{{link $job.KernelCommitLink $job.KernelAlias}}</td>
 				{{if not $.PerBug}}<td title="{{$job.Namespace}}/{{$job.Reporting}}">{{$job.Manager}}</td>{{end}}
 				<td class="result">
 					{{if $job.ErrorLink}}

@@ -18,9 +18,8 @@ import (
 	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/prog"
 	_ "github.com/google/syzkaller/sys"
+	"github.com/google/syzkaller/sys/targets"
 )
-
-const timeout = 10 * time.Second
 
 func buildExecutor(t *testing.T, target *prog.Target) string {
 	src := filepath.FromSlash("../../executor/executor.cc")
@@ -31,7 +30,7 @@ func buildExecutor(t *testing.T, target *prog.Target) string {
 	return bin
 }
 
-func initTest(t *testing.T) (*prog.Target, rand.Source, int, bool, bool) {
+func initTest(t *testing.T) (*prog.Target, rand.Source, int, bool, bool, targets.Timeouts) {
 	t.Parallel()
 	iters := 100
 	if testing.Short() {
@@ -51,27 +50,39 @@ func initTest(t *testing.T) (*prog.Target, rand.Source, int, bool, bool) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return target, rs, iters, cfg.UseShmem, cfg.UseForkServer
+	return target, rs, iters, cfg.UseShmem, cfg.UseForkServer, cfg.Timeouts
 }
 
 // TestExecutor runs all internal executor unit tests.
 // We do it here because we already build executor binary here.
 func TestExecutor(t *testing.T) {
-	target, err := prog.GetTarget(runtime.GOOS, runtime.GOARCH)
-	if err != nil {
-		t.Fatal(err)
+	t.Parallel()
+	for _, sysTarget := range targets.List[runtime.GOOS] {
+		sysTarget := targets.Get(runtime.GOOS, sysTarget.Arch)
+		t.Run(sysTarget.Arch, func(t *testing.T) {
+			if sysTarget.BrokenCompiler != "" {
+				t.Skipf("skipping, broken cross-compiler: %v", sysTarget.BrokenCompiler)
+			}
+			t.Parallel()
+			target, err := prog.GetTarget(runtime.GOOS, sysTarget.Arch)
+			if err != nil {
+				t.Fatal(err)
+			}
+			bin := buildExecutor(t, target)
+			defer os.Remove(bin)
+			// qemu-user may allow us to run some cross-arch binaries.
+			if _, err := osutil.RunCmd(time.Minute, "", bin, "test"); err != nil {
+				if sysTarget.Arch == runtime.GOARCH || sysTarget.VMArch == runtime.GOARCH {
+					t.Fatal(err)
+				}
+				t.Skipf("skipping, cross-arch binary failed: %v", err)
+			}
+		})
 	}
-	bin := buildExecutor(t, target)
-	defer os.Remove(bin)
-	output, err := osutil.RunCmd(time.Minute, "", bin, "test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Logf("executor output:\n%s", output)
 }
 
 func TestExecute(t *testing.T) {
-	target, _, _, useShmem, useForkServer := initTest(t)
+	target, _, _, useShmem, useForkServer, timeouts := initTest(t)
 
 	bin := buildExecutor(t, target)
 	defer os.Remove(bin)
@@ -83,7 +94,7 @@ func TestExecute(t *testing.T) {
 			Executor:      bin,
 			UseShmem:      useShmem,
 			UseForkServer: useForkServer,
-			Timeout:       timeout,
+			Timeouts:      timeouts,
 		}
 		env, err := MakeEnv(cfg, 0)
 		if err != nil {
@@ -117,13 +128,14 @@ func TestExecute(t *testing.T) {
 }
 
 func TestParallel(t *testing.T) {
-	target, _, _, useShmem, useForkServer := initTest(t)
+	target, _, _, useShmem, useForkServer, timeouts := initTest(t)
 	bin := buildExecutor(t, target)
 	defer os.Remove(bin)
 	cfg := &Config{
 		Executor:      bin,
 		UseShmem:      useShmem,
 		UseForkServer: useForkServer,
+		Timeouts:      timeouts,
 	}
 	const P = 10
 	errs := make(chan error, P)

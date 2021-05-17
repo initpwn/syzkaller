@@ -33,7 +33,7 @@ type checkArgs struct {
 
 func testImage(hostAddr string, args *checkArgs) {
 	log.Logf(0, "connecting to host at %v", hostAddr)
-	conn, err := rpctype.Dial(hostAddr)
+	conn, err := rpctype.Dial(hostAddr, args.ipcConfig.Timeouts.Scale)
 	if err != nil {
 		log.Fatalf("BUG: failed to connect to host: %v", err)
 	}
@@ -144,6 +144,7 @@ func checkMachine(args *checkArgs) (*rpctype.CheckArgs, error) {
 		args.ipcConfig.Flags&ipc.FlagSandboxAndroid != 0 {
 		return nil, fmt.Errorf("sandbox=android is not supported (%v)", feat.Reason)
 	}
+	createIPCConfig(features, args.ipcConfig)
 	if err := checkSimpleProgram(args, features); err != nil {
 		return nil, err
 	}
@@ -216,7 +217,7 @@ func checkRevisions(args *checkArgs) error {
 		return fmt.Errorf("mismatching fuzzer/executor git revisions: %v vs %v",
 			prog.GitRevision, vers[3])
 	}
-	if args.gitRevision != "" && args.gitRevision != prog.GitRevision {
+	if args.gitRevision != prog.GitRevision {
 		return fmt.Errorf("mismatching manager/fuzzer git revisions: %v vs %v",
 			args.gitRevision, prog.GitRevision)
 	}
@@ -224,9 +225,9 @@ func checkRevisions(args *checkArgs) error {
 		return fmt.Errorf("mismatching fuzzer/executor system call descriptions: %v vs %v",
 			args.target.Revision, vers[2])
 	}
-	if args.targetRevision != "" && args.targetRevision != args.target.Revision {
-		return fmt.Errorf("mismatching manager/fuzzer system call descriptions: %v vs %v",
-			args.targetRevision, args.target.Revision)
+	if args.target.Revision != args.targetRevision {
+		return fmt.Errorf("mismatching fuzzer/manager system call descriptions: %v vs %v",
+			args.target.Revision, args.targetRevision)
 	}
 	return nil
 }

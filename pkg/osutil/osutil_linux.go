@@ -1,8 +1,6 @@
 // Copyright 2017 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
-// +build !appengine
-
 package osutil
 
 import (
@@ -11,13 +9,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
-	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
 
 // RemoveAll is similar to os.RemoveAll, but can handle more cases.
@@ -28,8 +26,7 @@ func RemoveAll(dir string) error {
 		if f.IsDir() {
 			RemoveAll(name)
 		}
-		fn := []byte(name + "\x00")
-		syscall.Syscall(syscall.SYS_UMOUNT2, uintptr(unsafe.Pointer(&fn[0])), syscall.MNT_FORCE, 0)
+		unix.Unmount(name, unix.MNT_FORCE)
 	}
 	if err := os.RemoveAll(dir); err != nil {
 		removeImmutable(dir)
@@ -41,7 +38,7 @@ func RemoveAll(dir string) error {
 func SystemMemorySize() uint64 {
 	var info syscall.Sysinfo_t
 	syscall.Sysinfo(&info)
-	return uint64(info.Totalram) //nolint:unconvert
+	return uint64(info.Totalram) // nolint:unconvert
 }
 
 func removeImmutable(fname string) error {
@@ -51,20 +48,7 @@ func removeImmutable(fname string) error {
 		return err
 	}
 	defer syscall.Close(fd)
-	flags := 0
-	var cmd uint64 // FS_IOC_SETFLAGS
-	switch runtime.GOARCH {
-	case "386", "arm":
-		cmd = 1074030082
-	case "amd64", "arm64":
-		cmd = 1074292226
-	case "ppc64le", "mips64le":
-		cmd = 2148034050
-	default:
-		panic("unknown arch")
-	}
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), uintptr(cmd), uintptr(unsafe.Pointer(&flags)))
-	return errno
+	return unix.IoctlSetPointerInt(fd, unix.FS_IOC_SETFLAGS, 0)
 }
 
 func Sandbox(cmd *exec.Cmd, user, net bool) error {
@@ -106,7 +90,7 @@ var (
 
 func initSandbox() (bool, uint32, uint32, error) {
 	sandboxOnce.Do(func() {
-		if syscall.Getuid() != 0 || os.Getenv("SYZ_DISABLE_SANDBOXING") == "yes" {
+		if syscall.Getuid() != 0 || os.Getenv("CI") != "" || os.Getenv("SYZ_DISABLE_SANDBOXING") == "yes" {
 			sandboxEnabled = false
 			return
 		}

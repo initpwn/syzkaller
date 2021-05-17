@@ -8,10 +8,11 @@ import (
 
 	"github.com/google/syzkaller/prog"
 	_ "github.com/google/syzkaller/sys/openbsd/gen"
+	"github.com/google/syzkaller/sys/targets"
 )
 
 func TestNeutralize(t *testing.T) {
-	prog.TestDeserializeHelper(t, "openbsd", "amd64", nil, []prog.DeserializeTest{
+	prog.TestDeserializeHelper(t, targets.OpenBSD, targets.AMD64, nil, []prog.DeserializeTest{
 		{
 			In:  `chflagsat(0x0, 0x0, 0x60004, 0x0)`,
 			Out: `chflagsat(0x0, 0x0, 0x0, 0x0)`,
@@ -20,8 +21,14 @@ func TestNeutralize(t *testing.T) {
 			In:  `fchflags(0x0, 0x60004)`,
 			Out: `fchflags(0x0, 0x0)`,
 		},
+		// Note, a random ioctl description used since only the command
+		// is of importance.
 		{
 			In:  `ioctl$BIOCSDIRFILT(0x0, 0xc0e04429, 0x0)`,
+			Out: `ioctl$BIOCSDIRFILT(0x0, 0x0, 0x0)`,
+		},
+		{
+			In:  `ioctl$BIOCSDIRFILT(0x0, 0xc0e04412, 0x0)`,
 			Out: `ioctl$BIOCSDIRFILT(0x0, 0x0, 0x0)`,
 		},
 		{
@@ -75,6 +82,30 @@ func TestNeutralize(t *testing.T) {
 		{
 			// RLIMIT_CPU
 			In: `setrlimit(0x0, &(0x7f0000cc0ff0)={0x1, 0x1})`,
+		},
+		{
+			// Test for sysctl kern.maxclusters.
+			In:  `sysctl$kern(&(0x7f0000cc0ff0)={0x1, 0x43}, 0x2, 0x0, 0x0, &(0x7f0000000180), 0x0)`,
+			Out: `sysctl$kern(&(0x7f0000cc0ff0)={0x0}, 0x0, 0x0, 0x0, &(0x7f0000000180), 0x0)`,
+		},
+		{
+			// Test for sysctl kern.maxproc.
+			In:  `sysctl$kern(&(0x7f0000000300)={0x1, 0x6}, 0x2, 0x0, 0x0, &(0x7f0000000300)="ff0380c5", 0x4)`,
+			Out: `sysctl$kern(&(0x7f0000000300)={0x0}, 0x0, 0x0, 0x0, &(0x7f0000000300)="ff0380c5", 0x4)`,
+		},
+		{
+			// Test for sysctl kern.maxthread.
+			In:  `sysctl$kern(&(0x7f0000000300)={0x1, 0x19}, 0x2, 0x0, 0x0, &(0x7f0000000300)="ff0380c5", 0x4)`,
+			Out: `sysctl$kern(&(0x7f0000000300)={0x0}, 0x0, 0x0, 0x0, &(0x7f0000000300)="ff0380c5", 0x4)`,
+		},
+		{
+			// Test for sysctl kern.witness.
+			In:  `sysctl$kern(&(0x7f0000000300)={0x1, 0x3c}, 0x2, 0x0, 0x0, &(0x7f0000000300)="ff0380c5", 0x4)`,
+			Out: `sysctl$kern(&(0x7f0000000300)={0x0}, 0x0, 0x0, 0x0, &(0x7f0000000300)="ff0380c5", 0x4)`,
+		},
+		{
+			In:  `clock_settime(0x0, &(0x7f0000cc0ff0)={0x0, 0x0})`,
+			Out: `clock_settime(0xffffffffffffffff, &(0x7f0000cc0ff0))`,
 		},
 	})
 }

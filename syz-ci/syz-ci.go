@@ -4,7 +4,7 @@
 // syz-ci is a continuous fuzzing system for syzkaller.
 // It runs several syz-manager's, polls and rebuilds images for managers
 // and polls and rebuilds syzkaller binaries.
-// For usage instructions see: docs/ci.md
+// For usage instructions see: docs/ci.md.
 package main
 
 // Implementation details:
@@ -73,6 +73,7 @@ var (
 	flagConfig     = flag.String("config", "", "config file")
 	flagAutoUpdate = flag.Bool("autoupdate", true, "auto-update the binary (for testing)")
 	flagManagers   = flag.Bool("managers", true, "start managers (for testing)")
+	flagDebug      = flag.Bool("debug", false, "debug mode (for testing)")
 )
 
 type Config struct {
@@ -90,13 +91,47 @@ type Config struct {
 	SyzkallerBranch string `json:"syzkaller_branch"` // Defaults to "master".
 	// Dir with additional syscall descriptions (.txt and .const files).
 	SyzkallerDescriptions string `json:"syzkaller_descriptions"`
-	// GCS path to upload coverage reports from managers (optional).
+	// Protocol-specific path to upload coverage reports from managers (optional).
+	// Supported protocols: GCS (gs://) and HTTP PUT (http:// or https://).
 	CoverUploadPath string           `json:"cover_upload_path"`
 	BisectBinDir    string           `json:"bisect_bin_dir"`
+	Ccache          string           `json:"ccache"`
 	Managers        []*ManagerConfig `json:"managers"`
+	// Poll period for jobs in seconds (optional, defaults to 10 seconds)
+	JobPollPeriod int `json:"job_poll_period"`
+	// Poll period for commits in seconds (optional, defaults to 3600 seconds)
+	CommitPollPeriod int `json:"commit_poll_period"`
 }
 
 type ManagerConfig struct {
+	// If Name is specified, syz-manager name is set to Config.Name-ManagerConfig.Name.
+	// This is old naming scheme, it does not allow to move managers between ci instances.
+	// For new naming scheme set ManagerConfig.ManagerConfig.Name instead and leave this field empty.
+	// This allows to move managers as their name does not depend on cfg.Name.
+	// Generally, if you have:
+	// {
+	//   "name": "ci",
+	//   "managers": [
+	//     {
+	//       "name": "foo",
+	//       ...
+	//     }
+	//   ]
+	// }
+	// you want to change it to:
+	// {
+	//   "name": "ci",
+	//   "managers": [
+	//     {
+	//       ...
+	//       "manager_config": {
+	//         "name": "ci-foo"
+	//       }
+	//     }
+	//   ]
+	// }
+	// and rename managers/foo to managers/ci-foo. Then this instance can be moved
+	// to another ci along with managers/ci-foo dir.
 	Name            string `json:"name"`
 	Disabled        string `json:"disabled"` // If not empty, don't build/start this manager.
 	DashboardClient string `json:"dashboard_client"`
@@ -106,8 +141,11 @@ type ManagerConfig struct {
 	RepoAlias    string `json:"repo_alias"`
 	Branch       string `json:"branch"` // Defaults to "master".
 	Compiler     string `json:"compiler"`
+	Ccache       string `json:"ccache"`
 	Userspace    string `json:"userspace"`
 	KernelConfig string `json:"kernel_config"`
+	// Baseline config for bisection, see pkg/bisect.KernelConfig.BaselineConfig.
+	KernelBaselineConfig string `json:"kernel_baseline_config"`
 	// File with kernel cmdline values (optional).
 	KernelCmdline string `json:"kernel_cmdline"`
 	// File with sysctl values (e.g. output of sysctl -a, optional).
@@ -170,7 +208,7 @@ func main() {
 
 	var managers []*Manager
 	for _, mgrcfg := range cfg.Managers {
-		mgr, err := createManager(cfg, mgrcfg, stop)
+		mgr, err := createManager(cfg, mgrcfg, stop, *flagDebug)
 		if err != nil {
 			log.Logf(0, "failed to create manager %v: %v", mgrcfg.Name, err)
 			continue
@@ -232,10 +270,12 @@ func serveHTTP(cfg *Config) {
 
 func loadConfig(filename string) (*Config, error) {
 	cfg := &Config{
-		SyzkallerRepo:   "https://github.com/google/syzkaller.git",
-		SyzkallerBranch: "master",
-		ManagerPort:     10000,
-		Goroot:          os.Getenv("GOROOT"),
+		SyzkallerRepo:    "https://github.com/google/syzkaller.git",
+		SyzkallerBranch:  "master",
+		ManagerPort:      10000,
+		Goroot:           os.Getenv("GOROOT"),
+		JobPollPeriod:    10,
+		CommitPollPeriod: 3600,
 	}
 	if err := config.LoadFile(filename, cfg); err != nil {
 		return nil, err
@@ -246,40 +286,17 @@ func loadConfig(filename string) (*Config, error) {
 	if cfg.HTTP == "" {
 		return nil, fmt.Errorf("param 'http' is empty")
 	}
-	// Manager name must not contain dots because it is used as GCE image name prefix.
-	managerNameRe := regexp.MustCompile("^[a-zA-Z0-9-_]{4,64}$")
+	cfg.Goroot = osutil.Abs(cfg.Goroot)
+	cfg.SyzkallerDescriptions = osutil.Abs(cfg.SyzkallerDescriptions)
+	cfg.BisectBinDir = osutil.Abs(cfg.BisectBinDir)
+	cfg.Ccache = osutil.Abs(cfg.Ccache)
 	var managers []*ManagerConfig
-	for i, mgr := range cfg.Managers {
+	for _, mgr := range cfg.Managers {
 		if mgr.Disabled == "" {
 			managers = append(managers, mgr)
 		}
-		if !managerNameRe.MatchString(mgr.Name) {
-			return nil, fmt.Errorf("param 'managers[%v].name' has bad value: %q", i, mgr.Name)
-		}
-		if mgr.Branch == "" {
-			mgr.Branch = "master"
-		}
-		managercfg, err := mgrconfig.LoadPartialData(mgr.ManagerConfig)
-		if err != nil {
-			return nil, fmt.Errorf("manager %v: %v", mgr.Name, err)
-		}
-		if (mgr.Jobs.TestPatches || mgr.Jobs.PollCommits ||
-			mgr.Jobs.BisectCause || mgr.Jobs.BisectFix) &&
-			(cfg.DashboardAddr == "" || cfg.DashboardClient == "") {
-			return nil, fmt.Errorf("manager %v: has jobs but no dashboard info", mgr.Name)
-		}
-		if mgr.Jobs.PollCommits && (cfg.DashboardAddr == "" || mgr.DashboardClient == "") {
-			return nil, fmt.Errorf("manager %v: commit_poll is set but no dashboard info", mgr.Name)
-		}
-		if (mgr.Jobs.BisectCause || mgr.Jobs.BisectFix) && cfg.BisectBinDir == "" {
-			return nil, fmt.Errorf("manager %v: enabled bisection but no bisect_bin_dir", mgr.Name)
-		}
-		mgr.managercfg = managercfg
-		managercfg.Name = cfg.Name + "-" + mgr.Name
-		managercfg.Syzkaller = filepath.FromSlash("syzkaller/current")
-		if managercfg.HTTP == "" {
-			managercfg.HTTP = fmt.Sprintf(":%v", cfg.ManagerPort)
-			cfg.ManagerPort++
+		if err := loadManagerConfig(cfg, mgr); err != nil {
+			return nil, err
 		}
 	}
 	cfg.Managers = managers
@@ -287,4 +304,55 @@ func loadConfig(filename string) (*Config, error) {
 		return nil, fmt.Errorf("no managers specified")
 	}
 	return cfg, nil
+}
+
+func loadManagerConfig(cfg *Config, mgr *ManagerConfig) error {
+	managercfg, err := mgrconfig.LoadPartialData(mgr.ManagerConfig)
+	if err != nil {
+		return fmt.Errorf("manager config: %v", err)
+	}
+	if managercfg.Name != "" && mgr.Name != "" {
+		return fmt.Errorf("both managercfg.Name=%q and mgr.Name=%q are specified", managercfg.Name, mgr.Name)
+	}
+	if managercfg.Name == "" && mgr.Name == "" {
+		return fmt.Errorf("no managercfg.Name nor mgr.Name are specified")
+	}
+	if managercfg.Name != "" {
+		mgr.Name = managercfg.Name
+	} else {
+		managercfg.Name = cfg.Name + "-" + mgr.Name
+	}
+	// Manager name must not contain dots because it is used as GCE image name prefix.
+	managerNameRe := regexp.MustCompile("^[a-zA-Z0-9-_]{3,64}$")
+	if !managerNameRe.MatchString(mgr.Name) {
+		return fmt.Errorf("param 'managers.name' has bad value: %q", mgr.Name)
+	}
+	if mgr.Branch == "" {
+		mgr.Branch = "master"
+	}
+	if (mgr.Jobs.TestPatches || mgr.Jobs.PollCommits ||
+		mgr.Jobs.BisectCause || mgr.Jobs.BisectFix) &&
+		(cfg.DashboardAddr == "" || cfg.DashboardClient == "") {
+		return fmt.Errorf("manager %v: has jobs but no dashboard info", mgr.Name)
+	}
+	if mgr.Jobs.PollCommits && (cfg.DashboardAddr == "" || mgr.DashboardClient == "") {
+		return fmt.Errorf("manager %v: commit_poll is set but no dashboard info", mgr.Name)
+	}
+	if (mgr.Jobs.BisectCause || mgr.Jobs.BisectFix) && cfg.BisectBinDir == "" {
+		return fmt.Errorf("manager %v: enabled bisection but no bisect_bin_dir", mgr.Name)
+	}
+	mgr.managercfg = managercfg
+	managercfg.Syzkaller = filepath.FromSlash("syzkaller/current")
+	if managercfg.HTTP == "" {
+		managercfg.HTTP = fmt.Sprintf(":%v", cfg.ManagerPort)
+		cfg.ManagerPort++
+	}
+	// Note: we don't change Compiler/Ccache because it may be just "gcc" referring
+	// to the system binary, or pkg/build/netbsd.go uses "g++" and "clang++" as special marks.
+	mgr.Userspace = osutil.Abs(mgr.Userspace)
+	mgr.KernelConfig = osutil.Abs(mgr.KernelConfig)
+	mgr.KernelBaselineConfig = osutil.Abs(mgr.KernelBaselineConfig)
+	mgr.KernelCmdline = osutil.Abs(mgr.KernelCmdline)
+	mgr.KernelSysctl = osutil.Abs(mgr.KernelSysctl)
+	return nil
 }

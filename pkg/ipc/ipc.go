@@ -4,7 +4,6 @@
 package ipc
 
 import (
-	"encoding/binary"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -27,32 +26,35 @@ import (
 // Configuration flags for Config.Flags.
 type EnvFlags uint64
 
-// Note: New / changed flags should be added to parse_env_flags in executor.cc
+// Note: New / changed flags should be added to parse_env_flags in executor.cc.
 const (
-	FlagDebug            EnvFlags = 1 << iota // debug output from executor
-	FlagSignal                                // collect feedback signals (coverage)
-	FlagSandboxSetuid                         // impersonate nobody user
-	FlagSandboxNamespace                      // use namespaces for sandboxing
-	FlagSandboxAndroid                        // use Android sandboxing for the untrusted_app domain
-	FlagExtraCover                            // collect extra coverage
-	FlagEnableTun                             // setup and use /dev/tun for packet injection
-	FlagEnableNetDev                          // setup more network devices for testing
-	FlagEnableNetReset                        // reset network namespace between programs
-	FlagEnableCgroups                         // setup cgroups for testing
-	FlagEnableCloseFds                        // close fds after each program
-	FlagEnableDevlinkPCI                      // setup devlink PCI device
+	FlagDebug               EnvFlags = 1 << iota // debug output from executor
+	FlagSignal                                   // collect feedback signals (coverage)
+	FlagSandboxSetuid                            // impersonate nobody user
+	FlagSandboxNamespace                         // use namespaces for sandboxing
+	FlagSandboxAndroid                           // use Android sandboxing for the untrusted_app domain
+	FlagExtraCover                               // collect extra coverage
+	FlagEnableTun                                // setup and use /dev/tun for packet injection
+	FlagEnableNetDev                             // setup more network devices for testing
+	FlagEnableNetReset                           // reset network namespace between programs
+	FlagEnableCgroups                            // setup cgroups for testing
+	FlagEnableCloseFds                           // close fds after each program
+	FlagEnableDevlinkPCI                         // setup devlink PCI device
+	FlagEnableVhciInjection                      // setup and use /dev/vhci for hci packet injection
+	FlagEnableWifi                               // setup and use mac80211_hwsim for wifi emulation
 )
 
-// Per-exec flags for ExecOpts.Flags:
+// Per-exec flags for ExecOpts.Flags.
 type ExecFlags uint64
 
 const (
-	FlagCollectCover ExecFlags = 1 << iota // collect coverage
-	FlagDedupCover                         // deduplicate coverage in executor
-	FlagInjectFault                        // inject a fault in this execution (see ExecOpts)
-	FlagCollectComps                       // collect KCOV comparisons
-	FlagThreaded                           // use multiple threads to mitigate blocked syscalls
-	FlagCollide                            // collide syscalls to provoke data races
+	FlagCollectCover         ExecFlags = 1 << iota // collect coverage
+	FlagDedupCover                                 // deduplicate coverage in executor
+	FlagInjectFault                                // inject a fault in this execution (see ExecOpts)
+	FlagCollectComps                               // collect KCOV comparisons
+	FlagThreaded                                   // use multiple threads to mitigate blocked syscalls
+	FlagCollide                                    // collide syscalls to provoke data races
+	FlagEnableCoverageFilter                       // setup and use bitmap to do coverage filter
 )
 
 type ExecOpts struct {
@@ -72,8 +74,7 @@ type Config struct {
 	// Flags are configuation flags, defined above.
 	Flags EnvFlags
 
-	// Timeout is the execution timeout for a single program.
-	Timeout time.Duration
+	Timeouts targets.Timeouts
 }
 
 type CallFlags uint32
@@ -155,6 +156,10 @@ func FlagsToSandbox(flags EnvFlags) string {
 }
 
 func MakeEnv(config *Config, pid int) (*Env, error) {
+	if config.Timeouts.Slowdown == 0 || config.Timeouts.Scale == 0 ||
+		config.Timeouts.Syscall == 0 || config.Timeouts.Program == 0 {
+		return nil, fmt.Errorf("ipc.MakeEnv: uninitialized timeouts (%+v)", config.Timeouts)
+	}
 	var inf, outf *os.File
 	var inmem, outmem []byte
 	if config.UseShmem {
@@ -247,12 +252,12 @@ var rateLimit = time.NewTicker(1 * time.Second)
 // output: process output
 // info: per-call info
 // hanged: program hanged and was killed
-// err0: failed to start the process or bug in executor itself
+// err0: failed to start the process or bug in executor itself.
 func (env *Env) Exec(opts *ExecOpts, p *prog.Prog) (output []byte, info *ProgInfo, hanged bool, err0 error) {
 	// Copy-in serialized program.
 	progSize, err := p.SerializeForExec(env.in)
 	if err != nil {
-		err0 = fmt.Errorf("failed to serialize: %v", err)
+		err0 = err
 		return
 	}
 	var progData []byte
@@ -267,7 +272,7 @@ func (env *Env) Exec(opts *ExecOpts, p *prog.Prog) (output []byte, info *ProgInf
 
 	atomic.AddUint64(&env.StatExecs, 1)
 	if env.cmd == nil {
-		if p.Target.OS != "test" && targets.Get(p.Target.OS, p.Target.Arch).HostFuzzer {
+		if p.Target.OS != targets.TestOS && targets.Get(p.Target.OS, p.Target.Arch).HostFuzzer {
 			// The executor is actually ssh,
 			// starting them too frequently leads to timeouts.
 			<-rateLimit.C
@@ -439,7 +444,7 @@ func readUint32(outp *[]byte) (uint32, bool) {
 	if len(out) < 4 {
 		return 0, false
 	}
-	v := binary.LittleEndian.Uint32(out)
+	v := prog.HostEndian.Uint32(out)
 	*outp = out[4:]
 	return v, true
 }
@@ -449,7 +454,7 @@ func readUint64(outp *[]byte) (uint64, bool) {
 	if len(out) < 8 {
 		return 0, false
 	}
-	v := binary.LittleEndian.Uint64(out)
+	v := prog.HostEndian.Uint64(out)
 	*outp = out[8:]
 	return v, true
 }
@@ -462,12 +467,11 @@ func readUint32Array(outp *[]byte, size uint32) ([]uint32, bool) {
 	if int(size)*4 > len(out) {
 		return nil, false
 	}
-	hdr := reflect.SliceHeader{
-		Data: uintptr(unsafe.Pointer(&out[0])),
-		Len:  int(size),
-		Cap:  int(size),
-	}
-	res := *(*[]uint32)(unsafe.Pointer(&hdr))
+	var res []uint32
+	hdr := (*reflect.SliceHeader)((unsafe.Pointer(&res)))
+	hdr.Data = uintptr(unsafe.Pointer(&out[0]))
+	hdr.Len = int(size)
+	hdr.Cap = int(size)
 	*outp = out[size*4:]
 	return res, true
 }
@@ -501,14 +505,18 @@ type handshakeReply struct {
 }
 
 type executeReq struct {
-	magic     uint64
-	envFlags  uint64 // env flags
-	execFlags uint64 // exec flags
-	pid       uint64
-	faultCall uint64
-	faultNth  uint64
-	progSize  uint64
-	// prog follows on pipe or in shmem
+	magic            uint64
+	envFlags         uint64 // env flags
+	execFlags        uint64 // exec flags
+	pid              uint64
+	faultCall        uint64
+	faultNth         uint64
+	syscallTimeoutMS uint64
+	programTimeoutMS uint64
+	slowdownScale    uint64
+	progSize         uint64
+	// This structure is followed by a serialized test program in encodingexec format.
+	// Both when sent over a pipe or in shared memory.
 }
 
 type executeReply struct {
@@ -538,10 +546,18 @@ func makeCommand(pid int, bin []string, config *Config, inFile, outFile *os.File
 	}
 	dir = osutil.Abs(dir)
 
+	timeout := config.Timeouts.Program
+	if config.UseForkServer {
+		// Executor has an internal timeout and protects against most hangs when fork server is enabled,
+		// so we use quite large timeout. Executor can be slow due to global locks in namespaces
+		// and other things, so let's better wait than report false misleading crashes.
+		timeout *= 10
+	}
+
 	c := &command{
 		pid:     pid,
 		config:  config,
-		timeout: sanitizeTimeout(config),
+		timeout: timeout,
 		dir:     dir,
 		outmem:  outmem,
 	}
@@ -585,8 +601,9 @@ func makeCommand(pid int, bin []string, config *Config, inFile, outFile *os.File
 	if inFile != nil && outFile != nil {
 		cmd.ExtraFiles = []*os.File{inFile, outFile}
 	}
-	cmd.Env = []string{}
 	cmd.Dir = dir
+	// Tell ASAN to not mess with our NONFAILING.
+	cmd.Env = append(append([]string{}, os.Environ()...), "ASAN_OPTIONS=handle_segv=0 allow_user_segv_handler=1")
 	cmd.Stdin = outrp
 	cmd.Stdout = inwp
 	if config.Flags&FlagDebug != 0 {
@@ -678,7 +695,7 @@ func (c *command) handshake() error {
 		read <- nil
 	}()
 	// Sandbox setup can take significant time.
-	timeout := time.NewTimer(time.Minute)
+	timeout := time.NewTimer(time.Minute * c.config.Timeouts.Scale)
 	select {
 	case err := <-read:
 		timeout.Stop()
@@ -712,13 +729,16 @@ func (c *command) wait() error {
 
 func (c *command) exec(opts *ExecOpts, progData []byte) (output []byte, hanged bool, err0 error) {
 	req := &executeReq{
-		magic:     inMagic,
-		envFlags:  uint64(c.config.Flags),
-		execFlags: uint64(opts.Flags),
-		pid:       uint64(c.pid),
-		faultCall: uint64(opts.FaultCall),
-		faultNth:  uint64(opts.FaultNth),
-		progSize:  uint64(len(progData)),
+		magic:            inMagic,
+		envFlags:         uint64(c.config.Flags),
+		execFlags:        uint64(opts.Flags),
+		pid:              uint64(c.pid),
+		faultCall:        uint64(opts.FaultCall),
+		faultNth:         uint64(opts.FaultNth),
+		syscallTimeoutMS: uint64(c.config.Timeouts.Syscall / time.Millisecond),
+		programTimeoutMS: uint64(c.config.Timeouts.Program / time.Millisecond),
+		slowdownScale:    uint64(c.config.Timeouts.Scale),
+		progSize:         uint64(len(progData)),
 	}
 	reqData := (*[unsafe.Sizeof(*req)]byte)(unsafe.Pointer(req))[:]
 	if _, err := c.outwp.Write(reqData); err != nil {
@@ -805,28 +825,4 @@ func (c *command) exec(opts *ExecOpts, progData []byte) (output []byte, hanged b
 		err0 = fmt.Errorf("executor %v: exit status %d\n%s", c.pid, exitStatus, output)
 	}
 	return
-}
-
-func sanitizeTimeout(config *Config) time.Duration {
-	const (
-		executorTimeout = 5 * time.Second
-		minTimeout      = executorTimeout + 2*time.Second
-	)
-	timeout := config.Timeout
-	if timeout == 0 {
-		// Executor protects against most hangs, so we use quite large timeout here.
-		// Executor can be slow due to global locks in namespaces and other things,
-		// so let's better wait than report false misleading crashes.
-		timeout = time.Minute
-		if !config.UseForkServer {
-			// If there is no fork server, executor does not have internal timeout.
-			timeout = executorTimeout
-		}
-	}
-	// IPC timeout must be larger then executor timeout.
-	// Otherwise IPC will kill parent executor but leave child executor alive.
-	if config.UseForkServer && timeout < minTimeout {
-		timeout = minTimeout
-	}
-	return timeout
 }

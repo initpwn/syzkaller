@@ -1,9 +1,9 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Copyright 2016 syzkaller project authors. All rights reserved.
 # Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
-# create-gce-image.sh creates a minimal bootable image suitable for syzkaller/GCE.
-# The image will have password-less root login with a key stored in key file.
+# create-gce-image.sh creates a minimal bootable image suitable for syzkaller/GCE in ./disk.raw file.
+# The script can also create/delete temp files in the current dir.
 #
 # Prerequisites:
 # - you need a user-space system, a basic Debian system can be created with:
@@ -16,21 +16,11 @@
 # Usage:
 #   ./create-gce-image.sh /dir/with/user/space/system /path/to/{zImage,bzImage} [arch]
 #
-# SYZ_VM_TYPE env var controls type of target test machine. Supported values:
-# - qemu (default)
-# - gce
-#   Needs nbd support in kernel and qemu-utils (qemu-nbd) installed.
-#
 # If SYZ_SYSCTL_FILE env var is set and points to a file,
 # then its contents will be appended to the image /etc/sysctl.conf.
 # If SYZ_CMDLINE_FILE env var is set and points to a file,
 # then its contents will be appended to the kernel command line.
 # If MKE2FS_CONFIG env var is set, it will affect invoked mkfs.ext4.
-#
-# Outputs are (in the current dir):
-# - disk.raw: the image
-# - key: root ssh key
-# The script can also create/delete temp files in the current dir.
 #
 # The image then needs to be compressed with:
 #   tar -Sczf disk.tar.gz disk.raw
@@ -42,8 +32,7 @@
 #   qemu-system-x86_64 -hda disk.raw -net user,host=10.0.2.10,hostfwd=tcp::10022-:22 \
 #       -net nic -enable-kvm -m 2G -display none -serial stdio
 # once the kernel boots, you can ssh into it with:
-#   ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o IdentitiesOnly=yes \
-#       -p 10022 -i key root@localhost
+#   ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o IdentitiesOnly=yes -p 10022 root@localhost
 
 set -eux
 
@@ -58,7 +47,7 @@ if [ ! -e $1/sbin/init ]; then
 fi
 
 case "$IMG_ARCH" in
-	386|amd64)
+	386|amd64|s390x)
 		KERNEL_IMAGE_BASENAME=bzImage
 		;;
 	ppc64le)
@@ -68,16 +57,6 @@ esac
 
 if [ "$(basename $2)" != "$KERNEL_IMAGE_BASENAME" ]; then
 	echo "usage: create-gce-image.sh /dir/with/user/space/system /path/to/bzImage [arch]"
-	exit 1
-fi
-
-SYZ_VM_TYPE="${SYZ_VM_TYPE:-qemu}"
-if [ "$SYZ_VM_TYPE" == "qemu" ]; then
-	:
-elif [ "$SYZ_VM_TYPE" == "gce" ]; then
-	:
-else
-	echo "SYZ_VM_TYPE has unsupported value $SYZ_VM_TYPE"
 	exit 1
 fi
 
@@ -114,7 +93,7 @@ elif [ "$BLOCK_DEVICE" == "nbd" ]; then
 fi
 
 case "$IMG_ARCH" in
-	386|amd64)
+	386|amd64|s390x)
 		echo -en "o\nn\np\n1\n\n\na\nw\n" | sudo fdisk $DISKDEV
 		PARTDEV=$DISKDEV"p1"
 		;;
@@ -136,6 +115,7 @@ sudo cp $2 disk.mnt/vmlinuz
 sudo sed -i "/^root/ { s/:x:/::/ }" disk.mnt/etc/passwd
 echo "T0:23:respawn:/sbin/getty -L ttyS0 115200 vt100" | sudo tee -a disk.mnt/etc/inittab
 echo -en "auto lo\niface lo inet loopback\nauto eth0\niface eth0 inet dhcp\n" | sudo tee disk.mnt/etc/network/interfaces
+echo '/dev/root / ext4 defaults 0 0' | sudo tee -a disk.mnt/etc/fstab
 echo "debugfs /sys/kernel/debug debugfs defaults 0 0" | sudo tee -a disk.mnt/etc/fstab
 echo "securityfs /sys/kernel/security securityfs defaults 0 0" | sudo tee -a disk.mnt/etc/fstab
 echo "configfs /sys/kernel/config/ configfs defaults 0 0" | sudo tee -a disk.mnt/etc/fstab
@@ -145,9 +125,14 @@ for i in {0..31}; do
 		sudo tee -a disk.mnt/etc/udev/50-binder.rules
 done
 
+# Add udev rules for custom drivers.
+# Create a /dev/vim2m symlink for the device managed by the vim2m driver
+echo 'ATTR{name}=="vim2m", SYMLINK+="vim2m"' | sudo tee -a disk.mnt/etc/udev/rules.d/50-udev-default.rules
+
+# Create a /dev/i915 symlink to /dev/dri/card# if i915 driver is in use.
+echo 'SUBSYSTEMS=="pci", DRIVERS=="i915", SYMLINK+="i915"' | sudo tee -a disk.mnt/etc/udev/rules.d/60-drm.rules
+
 # sysctls
-echo "kernel.printk = 7 4 1 3" | sudo tee -a disk.mnt/etc/sysctl.conf
-echo "debug.exception-trace = 0" | sudo tee -a disk.mnt/etc/sysctl.conf
 SYZ_SYSCTL_FILE="${SYZ_SYSCTL_FILE:-}"
 if [ "$SYZ_SYSCTL_FILE" != "" ]; then
 	cat $SYZ_SYSCTL_FILE | sudo tee -a disk.mnt/etc/sysctl.conf
@@ -155,14 +140,18 @@ fi
 
 echo -en "127.0.0.1\tlocalhost\n" | sudo tee disk.mnt/etc/hosts
 echo "nameserver 8.8.8.8" | sudo tee -a disk.mnt/etc/resolve.conf
-echo "ClientAliveInterval 420" | sudo tee -a disk.mnt/etc/ssh/sshd_config
 echo "syzkaller" | sudo tee disk.mnt/etc/hostname
-rm -f key key.pub
-ssh-keygen -f key -t rsa -N ""
-sudo mkdir -p disk.mnt/root/.ssh
-sudo cp key.pub disk.mnt/root/.ssh/authorized_keys
-sudo chown root disk.mnt/root/.ssh/authorized_keys
 sudo mkdir -p disk.mnt/boot/grub
+
+# Setup ssh without key/password.
+cat << EOF | sudo tee disk.mnt/etc/ssh/sshd_config
+PermitRootLogin yes
+PasswordAuthentication yes
+PermitEmptyPasswords yes
+ClientAliveInterval 420
+EOF
+# Reset root password.
+sudo sed -i "s#^root:\*:#root::#g" disk.mnt/etc/shadow
 
 CMDLINE=""
 SYZ_CMDLINE_FILE="${SYZ_CMDLINE_FILE:-}"
@@ -178,7 +167,6 @@ terminal_output console
 set timeout=0
 # vsyscall=native: required to run x86_64 executables on android kernels
 #   (for some reason they disable VDSO by default)
-# rodata=n: mark_rodata_ro becomes very slow with KASAN (lots of PGDs)
 # panic=86400: prevents kernel from rebooting so that we don't get reboot output in all crash reports
 # debug is not set as it produces too much output
 menuentry 'linux' --class gnu-linux --class gnu --class os {
@@ -190,7 +178,7 @@ menuentry 'linux' --class gnu-linux --class gnu --class os {
 	insmod part_msdos
 	insmod ext2
 	set root='(hd0,1)'
-	linux /vmlinuz root=/dev/sda1 console=ttyS0 earlyprintk=serial vsyscall=native rodata=n oops=panic panic_on_warn=1 nmi_watchdog=panic panic=86400 net.ifnames=0 sysctl.kernel.hung_task_all_cpu_backtrace=1 $CMDLINE
+	linux /vmlinuz root=/dev/sda1 console=ttyS0 earlyprintk=serial vsyscall=native net.ifnames=0 sysctl.kernel.hung_task_all_cpu_backtrace=1 $CMDLINE
 }
 EOF
 	sudo grub-install --target=i386-pc --boot-directory=disk.mnt/boot --no-floppy $DISKDEV
@@ -200,7 +188,6 @@ ppc64le)
 terminal_input console
 terminal_output console
 set timeout=0
-# rodata=n: mark_rodata_ro becomes very slow with KASAN (lots of PGDs)
 # panic=86400: prevents kernel from rebooting so that we don't get reboot output in all crash reports
 # debug is not set as it produces too much output
 menuentry 'linux' --class gnu-linux --class gnu --class os {
@@ -208,9 +195,14 @@ menuentry 'linux' --class gnu-linux --class gnu --class os {
 	insmod part_gpt
 	insmod ext2
 	set root='(ieee1275/disk,gpt2)'
-	linux /vmlinuz root=/dev/sda2 console=ttyS0 earlyprintk=serial rodata=n oops=panic panic_on_warn=1 nmi_watchdog=panic panic=86400 net.ifnames=0 $CMDLINE
+	linux /vmlinuz root=/dev/sda2 console=ttyS0 earlyprintk=serial oops=panic panic_on_warn=1 nmi_watchdog=panic panic=86400 net.ifnames=0 $CMDLINE
 }
 EOF
 	sudo grub-install --target=powerpc-ieee1275 --boot-directory=disk.mnt/boot $DISKDEV"p1"
+	;;
+s390x)
+	sudo zipl -V -t disk.mnt/boot -i disk.mnt/vmlinuz \
+	     -P "root=/dev/vda1 console=ttyS0 earlyprintk=serial oops=panic panic_on_warn=1 nmi_watchdog=panic panic=86400 net.ifnames=0 sysctl.kernel.hung_task_all_cpu_backtrace=1 net.ifnames=0 biosdevname=0 $CMDLINE" \
+	     --targetbase=$DISKDEV --targettype=SCSI --targetblocksize=512 --targetoffset=2048
 	;;
 esac

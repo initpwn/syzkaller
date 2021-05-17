@@ -18,6 +18,7 @@ import (
 	"github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/pkg/report"
+	"github.com/google/syzkaller/sys/targets"
 	"github.com/google/syzkaller/vm/vmimpl"
 
 	// Import all VM implementations, so that users only need to import vm.
@@ -30,18 +31,21 @@ import (
 	_ "github.com/google/syzkaller/vm/odroid"
 	_ "github.com/google/syzkaller/vm/qemu"
 	_ "github.com/google/syzkaller/vm/vmm"
+	_ "github.com/google/syzkaller/vm/vmware"
 )
 
 type Pool struct {
 	impl     vmimpl.Pool
 	workdir  string
 	template string
+	timeouts targets.Timeouts
 }
 
 type Instance struct {
-	impl    vmimpl.Instance
-	workdir string
-	index   int
+	impl     vmimpl.Instance
+	workdir  string
+	timeouts targets.Timeouts
+	index    int
 }
 
 var (
@@ -73,15 +77,16 @@ func Create(cfg *mgrconfig.Config, debug bool) (*Pool, error) {
 		return nil, fmt.Errorf("unknown instance type '%v'", cfg.Type)
 	}
 	env := &vmimpl.Env{
-		Name:    cfg.Name,
-		OS:      cfg.TargetOS,
-		Arch:    cfg.TargetVMArch,
-		Workdir: cfg.Workdir,
-		Image:   cfg.Image,
-		SSHKey:  cfg.SSHKey,
-		SSHUser: cfg.SSHUser,
-		Debug:   debug,
-		Config:  cfg.VM,
+		Name:     cfg.Name,
+		OS:       cfg.TargetOS,
+		Arch:     cfg.TargetVMArch,
+		Workdir:  cfg.Workdir,
+		Image:    cfg.Image,
+		SSHKey:   cfg.SSHKey,
+		SSHUser:  cfg.SSHUser,
+		Timeouts: cfg.Timeouts,
+		Debug:    debug,
+		Config:   cfg.VM,
 	}
 	impl, err := typ.Ctor(env)
 	if err != nil {
@@ -91,6 +96,7 @@ func Create(cfg *mgrconfig.Config, debug bool) (*Pool, error) {
 		impl:     impl,
 		workdir:  env.Workdir,
 		template: cfg.WorkdirTemplate,
+		timeouts: cfg.Timeouts,
 	}, nil
 }
 
@@ -117,9 +123,10 @@ func (pool *Pool) Create(index int) (*Instance, error) {
 		return nil, err
 	}
 	return &Instance{
-		impl:    impl,
-		workdir: workdir,
-		index:   index,
+		impl:     impl,
+		workdir:  workdir,
+		timeouts: pool.timeouts,
+		index:    index,
 	}, nil
 }
 
@@ -136,8 +143,18 @@ func (inst *Instance) Run(timeout time.Duration, stop <-chan bool, command strin
 	return inst.impl.Run(timeout, stop, command)
 }
 
-func (inst *Instance) Diagnose() ([]byte, bool) {
-	return inst.impl.Diagnose()
+func (inst *Instance) Info() ([]byte, error) {
+	if ii, ok := inst.impl.(vmimpl.Infoer); ok {
+		return ii.Info()
+	}
+	return nil, nil
+}
+
+func (inst *Instance) diagnose(rep *report.Report) ([]byte, bool) {
+	if rep == nil {
+		panic("rep is nil")
+	}
+	return inst.impl.Diagnose(rep)
 }
 
 func (inst *Instance) Close() {
@@ -171,7 +188,7 @@ func (inst *Instance) MonitorExecution(outc <-chan []byte, errc <-chan error,
 		exit:     exit,
 	}
 	lastExecuteTime := time.Now()
-	ticker := time.NewTicker(tickerPeriod)
+	ticker := time.NewTicker(tickerPeriod * inst.timeouts.Scale)
 	defer ticker.Stop()
 	for {
 		select {
@@ -234,34 +251,11 @@ func (inst *Instance) MonitorExecution(outc <-chan []byte, errc <-chan error,
 				mon.matchPos = 0
 			}
 		case <-ticker.C:
-			// Detect both "not output whatsoever" and "kernel episodically prints
+			// Detect both "no output whatsoever" and "kernel episodically prints
 			// something to console, but fuzzer is not actually executing programs".
-			// The timeout used to be 3 mins for a long time.
-			// But (1) we were seeing flakes on linux where net namespace
-			// destruction can be really slow, and (2) gVisor watchdog timeout
-			// is 3 mins + 1/4 of that for checking period = 3m45s.
-			// Current linux max timeout is CONFIG_DEFAULT_HUNG_TASK_TIMEOUT=140
-			// and workqueue.watchdog_thresh=140 which both actually result
-			// in 140-280s detection delay.
-			// So the current timeout is 5 mins (300s).
-			// We don't want it to be too long too because it will waste time on real hangs.
-			if time.Since(lastExecuteTime) < NoOutputTimeout {
-				break
+			if time.Since(lastExecuteTime) > inst.timeouts.NoOutput {
+				return mon.extractError(noOutputCrash)
 			}
-			diag, wait := inst.Diagnose()
-			if len(diag) > 0 {
-				mon.output = append(mon.output, "DIAGNOSIS:\n"...)
-				mon.output = append(mon.output, diag...)
-			}
-			if wait {
-				mon.waitForOutput()
-			}
-			rep := &report.Report{
-				Title:      noOutputCrash,
-				Output:     mon.output,
-				Suppressed: report.IsSuppressed(mon.reporter, mon.output),
-			}
-			return rep
 		case <-Shutdown:
 			return nil
 		}
@@ -279,45 +273,47 @@ type monitor struct {
 }
 
 func (mon *monitor) extractError(defaultError string) *report.Report {
-	var diagOutput []byte
-	appendDiagOutput := func() {
-		if len(diagOutput) > 0 {
-			mon.output = append(mon.output, report.VMDiagnosisStart...)
-			mon.output = append(mon.output, diagOutput...)
-		}
-	}
+	diagOutput, diagWait := []byte{}, false
 	if defaultError != "" {
-		// N.B. we always wait below for other errors.
-		diagOutput, _ = mon.inst.Diagnose()
+		diagOutput, diagWait = mon.inst.diagnose(mon.createReport(defaultError))
 	}
 	// Give it some time to finish writing the error message.
-	mon.waitForOutput()
+	// But don't wait for "no output", we already waited enough.
+	if defaultError != noOutputCrash || diagWait {
+		mon.waitForOutput()
+	}
 	if bytes.Contains(mon.output, []byte(fuzzerPreemptedStr)) {
 		return nil
 	}
-	if !mon.reporter.ContainsCrash(mon.output[mon.matchPos:]) {
+	if defaultError == "" && mon.reporter.ContainsCrash(mon.output[mon.matchPos:]) {
+		// We did not call Diagnose above because we thought there is no error, so call it now.
+		diagOutput, diagWait = mon.inst.diagnose(mon.createReport(defaultError))
+		if diagWait {
+			mon.waitForOutput()
+		}
+	}
+	rep := mon.createReport(defaultError)
+	if rep == nil {
+		return nil
+	}
+	if len(diagOutput) > 0 {
+		rep.Output = append(rep.Output, vmDiagnosisStart...)
+		rep.Output = append(rep.Output, diagOutput...)
+	}
+	return rep
+}
+
+func (mon *monitor) createReport(defaultError string) *report.Report {
+	rep := mon.reporter.Parse(mon.output[mon.matchPos:])
+	if rep == nil {
 		if defaultError == "" {
 			return nil
 		}
-		appendDiagOutput()
-		rep := &report.Report{
+		return &report.Report{
 			Title:      defaultError,
 			Output:     mon.output,
 			Suppressed: report.IsSuppressed(mon.reporter, mon.output),
 		}
-		return rep
-	}
-	if defaultError == "" {
-		wait := false
-		diagOutput, wait = mon.inst.Diagnose()
-		if wait {
-			mon.waitForOutput()
-		}
-	}
-	appendDiagOutput()
-	rep := mon.reporter.Parse(mon.output[mon.matchPos:])
-	if rep == nil {
-		panic(fmt.Sprintf("reporter.ContainsCrash/Parse disagree:\n%s", mon.output[mon.matchPos:]))
 	}
 	start := mon.matchPos + rep.StartPos - beforeContext
 	if start < 0 {
@@ -334,7 +330,7 @@ func (mon *monitor) extractError(defaultError string) *report.Report {
 }
 
 func (mon *monitor) waitForOutput() {
-	timer := time.NewTimer(waitForOutputTimeout)
+	timer := time.NewTimer(waitForOutputTimeout * mon.inst.timeouts.Scale)
 	defer timer.Stop()
 	for {
 		select {
@@ -354,22 +350,20 @@ func (mon *monitor) waitForOutput() {
 const (
 	maxErrorLength = 256
 
-	lostConnectionCrash  = "lost connection to test machine"
-	noOutputCrash        = "no output from test machine"
-	timeoutCrash         = "timed out"
-	executingProgramStr1 = "executing program"  // syz-fuzzer output
-	executingProgramStr2 = "executed programs:" // syz-execprog output
-	fuzzerPreemptedStr   = "SYZ-FUZZER: PREEMPTED"
+	lostConnectionCrash = "lost connection to test machine"
+	noOutputCrash       = "no output from test machine"
+	timeoutCrash        = "timed out"
+	fuzzerPreemptedStr  = "SYZ-FUZZER: PREEMPTED"
+	vmDiagnosisStart    = "\nVM DIAGNOSIS:\n"
 )
 
 var (
-	executingProgram1 = []byte(executingProgramStr1)
-	executingProgram2 = []byte(executingProgramStr2)
+	executingProgram1 = []byte("executing program")  // syz-fuzzer output
+	executingProgram2 = []byte("executed programs:") // syz-execprog output
 
 	beforeContext = 1024 << 10
 	afterContext  = 128 << 10
 
-	NoOutputTimeout      = 5 * time.Minute
 	tickerPeriod         = 10 * time.Second
 	waitForOutputTimeout = 10 * time.Second
 )

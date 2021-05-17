@@ -9,7 +9,7 @@ include <uapi/linux/batman_adv.h>
 resource genl_batadv_family_id[int16]
 type msghdr_batadv[CMD] msghdr_netlink[netlink_msg_t[genl_batadv_family_id, genlmsghdr_t[CMD], batadv_netlink_policy]]
 
-syz_genetlink_get_family_id$batadv(name ptr[in, string["batadv"]]) genl_batadv_family_id
+syz_genetlink_get_family_id$batadv(name ptr[in, string["batadv"]], fd sock_nl_generic) genl_batadv_family_id
 
 sendmsg$BATADV_CMD_GET_MESH(fd sock_nl_generic, msg ptr[in, msghdr_batadv[BATADV_CMD_GET_MESH]], f flags[send_flags])
 sendmsg$BATADV_CMD_TP_METER(fd sock_nl_generic, msg ptr[in, msghdr_batadv[BATADV_CMD_TP_METER]], f flags[send_flags])
@@ -33,8 +33,8 @@ sendmsg$BATADV_CMD_SET_VLAN(fd sock_nl_generic, msg ptr[in, msghdr_batadv[BATADV
 resource batadv_mesh_ifindex[ifindex]
 resource batadv_hard_ifindex[ifindex]
 
-ioctl$ifreq_SIOCGIFINDEX_batadv_mesh(fd sock, cmd const[SIOCGIFINDEX], arg ptr[inout, ifreq_dev_t["batadv0", batadv_mesh_ifindex[opt]]])
-ioctl$ifreq_SIOCGIFINDEX_batadv_hard(fd sock, cmd const[SIOCGIFINDEX], arg ptr[inout, ifreq_dev_t[batadv_hard_ifindex_names, batadv_hard_ifindex[opt]]])
+ioctl$ifreq_SIOCGIFINDEX_batadv_mesh(fd sock, cmd const[SIOCGIFINDEX], arg ptr[inout, ifreq_dev_t["batadv0", batadv_mesh_ifindex]])
+ioctl$ifreq_SIOCGIFINDEX_batadv_hard(fd sock, cmd const[SIOCGIFINDEX], arg ptr[inout, ifreq_dev_t[batadv_hard_ifindex_names, batadv_hard_ifindex]])
 
 batadv_hard_ifindex_names = "batadv_slave_0", "batadv_slave_1"
 

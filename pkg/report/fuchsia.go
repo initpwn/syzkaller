@@ -86,7 +86,7 @@ func (ctx *fuchsia) shortenReport(report []byte) []byte {
 }
 
 func (ctx *fuchsia) symbolize(output []byte) []byte {
-	symb := symbolizer.NewSymbolizer()
+	symb := symbolizer.NewSymbolizer(ctx.config.target)
 	defer symb.Close()
 	out := new(bytes.Buffer)
 	for s := bufio.NewScanner(bytes.NewReader(output)); s.Scan(); {
@@ -139,7 +139,7 @@ func (ctx *fuchsia) processPC(out *bytes.Buffer, symb *symbolizer.Symbolizer,
 		file := ctx.trimFile(frame.File)
 		name := demangle.Filter(frame.Func, demangle.NoParams, demangle.NoTemplateParams)
 		if strings.Contains(name, "<lambda(") {
-			// demangle produces super long (full) names for lambdas.
+			// Demangling produces super long (full) names for lambdas.
 			name = "lambda"
 		}
 		id := "[ inline ]"
@@ -277,9 +277,9 @@ var zirconOopses = append([]*oops{
 	// We should detect just "stopping other cpus" as some kernel crash rather then as "lost connection",
 	// but if we add oops for "stopping other cpus", then it will interfere with other formats,
 	// because "stopping other cpus" usually goes after "ZIRCON KERNEL PANIC", but sometimes before. Mess.
-	//{
+	// {
 	//	[]byte("stopping other cpus"),
-	//},
+	// },
 	{
 		[]byte("welcome to Zircon"),
 		[]oopsFormat{

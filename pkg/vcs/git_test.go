@@ -18,6 +18,8 @@ rbtree: include rcu.h
 foobar@foobar.de
 Foo Bar
 Fri May 11 16:02:14 2018 -0700
+78eb0c6356cda285c6ee6e29bea0c0188368103e
+Fri May 11 17:28:45 2018 -0700
 Since commit c1adf20052d8 ("Introduce rb_replace_node_rcu()")
 rbtree_augmented.h uses RCU related data structures but does not include
 the header file.  It works as long as it gets somehow included before
@@ -37,7 +39,7 @@ Signed-off-by: Linux Master <linux@linux-foundation.org>
 			Title:      "rbtree: include rcu.h",
 			Author:     "foobar@foobar.de",
 			AuthorName: "Foo Bar",
-			CC: []string{
+			Recipients: NewRecipients([]string{
 				"and@me.com",
 				"another@email.de",
 				"foobar@foobar.de",
@@ -46,8 +48,9 @@ Signed-off-by: Linux Master <linux@linux-foundation.org>
 				"name@name.com",
 				"subsystem@reviewer.com",
 				"yetanother@email.org",
-			},
-			Date: time.Date(2018, 5, 11, 16, 02, 14, 0, time.FixedZone("", -7*60*60)),
+			}, To),
+			Date:       time.Date(2018, 5, 11, 16, 02, 14, 0, time.FixedZone("", -7*60*60)),
+			CommitDate: time.Date(2018, 5, 11, 17, 28, 45, 0, time.FixedZone("", -7*60*60)),
 		},
 	}
 	for input, com := range tests {
@@ -70,11 +73,14 @@ Signed-off-by: Linux Master <linux@linux-foundation.org>
 		if com.Author != res.Author {
 			t.Fatalf("want author %q, got %q", com.Author, res.Author)
 		}
-		if diff := cmp.Diff(com.CC, res.CC); diff != "" {
+		if diff := cmp.Diff(com.Recipients, res.Recipients); diff != "" {
 			t.Fatalf("bad CC: %v", diff)
 		}
 		if !com.Date.Equal(res.Date) {
 			t.Fatalf("want date %v, got %v", com.Date, res.Date)
+		}
+		if !com.CommitDate.Equal(res.CommitDate) {
+			t.Fatalf("want date %v, got %v", com.CommitDate, res.CommitDate)
 		}
 	}
 }
@@ -91,11 +97,18 @@ v3.11
 v3.19
 v3.9
 v3.2
+v4.9-rc1
 v4.9
+v4.9-rc3
+v4.9-rc2
 v2.6.32
 v4.0
+vv4.1
+v2.6-rc5
+v4.1foo
 voo
 v1.foo
+v2.6-rc2
 v10.2.foo
 v1.2.
 v1.
@@ -115,11 +128,32 @@ v1.
 		"v2.6.13",
 		"v2.6.12",
 	}
-	got, err := gitParseReleaseTags([]byte(input))
-	if err != nil {
-		t.Fatal(err)
-	}
+	got := gitParseReleaseTags([]byte(input), false)
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got bad tags\ngot:  %+v\nwant: %+v", got, want)
+	}
+	wantRC := []string{
+		"v4.9",
+		"v4.9-rc3",
+		"v4.9-rc2",
+		"v4.9-rc1",
+		"v4.0",
+		"v3.19",
+		"v3.11",
+		"v3.10",
+		"v3.9",
+		"v3.2",
+		"v3.1",
+		"v3.0",
+		"v2.6.39",
+		"v2.6.32",
+		"v2.6.13",
+		"v2.6.12",
+		"v2.6-rc5",
+		"v2.6-rc2",
+	}
+	gotRC := gitParseReleaseTags([]byte(input), true)
+	if !reflect.DeepEqual(gotRC, wantRC) {
+		t.Fatalf("got bad tags\ngot:  %+v\nwant: %+v", gotRC, wantRC)
 	}
 }

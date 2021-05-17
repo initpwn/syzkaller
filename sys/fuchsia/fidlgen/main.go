@@ -13,21 +13,22 @@ import (
 	"github.com/google/syzkaller/pkg/ast"
 	"github.com/google/syzkaller/pkg/compiler"
 	"github.com/google/syzkaller/pkg/osutil"
+	"github.com/google/syzkaller/pkg/tool"
 	"github.com/google/syzkaller/sys/fuchsia/layout"
 	"github.com/google/syzkaller/sys/targets"
 )
 
 func main() {
 	targetArch := os.Getenv("TARGETARCH")
-	target := targets.Get("fuchsia", targetArch)
+	target := targets.Get(targets.Fuchsia, targetArch)
 	if target == nil {
-		failf("unknown TARGETARCH %s", targetArch)
+		tool.Failf("unknown TARGETARCH %s", targetArch)
 	}
 	arch := target.KernelHeaderArch
 
 	sourceDir := os.Getenv("SOURCEDIR")
 	if !osutil.IsExist(sourceDir) {
-		failf("cannot find SOURCEDIR %s", sourceDir)
+		tool.Failf("cannot find SOURCEDIR %s", sourceDir)
 	}
 
 	fidlgenPath := filepath.Join(
@@ -35,16 +36,16 @@ func main() {
 		"out",
 		arch,
 		"host_x64",
-		"fidlgen",
+		"fidlgen_syzkaller",
 	)
 	if !osutil.IsExist(fidlgenPath) {
-		failf("cannot find fidlgen %s", fidlgenPath)
+		tool.Failf("cannot find fidlgen %s", fidlgenPath)
 	}
 
 	var newFiles []string
 	for _, fidlLib := range layout.AllFidlLibraries {
 		jsonPath := filepath.Join(sourceDir, "out", arch, fidlLib.PathToJSONIr())
-		txtPathBase := strings.Replace(strings.Join(fidlLib.FqName, "_"), "^fuchsia", "fidl", 1)
+		txtPathBase := strings.Replace(strings.Join(fidlLib, "_"), "^fuchsia", "fidl", 1)
 
 		txtPath := fidlgen(
 			fidlgenPath,
@@ -62,14 +63,14 @@ func main() {
 		errorMsg = msg
 	})
 	if desc == nil {
-		failf("parsing failed at %v: %v", errorPos, errorMsg)
+		tool.Failf("parsing failed at %v: %v", errorPos, errorMsg)
 	}
 
 	unused := make(map[ast.Node]bool)
 
 	nodes, err := compiler.CollectUnused(desc, target, nil)
 	if err != nil {
-		failf("collect unused nodes failed: %v", err)
+		tool.Failf("collect unused nodes failed: %v", err)
 	}
 
 	for _, n := range nodes {
@@ -88,32 +89,28 @@ func main() {
 		}))
 
 		if err := osutil.WriteFile(file, desc); err != nil {
-			failf("%v", err)
+			tool.Fail(err)
 		}
 	}
 }
 
-func fidlgen(fidlgenPath string, jsonPath string, txtPathBase string) string {
+func fidlgen(fidlgenPath, jsonPath, txtPathBase string) string {
 	if !osutil.IsExist(jsonPath) {
-		failf("cannot find %s", jsonPath)
+		tool.Failf("cannot find %s", jsonPath)
 	}
 
-	_, err := osutil.RunCmd(time.Minute, "",
+	out, err := osutil.RunCmd(time.Minute, "",
 		fidlgenPath,
-		"-generators", "syzkaller",
 		"-json", jsonPath,
-		"-output-base", txtPathBase,
-		"-include-base", txtPathBase,
+		"-output-syz", txtPathBase+".syz.txt",
 	)
+	if len(out) != 0 {
+		fmt.Println(string(out))
+	}
 
 	if err != nil {
-		failf("fidlgen failed: %v", err)
+		tool.Failf("fidlgen failed: %v", err)
 	}
 
 	return fmt.Sprintf("%s.syz.txt", txtPathBase)
-}
-
-func failf(msg string, args ...interface{}) {
-	fmt.Fprintf(os.Stderr, msg+"\n", args...)
-	os.Exit(1)
 }

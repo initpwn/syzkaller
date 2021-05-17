@@ -8,8 +8,11 @@ import (
 	"io"
 	"io/ioutil"
 	"net/http"
+	"net/url"
 	"os"
+	"path"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/google/syzkaller/dashboard/dashapi"
@@ -77,9 +80,10 @@ type Manager struct {
 	cmd        *ManagerCmd
 	dash       *dashapi.Dashboard
 	stop       chan struct{}
+	debug      bool
 }
 
-func createManager(cfg *Config, mgrcfg *ManagerConfig, stop chan struct{}) (*Manager, error) {
+func createManager(cfg *Config, mgrcfg *ManagerConfig, stop chan struct{}, debug bool) (*Manager, error) {
 	dir := osutil.Abs(filepath.Join("managers", mgrcfg.Name))
 	if err := osutil.MkdirAll(dir); err != nil {
 		log.Fatal(err)
@@ -125,7 +129,9 @@ func createManager(cfg *Config, mgrcfg *ManagerConfig, stop chan struct{}) (*Man
 		managercfg: mgrcfg.managercfg,
 		dash:       dash,
 		stop:       stop,
+		debug:      debug,
 	}
+
 	os.RemoveAll(mgr.currentDir)
 	return mgr, nil
 }
@@ -140,7 +146,8 @@ func (mgr *Manager) loop() {
 	nextBuildTime := time.Now()
 	var managerRestartTime, coverUploadTime time.Time
 	latestInfo := mgr.checkLatest()
-	if latestInfo != nil && time.Since(latestInfo.Time) < kernelRebuildPeriod/2 && mgr.managercfg.TargetOS != "fuchsia" {
+	if latestInfo != nil && time.Since(latestInfo.Time) < kernelRebuildPeriod/2 &&
+		mgr.managercfg.TargetOS != targets.Fuchsia {
 		// If we have a reasonably fresh build,
 		// start manager straight away and don't rebuild kernel for a while.
 		// Fuchsia is a special case: it builds with syz-executor, so if we just updated syzkaller, we need
@@ -278,7 +285,7 @@ func (mgr *Manager) build(kernelCommit *vcs.Commit) error {
 		KernelBranch:      mgr.mgrcfg.Branch,
 		KernelCommit:      kernelCommit.Hash,
 		KernelCommitTitle: kernelCommit.Title,
-		KernelCommitDate:  kernelCommit.Date,
+		KernelCommitDate:  kernelCommit.CommitDate,
 		KernelConfigTag:   mgr.configTag,
 	}
 
@@ -300,21 +307,29 @@ func (mgr *Manager) build(kernelCommit *vcs.Commit) error {
 		KernelDir:    mgr.kernelDir,
 		OutputDir:    tmpDir,
 		Compiler:     mgr.mgrcfg.Compiler,
+		Ccache:       mgr.mgrcfg.Ccache,
 		UserspaceDir: mgr.mgrcfg.Userspace,
 		CmdlineFile:  mgr.mgrcfg.KernelCmdline,
 		SysctlFile:   mgr.mgrcfg.KernelSysctl,
 		Config:       mgr.configData,
 	}
 	if _, err := build.Image(params); err != nil {
-		if buildErr, ok := err.(build.KernelBuildError); ok {
-			rep := &report.Report{
-				Title:  fmt.Sprintf("%v build error", mgr.mgrcfg.RepoAlias),
-				Report: []byte(buildErr.Title),
-				Output: buildErr.Output,
-			}
-			if err := mgr.reportBuildError(rep, info, tmpDir); err != nil {
-				mgr.Errorf("failed to report image error: %v", err)
-			}
+		rep := &report.Report{
+			Title: fmt.Sprintf("%v build error", mgr.mgrcfg.RepoAlias),
+		}
+		switch err1 := err.(type) {
+		case *build.KernelError:
+			rep.Report = err1.Report
+			rep.Output = err1.Output
+			rep.Recipients = err1.Recipients
+		case *osutil.VerboseError:
+			rep.Report = []byte(err1.Title)
+			rep.Output = err1.Output
+		default:
+			rep.Report = []byte(err.Error())
+		}
+		if err := mgr.reportBuildError(rep, info, tmpDir); err != nil {
+			mgr.Errorf("failed to report image error: %v", err)
 		}
 		return fmt.Errorf("kernel build failed: %v", err)
 	}
@@ -360,7 +375,11 @@ func (mgr *Manager) restartManager() {
 	}
 	bin := filepath.FromSlash("syzkaller/current/bin/syz-manager")
 	logFile := filepath.Join(mgr.currentDir, "manager.log")
-	mgr.cmd = NewManagerCmd(mgr.name, logFile, mgr.Errorf, bin, "-config", cfgFile)
+	args := []string{"-config", cfgFile}
+	if mgr.debug {
+		args = append(args, "-debug")
+	}
+	mgr.cmd = NewManagerCmd(mgr.name, logFile, mgr.Errorf, bin, args...)
 }
 
 func (mgr *Manager) testImage(imageDir string, info *BuildInfo) error {
@@ -395,12 +414,16 @@ func (mgr *Manager) testImage(imageDir string, info *BuildInfo) error {
 		switch err := res.(type) {
 		case *instance.TestError:
 			if rep := err.Report; rep != nil {
-				what := "test"
+				what := targets.TestOS
 				if err.Boot {
 					what = "boot"
 				}
 				rep.Title = fmt.Sprintf("%v %v error: %v",
 					mgr.mgrcfg.RepoAlias, what, rep.Title)
+				// There are usually no duplicates for boot errors, so we reset AltTitles.
+				// But if we pass them, we would need to add the same prefix as for Title
+				// in order to avoid duping boot bugs with non-boot bugs.
+				rep.AltTitles = nil
 				if err := mgr.reportBuildError(rep, info, imageDir); err != nil {
 					mgr.Errorf("failed to report image error: %v", err)
 				}
@@ -422,7 +445,7 @@ func (mgr *Manager) testImage(imageDir string, info *BuildInfo) error {
 
 func (mgr *Manager) reportBuildError(rep *report.Report, info *BuildInfo, imageDir string) error {
 	if mgr.dash == nil {
-		log.Logf(0, "%v: image testing failed: %v\n\n%s\n\n%s\n",
+		log.Logf(0, "%v: image testing failed: %v\n\n%s\n\n%s",
 			mgr.name, rep.Title, rep.Report, rep.Output)
 		return nil
 	}
@@ -433,11 +456,12 @@ func (mgr *Manager) reportBuildError(rep *report.Report, info *BuildInfo, imageD
 	req := &dashapi.BuildErrorReq{
 		Build: *build,
 		Crash: dashapi.Crash{
-			Title:       rep.Title,
-			Corrupted:   false, // Otherwise they get merged with other corrupted reports.
-			Maintainers: rep.Maintainers,
-			Log:         rep.Output,
-			Report:      rep.Report,
+			Title:      rep.Title,
+			AltTitles:  rep.AltTitles,
+			Corrupted:  false, // Otherwise they get merged with other corrupted reports.
+			Recipients: rep.Recipients.ToDash(),
+			Log:        rep.Output,
+			Report:     rep.Report,
 		},
 	}
 	return mgr.dash.ReportBuildError(req)
@@ -596,11 +620,15 @@ func (mgr *Manager) pollCommits(buildCommit string) ([]string, []dashapi.Commit,
 }
 
 func (mgr *Manager) uploadCoverReport() error {
-	GCS, err := gcs.NewClient()
-	if err != nil {
-		return fmt.Errorf("failed to create GCS client: %v", err)
+	// Report generation can consume lots of memory. Generate one at a time.
+	select {
+	case kernelBuildSem <- struct{}{}:
+	case <-mgr.stop:
+		return nil
 	}
-	defer GCS.Close()
+	defer func() { <-kernelBuildSem }()
+
+	// Get coverage report from manager.
 	addr := mgr.managercfg.HTTP
 	if addr != "" && addr[0] == ':' {
 		addr = "127.0.0.1" + addr // in case addr is ":port"
@@ -610,19 +638,59 @@ func (mgr *Manager) uploadCoverReport() error {
 		return fmt.Errorf("failed to get report: %v", err)
 	}
 	defer resp.Body.Close()
-	gcsPath := filepath.Join(mgr.cfg.CoverUploadPath, mgr.name+".html")
-	gcsWriter, err := GCS.FileWriter(gcsPath)
+	// Upload coverage report.
+	coverUploadURL, err := url.Parse(mgr.cfg.CoverUploadPath)
+	if err != nil {
+		return fmt.Errorf("failed to parse cover upload path: %v", err)
+	}
+	coverUploadURL.Path = path.Join(coverUploadURL.Path, mgr.name+".html")
+	coverUploadURLStr := coverUploadURL.String()
+	log.Logf(0, "%v: uploading cover report to %v", mgr.name, coverUploadURLStr)
+	if strings.HasPrefix(coverUploadURLStr, "gs://") {
+		return uploadCoverReportGCS(strings.TrimPrefix(coverUploadURLStr, "gs://"), resp.Body)
+	} else if strings.HasPrefix(coverUploadURLStr, "http://") ||
+		strings.HasPrefix(coverUploadURLStr, "https://") {
+		return uploadCoverReportHTTPPut(coverUploadURLStr, resp.Body)
+	} else { // Use GCS as default to maintain backwards compatibility.
+		return uploadCoverReportGCS(coverUploadURLStr, resp.Body)
+	}
+}
+
+func uploadCoverReportGCS(coverUploadURL string, coverReport io.Reader) error {
+	GCS, err := gcs.NewClient()
+	if err != nil {
+		return fmt.Errorf("failed to create GCS client: %v", err)
+	}
+	defer GCS.Close()
+	gcsWriter, err := GCS.FileWriter(coverUploadURL)
 	if err != nil {
 		return fmt.Errorf("failed to create GCS writer: %v", err)
 	}
-	if _, err := io.Copy(gcsWriter, resp.Body); err != nil {
+	if _, err := io.Copy(gcsWriter, coverReport); err != nil {
 		gcsWriter.Close()
 		return fmt.Errorf("failed to copy report: %v", err)
 	}
 	if err := gcsWriter.Close(); err != nil {
 		return fmt.Errorf("failed to close gcs writer: %v", err)
 	}
-	return GCS.Publish(gcsPath)
+	return GCS.Publish(coverUploadURL)
+}
+
+func uploadCoverReportHTTPPut(coverUploadURL string, coverReport io.Reader) error {
+	req, err := http.NewRequest(http.MethodPut, coverUploadURL, coverReport)
+	if err != nil {
+		return fmt.Errorf("failed to create HTTP PUT request: %v", err)
+	}
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to perform HTTP PUT request: %v", err)
+	}
+	defer resp.Body.Close()
+	if !(resp.StatusCode >= 200 && resp.StatusCode <= 299) {
+		return fmt.Errorf("HTTP PUT failed with status code: %v", resp.StatusCode)
+	}
+	return nil
 }
 
 // Errorf logs non-fatal error and sends it to dashboard.

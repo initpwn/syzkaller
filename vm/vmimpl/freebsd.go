@@ -9,9 +9,9 @@ import (
 )
 
 // DiagnoseFreeBSD sends the debug commands to the given writer which
-// is expected to be connected to a panicked FreeBSD kernel.  If kernel
-// just hanged, we've lost connection or detected some non-panic
-// error, console still shows normal login prompt.
+// is expected to be connected to a panicked FreeBSD kernel. If kernel
+// just hanged, we've lost connection or detected some non-panic error,
+// console still shows normal login prompt.
 func DiagnoseFreeBSD(w io.Writer) ([]byte, bool) {
 	commands := []string{
 		"",
@@ -22,7 +22,7 @@ func DiagnoseFreeBSD(w io.Writer) ([]byte, bool) {
 		"ps",
 		"show all locks",
 		"show malloc",
-		"show ktr",
+		"show uma",
 	}
 	for _, c := range commands {
 		w.Write([]byte(c + "\n"))

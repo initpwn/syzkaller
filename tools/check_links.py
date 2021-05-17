@@ -1,4 +1,6 @@
 #!/usr/bin/env python
+# Copyright 2017 syzkaller project authors. All rights reserved.
+# Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
 from __future__ import print_function
 import os
@@ -18,13 +20,20 @@ links = []
 
 for doc in docs:
 	with open(doc) as f:
-		data = f.read()
-		r = link_re.findall(data)
-		for link in r:
-			links += [(doc, link)]
+		for i, line in enumerate(f.readlines()):
+			for match in link_re.finditer(line):
+				links += [(doc, match.group(1), i + 1, match.start(1))]
+
+errors = []
+
+for link in links:
+	(doc, link, line, col) = link
+	for prefix in ['https://github.com/google/syzkaller/blob/master', 'https://github.com/google/syzkaller/tree/master']:
+		if link.startswith(prefix):
+			errors += ['%s:%d:%d: Replace absolute link with %s.' % (doc, line, col, link[len(prefix):])]
 
 def filter_link(args):
-	(doc, link) = args
+	(doc, link, line, col) = args
 	if link.startswith('http'):
 		return False
 	if link.startswith('#'):
@@ -36,17 +45,15 @@ def filter_link(args):
 links = list(filter(filter_link, links))
 
 def fix_link(args):
-	(doc, link) = args
+	(doc, link, line, col) = args
 	link = link.split('#')[0]
 	link = link.split('?')[0]
-	return (doc, link)
+	return (doc, link, line, col)
 
 links = list(map(fix_link, links))
 
-errors = []
-
 def check_link(args):
-	(doc, link) = args
+	(doc, link, line, col) = args
 	path = os.path.dirname(doc)
 	full_link = None
 	if link[0] == '/':
@@ -60,13 +67,14 @@ def check_link(args):
 
 for link in links:
 	if not check_link(link):
-		errors += [link]
+		(doc, link, line, col) = link
+		errors += ['%s:%d:%d: Broken link %s.' % (doc, line, col, link)]
 
 if len(errors) == 0:
-	print('%d links checked: OK' % (len(links),))
+	print('%d links checked: OK' % len(links))
 	sys.exit(0)
 
-for (doc, link) in errors:
-	print('File %s linked from %s not found' % (link, doc))
+for error in errors:
+	print(error)
 
 sys.exit(2)

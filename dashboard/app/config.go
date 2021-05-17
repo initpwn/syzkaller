@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/mail"
@@ -31,8 +32,8 @@ type GlobalConfig struct {
 	CoverPath string
 	// Global API clients that work across namespaces (e.g. external reporting).
 	Clients map[string]string
-	// List of emails blacklisted from issuing test requests.
-	EmailBlacklist []string
+	// List of emails blocked from issuing test requests.
+	EmailBlocklist []string
 	// Bug obsoleting settings. See ObsoletingConfig for details.
 	Obsoleting ObsoletingConfig
 	// Namespace that is shown by default (no namespace selected yet).
@@ -43,6 +44,14 @@ type GlobalConfig struct {
 	// Each namespace has own reporting config, own API clients
 	// and bugs are not merged across namespaces.
 	Namespaces map[string]*Config
+	// app's own email address which will appear in FROM field of mails sent by the app.
+	OwnEmailAddress string
+	// List of email addresses which are considered app's own email addresses.
+	// All emails sent from one of these email addresses shall be ignored by the app on reception.
+	ExtraOwnEmailAddresses []string
+	// Main part of the URL at which the app is reachable.
+	// This URL is used e.g. to construct HTML links contained in the emails sent by the app.
+	AppURL string
 }
 
 // Per-namespace config.
@@ -83,6 +92,8 @@ type Config struct {
 	// Other repos are secondary repos, they may be tested or not.
 	// If not tested they are used to poll for fixing commits.
 	Repos []KernelRepo
+	// If not nil, bugs in this namespace will be exported to the specified Kcidb.
+	Kcidb *KcidbConfig
 }
 
 // ObsoletingConfig describes how bugs without reproducer should be obsoleted.
@@ -119,6 +130,8 @@ type ConfigManager struct {
 	ObsoletingMaxPeriod time.Duration
 	// Determines if fix bisection should be disabled on this manager.
 	FixBisectionDisabled bool
+	// CC for all bugs that happened only on this manager.
+	CC CCConfig
 }
 
 // One reporting stage.
@@ -159,8 +172,28 @@ type KernelRepo struct {
 	// ReportingPriority says if we need to prefer to report crashes in this
 	// repo over crashes in repos with lower value. Must be in [0-9] range.
 	ReportingPriority int
-	// Additional CC list to add to all bugs reported on this repo.
-	CC []string
+	// CC for all bugs reported on this repo.
+	CC CCConfig
+}
+
+type CCConfig struct {
+	// Additional CC list to add to bugs unconditionally.
+	Always []string
+	// Additional CC list to add to bugs if we are mailing maintainers.
+	Maintainers []string
+	// Additional CC list to add to build/boot bugs if we are mailing maintainers.
+	BuildMaintainers []string
+}
+
+type KcidbConfig struct {
+	// Origin is how this system identified in Kcidb, e.g. "syzbot_foobar".
+	Origin string
+	// Project is Kcidb GCE project name, e.g. "kernelci-production".
+	Project string
+	// Topic is pubsub topic to publish messages to, e.g. "playground_kernelci_new".
+	Topic string
+	// Credentials is Google application credentials file contents to use for authorization.
+	Credentials []byte
 }
 
 var (
@@ -212,6 +245,7 @@ func installConfig(cfg *GlobalConfig) {
 	initEmailReporting()
 	initHTTPHandlers()
 	initAPIHandlers()
+	initKcidb()
 }
 
 func checkConfig(cfg *GlobalConfig) {
@@ -221,8 +255,8 @@ func checkConfig(cfg *GlobalConfig) {
 	if len(cfg.Namespaces) == 0 {
 		panic("no namespaces found")
 	}
-	for i := range cfg.EmailBlacklist {
-		cfg.EmailBlacklist[i] = email.CanonicalEmail(cfg.EmailBlacklist[i])
+	for i := range cfg.EmailBlocklist {
+		cfg.EmailBlocklist[i] = email.CanonicalEmail(cfg.EmailBlocklist[i])
 	}
 	namespaces := make(map[string]bool)
 	clientNames := make(map[string]bool)
@@ -295,6 +329,9 @@ func checkNamespace(ns string, cfg *Config, namespaces, clientNames map[string]b
 			return true
 		}
 	}
+	if cfg.Kcidb != nil {
+		checkKcidb(ns, cfg.Kcidb)
+	}
 	checkKernelRepos(ns, cfg)
 	checkNamespaceReporting(ns, cfg)
 }
@@ -316,10 +353,15 @@ func checkKernelRepos(ns string, cfg *Config) {
 		if prio := repo.ReportingPriority; prio < 0 || prio > 9 {
 			panic(fmt.Sprintf("%v: bad kernel repo reporting priority %v for %q", ns, prio, repo.Alias))
 		}
-		for _, email := range repo.CC {
-			if _, err := mail.ParseAddress(email); err != nil {
-				panic(fmt.Sprintf("bad email address %q: %v", email, err))
-			}
+		checkCC(&repo.CC)
+	}
+}
+
+func checkCC(cc *CCConfig) {
+	emails := append(append(append([]string{}, cc.Always...), cc.Maintainers...), cc.BuildMaintainers...)
+	for _, email := range emails {
+		if _, err := mail.ParseAddress(email); err != nil {
+			panic(fmt.Sprintf("bad email address %q: %v", email, err))
 		}
 	}
 }
@@ -347,6 +389,9 @@ func checkNamespaceReporting(ns string, cfg *Config) {
 		checkConfigAccessLevel(&reporting.AccessLevel, parentAccessLevel,
 			fmt.Sprintf("reporting %q/%q", ns, reporting.Name))
 		parentAccessLevel = reporting.AccessLevel
+		if reporting.DailyLimit < 0 || reporting.DailyLimit > 1000 {
+			panic(fmt.Sprintf("reporting %v: bad daily limit %v", reporting.Name, reporting.DailyLimit))
+		}
 		if reporting.Filter == nil {
 			reporting.Filter = ConstFilter(FilterReport)
 		}
@@ -385,6 +430,22 @@ func checkManager(ns, name string, mgr ConfigManager) {
 	}
 	if mgr.ObsoletingMinPeriod != 0 && mgr.ObsoletingMinPeriod < 24*time.Hour {
 		panic(fmt.Sprintf("manager %v/%v obsoleting: too low MinPeriod", ns, name))
+	}
+	checkCC(&mgr.CC)
+}
+
+func checkKcidb(ns string, kcidb *KcidbConfig) {
+	if !regexp.MustCompile("^[a-z0-9_]+$").MatchString(kcidb.Origin) {
+		panic(fmt.Sprintf("%v: bad Kcidb origin %q", ns, kcidb.Origin))
+	}
+	if kcidb.Project == "" {
+		panic(fmt.Sprintf("%v: empty Kcidb project", ns))
+	}
+	if kcidb.Topic == "" {
+		panic(fmt.Sprintf("%v: empty Kcidb topic", ns))
+	}
+	if !bytes.Contains(kcidb.Credentials, []byte("private_key")) {
+		panic(fmt.Sprintf("%v: empty Kcidb credentials", ns))
 	}
 }
 

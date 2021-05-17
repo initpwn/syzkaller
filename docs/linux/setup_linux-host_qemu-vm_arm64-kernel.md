@@ -50,7 +50,7 @@ If you have another ARM64 toolchain on your machine, ensure that this newly down
 
 ## Compile the kernel
 
-Once you have obtained the source code for the linux kernel you wish to fuzz, do the following.
+Get the source code of the Linux kernel version you want to fuzz, and do the following.
 
     $ ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make defconfig
     $ vim .config
@@ -109,7 +109,7 @@ At the top of /etc/init.d/S50sshd add the following lines:
     mount -t debugfs none /sys/kernel/debug
     chmod 777 /sys/kernel/debug/kcov
 
-Comment out the line 
+Comment out the line
 
     /usr/bin/ssh-keygen -A
 

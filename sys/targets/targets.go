@@ -4,34 +4,46 @@
 package targets
 
 import (
+	"encoding/binary"
 	"fmt"
 	"os"
 	"os/exec"
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 )
 
 type Target struct {
-	init sync.Once
 	osCommon
-	OS                  string
-	Arch                string
-	VMArch              string // e.g. amd64 for 386, or arm64 for arm
-	PtrSize             uint64
-	PageSize            uint64
-	NumPages            uint64
-	DataOffset          uint64
-	Int64Alignment      uint64
-	CFlags              []string
-	CrossCFlags         []string
-	CCompilerPrefix     string
-	CCompiler           string
-	KernelArch          string
-	KernelHeaderArch    string
-	BrokenCrossCompiler string
+	OS               string
+	Arch             string
+	VMArch           string // e.g. amd64 for 386, or arm64 for arm
+	PtrSize          uint64
+	PageSize         uint64
+	NumPages         uint64
+	DataOffset       uint64
+	Int64Alignment   uint64
+	LittleEndian     bool
+	CFlags           []string
+	Triple           string
+	CCompiler        string
+	Objdump          string // name of objdump executable
+	KernelCompiler   string // override CC when running kernel make
+	KernelLinker     string // override LD when running kernel make
+	KernelArch       string
+	KernelHeaderArch string
+	BrokenCompiler   string
 	// NeedSyscallDefine is used by csource package to decide when to emit __NR_* defines.
-	NeedSyscallDefine func(nr uint64) bool
+	NeedSyscallDefine  func(nr uint64) bool
+	HostEndian         binary.ByteOrder
+	SyscallTrampolines map[string]string
+
+	init      *sync.Once
+	initOther *sync.Once
+	// Target for the other compiler. If SYZ_CLANG says to use gcc, this will be clang. Or the other way around.
+	other    *Target
+	timeouts Timeouts
 }
 
 type osCommon struct {
@@ -57,75 +69,142 @@ type osCommon struct {
 	// Some systems build syz-executor into their images.
 	// If this flag is not empty, syz-executor will not be copied to the machine, and will be run using
 	// this command instead.
-	SyzExecutorCmd string
+	ExecutorBin string
 	// Extension of executable files (notably, .exe for windows).
 	ExeExtension string
 	// Name of the kernel object file.
 	KernelObject string
 	// Name of cpp(1) executable.
 	CPP string
+	// Common CFLAGS for this OS.
+	cflags []string
 }
 
+// Timeouts structure parametrizes timeouts throughout the system.
+// It allows to support different operating system, architectures and execution environments
+// (emulation, models, etc) without scattering and duplicating knowledge about their execution
+// performance everywhere.
+// Timeouts calculation consists of 2 parts: base values and scaling.
+// Base timeout values consist of a single syscall timeout, program timeout and "no output" timeout
+// and are specified by the target (OS/arch), or defaults are used.
+// Scaling part is calculated from the execution environment in pkg/mgrconfig based on VM type,
+// kernel build type, emulation, etc. Scaling is specifically converged to a single number so that
+// it can be specified/overridden for command line tools (e.g. syz-execprog -slowdown=10).
+type Timeouts struct {
+	// Base scaling factor, used only for a single syscall timeout.
+	Slowdown int
+	// Capped scaling factor used for timeouts other than syscall timeout.
+	// It's already applied to all values in this struct, but can be used for one-off timeout values
+	// in the system. This should also be applied to syscall/program timeout attributes in syscall descriptions.
+	// Derived from Slowdown and should not be greater than Slowdown.
+	// The idea behind capping is that slowdown can be large (10-20) and most timeouts already
+	// include some safety margin. If we just multiply them we will get too large timeouts,
+	// e.g. program timeout can become 5s*20 = 100s, or "no output" timeout: 5m*20 = 100m.
+	Scale time.Duration
+	// Timeout for a single syscall, after this time the syscall is considered "blocked".
+	Syscall time.Duration
+	// Timeout for a single program execution.
+	Program time.Duration
+	// Timeout for "no output" detection.
+	NoOutput time.Duration
+	// Limit on a single VM running time, after this time a VM is restarted.
+	VMRunningTime time.Duration
+	// How long we should test to get "no output" error (derivative of NoOutput, here to avoid duplication).
+	NoOutputRunningTime time.Duration
+}
+
+const (
+	Akaros  = "akaros"
+	FreeBSD = "freebsd"
+	Fuchsia = "fuchsia"
+	Linux   = "linux"
+	NetBSD  = "netbsd"
+	OpenBSD = "openbsd"
+	TestOS  = "test"
+	Trusty  = "trusty"
+	Windows = "windows"
+
+	AMD64               = "amd64"
+	ARM64               = "arm64"
+	ARM                 = "arm"
+	I386                = "386"
+	MIPS64LE            = "mips64le"
+	PPC64LE             = "ppc64le"
+	S390x               = "s390x"
+	RiscV64             = "riscv64"
+	TestArch64          = "64"
+	TestArch64Fork      = "64_fork"
+	TestArch32Shmem     = "32_shmem"
+	TestArch32ForkShmem = "32_fork_shmem"
+)
+
 func Get(OS, arch string) *Target {
+	return GetEx(OS, arch, useClang)
+}
+
+func GetEx(OS, arch string, clang bool) *Target {
 	target := List[OS][arch]
 	if target == nil {
 		return nil
 	}
-	target.init.Do(target.lazyInit)
-	return target
+	if clang == useClang {
+		target.init.Do(target.lazyInit)
+		return target
+	}
+	target.initOther.Do(func() {
+		other := new(Target)
+		*other = *target
+		other.setCompiler(clang)
+		other.lazyInit()
+		target.other = other
+	})
+	return target.other
 }
 
 // nolint: lll
 var List = map[string]map[string]*Target{
-	"test": {
-		"64": {
+	TestOS: {
+		TestArch64: {
 			PtrSize:  8,
 			PageSize: 4 << 10,
-			CFlags:   []string{"-m64"},
-			// Compile with -no-pie due to issues with ASan + ASLR on ppc64le
-			CrossCFlags: []string{"-m64", "-fsanitize=address", "-no-pie"},
+			// Compile with -no-pie due to issues with ASan + ASLR on ppc64le.
+			CFlags: []string{"-m64", "-fsanitize=address", "-no-pie"},
 			osCommon: osCommon{
 				SyscallNumbers:         true,
 				SyscallPrefix:          "SYS_",
 				ExecutorUsesShmem:      false,
 				ExecutorUsesForkServer: false,
-				HostFuzzer:             true,
 			},
 		},
-		"64_fork": {
+		TestArch64Fork: {
 			PtrSize:  8,
 			PageSize: 8 << 10,
-			CFlags:   []string{"-m64"},
-			// Compile with -no-pie due to issues with ASan + ASLR on ppc64le
-			CrossCFlags: []string{"-m64", "-fsanitize=address", "-no-pie"},
+			// Compile with -no-pie due to issues with ASan + ASLR on ppc64le.
+			CFlags: []string{"-m64", "-fsanitize=address", "-no-pie"},
 			osCommon: osCommon{
 				SyscallNumbers:         true,
 				SyscallPrefix:          "SYS_",
 				ExecutorUsesShmem:      false,
 				ExecutorUsesForkServer: true,
-				HostFuzzer:             true,
 			},
 		},
-		"32_shmem": {
+		TestArch32Shmem: {
 			PtrSize:        4,
 			PageSize:       8 << 10,
 			Int64Alignment: 4,
-			CFlags:         []string{"-m32"},
-			CrossCFlags:    []string{"-m32", "-static"},
+			CFlags:         []string{"-m32", "-static"},
 			osCommon: osCommon{
 				SyscallNumbers:         true,
 				Int64SyscallArgs:       true,
 				SyscallPrefix:          "SYS_",
 				ExecutorUsesShmem:      true,
 				ExecutorUsesForkServer: false,
-				HostFuzzer:             true,
 			},
 		},
-		"32_fork_shmem": {
-			PtrSize:     4,
-			PageSize:    4 << 10,
-			CFlags:      []string{"-m32"},
-			CrossCFlags: []string{"-m32", "-static"},
+		TestArch32ForkShmem: {
+			PtrSize:  4,
+			PageSize: 4 << 10,
+			CFlags:   []string{"-m32", "-static"},
 			osCommon: osCommon{
 				SyscallNumbers:         true,
 				Int64SyscallArgs:       true,
@@ -136,13 +215,13 @@ var List = map[string]map[string]*Target{
 			},
 		},
 	},
-	"linux": {
-		"amd64": {
+	Linux: {
+		AMD64: {
 			PtrSize:          8,
 			PageSize:         4 << 10,
+			LittleEndian:     true,
 			CFlags:           []string{"-m64"},
-			CrossCFlags:      []string{"-m64", "-static"},
-			CCompilerPrefix:  "x86_64-linux-gnu-",
+			Triple:           "x86_64-linux-gnu",
 			KernelArch:       "x86_64",
 			KernelHeaderArch: "x86",
 			NeedSyscallDefine: func(nr uint64) bool {
@@ -151,97 +230,127 @@ var List = map[string]map[string]*Target{
 				return nr >= 313
 			},
 		},
-		"386": {
-			VMArch:           "amd64",
+		I386: {
+			VMArch:           AMD64,
 			PtrSize:          4,
 			PageSize:         4 << 10,
 			Int64Alignment:   4,
+			LittleEndian:     true,
 			CFlags:           []string{"-m32"},
-			CrossCFlags:      []string{"-m32", "-static"},
-			CCompilerPrefix:  "x86_64-linux-gnu-",
+			Triple:           "x86_64-linux-gnu",
 			KernelArch:       "i386",
 			KernelHeaderArch: "x86",
 		},
-		"arm64": {
+		ARM64: {
 			PtrSize:          8,
 			PageSize:         4 << 10,
-			CrossCFlags:      []string{"-static"},
-			CCompilerPrefix:  "aarch64-linux-gnu-",
+			LittleEndian:     true,
+			Triple:           "aarch64-linux-gnu",
 			KernelArch:       "arm64",
 			KernelHeaderArch: "arm64",
 		},
-		"arm": {
-			VMArch:           "arm64",
+		ARM: {
+			VMArch:           ARM64,
 			PtrSize:          4,
 			PageSize:         4 << 10,
-			CFlags:           []string{"-D__LINUX_ARM_ARCH__=6", "-m32", "-D__ARM_EABI__"},
-			CrossCFlags:      []string{"-D__LINUX_ARM_ARCH__=6", "-march=armv6", "-static"},
-			CCompilerPrefix:  "arm-linux-gnueabi-",
+			LittleEndian:     true,
+			CFlags:           []string{"-D__LINUX_ARM_ARCH__=6", "-march=armv6"},
+			Triple:           "arm-linux-gnueabi",
 			KernelArch:       "arm",
 			KernelHeaderArch: "arm",
 		},
-		"mips64le": {
-			VMArch:           "mips64le",
+		MIPS64LE: {
 			PtrSize:          8,
 			PageSize:         4 << 10,
-			CFlags:           []string{"-D_MIPS_SZLONG=64", "-D__MIPSEL__", "-D__KERNEL__", "-D_MIPS_SIM=_MIPS_SIM_ABI64"},
-			CrossCFlags:      []string{"-static", "-march=mips64r2", "-mabi=64", "-EL"},
-			CCompilerPrefix:  "mips64el-linux-gnuabi64-",
+			LittleEndian:     true,
+			CFlags:           []string{"-march=mips64r2", "-mabi=64", "-EL"},
+			Triple:           "mips64el-linux-gnuabi64",
 			KernelArch:       "mips",
 			KernelHeaderArch: "mips",
 		},
-		"ppc64le": {
-			PtrSize:  8,
-			PageSize: 4 << 10,
-			CFlags: []string{
-				"-D__powerpc64__",
-				"-D__LITTLE_ENDIAN__=1",
-				"-D__BYTE_ORDER__=__ORDER_LITTLE_ENDIAN__",
-			},
-			CrossCFlags:      []string{"-D__powerpc64__", "-static"},
-			CCompilerPrefix:  "powerpc64le-linux-gnu-",
+		PPC64LE: {
+			PtrSize:          8,
+			PageSize:         64 << 10,
+			LittleEndian:     true,
+			CFlags:           []string{"-D__powerpc64__"},
+			Triple:           "powerpc64le-linux-gnu",
 			KernelArch:       "powerpc",
 			KernelHeaderArch: "powerpc",
 		},
-	},
-	"freebsd": {
-		"amd64": {
-			PtrSize:           8,
-			PageSize:          4 << 10,
-			CFlags:            []string{"-m64"},
-			CrossCFlags:       []string{"-m64", "-static"},
-			NeedSyscallDefine: dontNeedSyscallDefine,
-		},
-		"386": {
-			VMArch:         "amd64",
-			PtrSize:        4,
-			PageSize:       4 << 10,
-			Int64Alignment: 4,
-			CFlags:         []string{"-m32"},
-			// The story behind -B/usr/lib32 is not completely clear, but it helps in some cases.
-			// For context see discussion in https://github.com/google/syzkaller/pull/1202
-			CrossCFlags:       []string{"-m32", "-static", "-B/usr/lib32"},
-			NeedSyscallDefine: dontNeedSyscallDefine,
-		},
-	},
-	"netbsd": {
-		"amd64": {
-			PtrSize:  8,
-			PageSize: 4 << 10,
-			CFlags:   []string{"-m64"},
-			CrossCFlags: []string{"-m64", "-static",
-				"--sysroot", os.ExpandEnv("${SOURCEDIR}/../dest/"),
+		S390x: {
+			PtrSize:          8,
+			PageSize:         4 << 10,
+			DataOffset:       0xfffff000,
+			LittleEndian:     false,
+			Triple:           "s390x-linux-gnu",
+			KernelArch:       "s390",
+			KernelHeaderArch: "s390",
+			SyscallTrampolines: map[string]string{
+				// The s390x Linux syscall ABI allows for upto 5 input parameters passed in registers, and this is not enough
+				// for the mmap syscall. Therefore, all input parameters for the mmap syscall are packed into a struct
+				// on user stack and the pointer to the struct is passed as an input parameter to the syscall.
+				// To work around this problem we therefore reroute the mmap syscall to the glibc mmap wrapper.
+				"mmap": "mmap",
 			},
-			CCompiler: os.ExpandEnv("${SOURCEDIR}/../tools/bin/x86_64--netbsd-g++"),
+		},
+		RiscV64: {
+			PtrSize:          8,
+			PageSize:         4 << 10,
+			LittleEndian:     true,
+			Triple:           "riscv64-linux-gnu",
+			KernelArch:       "riscv",
+			KernelHeaderArch: "riscv",
 		},
 	},
-	"openbsd": {
-		"amd64": {
-			PtrSize:     8,
-			PageSize:    4 << 10,
-			CFlags:      []string{"-m64"},
-			CCompiler:   "c++",
-			CrossCFlags: []string{"-m64", "-static", "-lutil"},
+	FreeBSD: {
+		AMD64: {
+			PtrSize:      8,
+			PageSize:     4 << 10,
+			LittleEndian: true,
+			CCompiler:    "clang",
+			CFlags:       []string{"-m64"},
+			NeedSyscallDefine: func(nr uint64) bool {
+				// freebsd_12_shm_open, shm_open2, shm_rename, __realpathat, close_range, copy_file_range
+				return nr == 482 || nr >= 569
+			},
+		},
+		I386: {
+			VMArch:   AMD64,
+			PtrSize:  4,
+			PageSize: 4 << 10,
+			// The default DataOffset doesn't work with 32-bit
+			// FreeBSD and using ld.lld due to collisions.
+			DataOffset:     256 << 20,
+			Int64Alignment: 4,
+			LittleEndian:   true,
+			CCompiler:      "clang",
+			CFlags:         []string{"-m32"},
+			NeedSyscallDefine: func(nr uint64) bool {
+				// freebsd_12_shm_open, shm_open2, shm_rename, __realpathat, close_range, copy_file_range
+				return nr == 482 || nr >= 569
+			},
+		},
+	},
+	NetBSD: {
+		AMD64: {
+			PtrSize:      8,
+			PageSize:     4 << 10,
+			LittleEndian: true,
+			CFlags: []string{
+				"-m64",
+				"-static",
+				"--sysroot", sourceDirVar + "/dest/",
+			},
+			CCompiler: sourceDirVar + "/tools/bin/x86_64--netbsd-g++",
+		},
+	},
+	OpenBSD: {
+		AMD64: {
+			PtrSize:      8,
+			PageSize:     4 << 10,
+			LittleEndian: true,
+			CCompiler:    "c++",
+			CFlags:       []string{"-m64", "-static", "-lutil"},
 			NeedSyscallDefine: func(nr uint64) bool {
 				switch nr {
 				case 8: // SYS___tfork
@@ -269,91 +378,67 @@ var List = map[string]map[string]*Target{
 			},
 		},
 	},
-	"fuchsia": {
-		"amd64": {
+	Fuchsia: {
+		AMD64: {
 			PtrSize:          8,
 			PageSize:         4 << 10,
+			LittleEndian:     true,
 			KernelHeaderArch: "x64",
-			CCompiler:        os.ExpandEnv("${SOURCEDIR}/prebuilt/third_party/clang/linux-x64/bin/clang"),
-			CrossCFlags: []string{
-				"-Wno-deprecated",
-				"--target=x86_64-fuchsia",
-				"-ldriver",
-				"-lfdio",
-				"-lzircon",
-				"--sysroot", os.ExpandEnv("${SOURCEDIR}/out/x64/sdk/exported/zircon_sysroot/arch/x64/sysroot"),
-				"-I", os.ExpandEnv("${SOURCEDIR}/zircon/system/ulib/ddk/include"),
-				"-I", os.ExpandEnv("${SOURCEDIR}/zircon/system/ulib/fdio/include"),
-				"-I", os.ExpandEnv("${SOURCEDIR}/zircon/system/ulib/fidl/include"),
-				"-I", os.ExpandEnv("${SOURCEDIR}/out/x64/fidling/gen/zircon/system/fidl/fuchsia-device"),
-				"-I", os.ExpandEnv("${SOURCEDIR}/out/x64/fidling/gen/zircon/system/fidl/fuchsia-device-manager"),
-				"-I", os.ExpandEnv("${SOURCEDIR}/out/x64/fidling/gen/zircon/system/fidl/fuchsia-hardware-nand"),
-				"-I", os.ExpandEnv("${SOURCEDIR}/out/x64/fidling/gen/zircon/system/fidl/fuchsia-hardware-usb-peripheral"),
-				"-L", os.ExpandEnv("${SOURCEDIR}/out/x64/x64-shared"),
-				"-L", os.ExpandEnv("${SOURCEDIR}/out/x64/gen/zircon/public/lib/fdio"),
-			},
+			CCompiler:        sourceDirVar + "/prebuilt/third_party/clang/linux-x64/bin/clang",
+			Objdump:          sourceDirVar + "/prebuilt/third_party/clang/linux-x64/bin/llvm-objdump",
+			CFlags:           fuchsiaCFlags("x64", "x86_64"),
 		},
-		"arm64": {
+		ARM64: {
 			PtrSize:          8,
 			PageSize:         4 << 10,
-			KernelHeaderArch: "arm64",
-			CCompiler:        os.ExpandEnv("${SOURCEDIR}/prebuilt/third_party/clang/linux-x64/bin/clang"),
-			CrossCFlags: []string{
-				"-Wno-deprecated",
-				"--target=aarch64-fuchsia",
-				"-ldriver",
-				"-lfdio",
-				"-lzircon",
-				"--sysroot", os.ExpandEnv("${SOURCEDIR}/out/arm64/sdk/exported/zircon_sysroot/arch/arm64/sysroot"),
-				"-I", os.ExpandEnv("${SOURCEDIR}/zircon/system/ulib/ddk/include"),
-				"-I", os.ExpandEnv("${SOURCEDIR}/zircon/system/ulib/fdio/include"),
-				"-I", os.ExpandEnv("${SOURCEDIR}/zircon/system/ulib/fidl/include"),
-				"-I", os.ExpandEnv("${SOURCEDIR}/out/arm64/fidling/gen/zircon/system/fidl/fuchsia-device"),
-				"-I", os.ExpandEnv("${SOURCEDIR}/out/arm64/fidling/gen/zircon/system/fidl/fuchsia-device-manager"),
-				"-I", os.ExpandEnv("${SOURCEDIR}/out/arm64/fidling/gen/zircon/system/fidl/fuchsia-hardware-nand"),
-				"-I", os.ExpandEnv("${SOURCEDIR}/out/arm64/fidling/gen/zircon/system/fidl/fuchsia-hardware-usb-peripheral"),
-				"-L", os.ExpandEnv("${SOURCEDIR}/out/arm64/arm64-shared"),
-				"-L", os.ExpandEnv("${SOURCEDIR}/out/arm64/gen/zircon/public/lib/fdio"),
-			},
+			LittleEndian:     true,
+			KernelHeaderArch: ARM64,
+			CCompiler:        sourceDirVar + "/prebuilt/third_party/clang/linux-x64/bin/clang",
+			Objdump:          sourceDirVar + "/prebuilt/third_party/clang/linux-x64/bin/llvm-objdump",
+			CFlags:           fuchsiaCFlags(ARM64, "aarch64"),
 		},
 	},
-	"windows": {
-		"amd64": {
+	Windows: {
+		AMD64: {
 			PtrSize: 8,
 			// TODO(dvyukov): what should we do about 4k vs 64k?
-			PageSize: 4 << 10,
+			PageSize:     4 << 10,
+			LittleEndian: true,
 		},
 	},
-	"akaros": {
-		"amd64": {
+	Akaros: {
+		AMD64: {
 			PtrSize:           8,
 			PageSize:          4 << 10,
+			LittleEndian:      true,
 			KernelHeaderArch:  "x86",
 			NeedSyscallDefine: dontNeedSyscallDefine,
-			CCompiler:         os.ExpandEnv("${SOURCEDIR}/toolchain/x86_64-ucb-akaros-gcc/bin/x86_64-ucb-akaros-g++"),
-			CrossCFlags: []string{
+			CCompiler:         sourceDirVar + "/toolchain/x86_64-ucb-akaros-gcc/bin/x86_64-ucb-akaros-g++",
+			CFlags: []string{
 				"-static",
 			},
 		},
 	},
-	"trusty": {
-		"arm": {
+	Trusty: {
+		ARM: {
 			PtrSize:           4,
 			PageSize:          4 << 10,
+			LittleEndian:      true,
 			NeedSyscallDefine: dontNeedSyscallDefine,
 		},
 	},
 }
 
 var oses = map[string]osCommon{
-	"linux": {
+	Linux: {
 		SyscallNumbers:         true,
 		SyscallPrefix:          "__NR_",
 		ExecutorUsesShmem:      true,
 		ExecutorUsesForkServer: true,
 		KernelObject:           "vmlinux",
+		cflags:                 []string{"-static"},
 	},
-	"freebsd": {
+	FreeBSD: {
 		SyscallNumbers:         true,
 		Int64SyscallArgs:       true,
 		SyscallPrefix:          "SYS_",
@@ -361,16 +446,17 @@ var oses = map[string]osCommon{
 		ExecutorUsesForkServer: true,
 		KernelObject:           "kernel.full",
 		CPP:                    "g++",
+		cflags:                 []string{"-static", "-lc++"},
 	},
-	"netbsd": {
-		BuildOS:                "linux",
+	NetBSD: {
+		BuildOS:                Linux,
 		SyscallNumbers:         true,
 		SyscallPrefix:          "SYS_",
 		ExecutorUsesShmem:      true,
 		ExecutorUsesForkServer: true,
 		KernelObject:           "netbsd.gdb",
 	},
-	"openbsd": {
+	OpenBSD: {
 		SyscallNumbers:         true,
 		SyscallPrefix:          "SYS_",
 		ExecutorUsesShmem:      true,
@@ -378,24 +464,24 @@ var oses = map[string]osCommon{
 		KernelObject:           "bsd.gdb",
 		CPP:                    "ecpp",
 	},
-	"fuchsia": {
-		BuildOS:                "linux",
+	Fuchsia: {
+		BuildOS:                Linux,
 		SyscallNumbers:         false,
 		ExecutorUsesShmem:      false,
 		ExecutorUsesForkServer: false,
 		HostFuzzer:             true,
-		SyzExecutorCmd:         "syz-executor",
+		ExecutorBin:            "syz-executor",
 		KernelObject:           "zircon.elf",
 	},
-	"windows": {
+	Windows: {
 		SyscallNumbers:         false,
 		ExecutorUsesShmem:      false,
 		ExecutorUsesForkServer: false,
 		ExeExtension:           ".exe",
 		KernelObject:           "vmlinux",
 	},
-	"akaros": {
-		BuildOS:                "linux",
+	Akaros: {
+		BuildOS:                Linux,
 		SyscallNumbers:         true,
 		SyscallPrefix:          "SYS_",
 		ExecutorUsesShmem:      false,
@@ -403,7 +489,7 @@ var oses = map[string]osCommon{
 		HostFuzzer:             true,
 		KernelObject:           "akaros-kernel-64b",
 	},
-	"trusty": {
+	Trusty: {
 		SyscallNumbers:   true,
 		Int64SyscallArgs: true,
 		SyscallPrefix:    "__NR_",
@@ -427,30 +513,71 @@ var (
 	}
 )
 
+func fuchsiaCFlags(arch, clangArch string) []string {
+	out := sourceDirVar + "/out/" + arch
+	return []string{
+		"-Wno-deprecated",
+		"-target", clangArch + "-fuchsia",
+		"-ldriver",
+		"-lfdio",
+		"-lzircon",
+		"--sysroot", out + "/zircon_toolchain/obj/zircon/public/sysroot/sysroot",
+		"-I", sourceDirVar + "/sdk/lib/fdio/include",
+		"-I", sourceDirVar + "/zircon/system/ulib/fidl/include",
+		"-I", sourceDirVar + "/src/lib/ddk/include",
+		"-I", out + "/fidling/gen/sdk/fidl/fuchsia.device",
+		"-I", out + "/fidling/gen/sdk/fidl/fuchsia.device.manager",
+		"-I", out + "/fidling/gen/sdk/fidl/fuchsia.hardware.nand",
+		"-I", out + "/fidling/gen/sdk/fidl/fuchsia.hardware.power.statecontrol",
+		"-I", out + "/fidling/gen/sdk/fidl/fuchsia.hardware.usb.peripheral",
+		"-I", out + "/fidling/gen/zircon/vdso/zx",
+		"-L", out + "/" + arch + "-shared",
+	}
+}
+
 func init() {
 	for OS, archs := range List {
 		for arch, target := range archs {
 			initTarget(target, OS, arch)
 		}
 	}
+	goarch := runtime.GOARCH
 	goos := runtime.GOOS
 	if goos == "android" {
-		goos = "linux"
+		goos = Linux
 	}
-	for _, target := range List["test"] {
+	for _, target := range List[TestOS] {
 		if List[goos] != nil {
-			if host := List[goos][runtime.GOARCH]; host != nil {
+			if host := List[goos][goarch]; host != nil {
 				target.CCompiler = host.CCompiler
 				target.CPP = host.CPP
+				if goos == FreeBSD {
+					// For some configurations -no-pie is passed to the compiler,
+					// which is not used by clang.
+					// Ensure clang does not complain about it.
+					target.CFlags = append(target.CFlags, "-Wno-unused-command-line-argument")
+					// When building executor for the test OS, clang needs
+					// to link against the libc++ library.
+					target.CFlags = append(target.CFlags, "-lc++")
+				}
+				// In ESA/390 mode, the CPU is able to address only 31bit of memory but
+				// arithmetic operations are still 32bit
+				// Fix cflags by replacing compiler's -m32 option with -m31
+				if goarch == S390x {
+					for i := range target.CFlags {
+						target.CFlags[i] = strings.Replace(target.CFlags[i], "-m32", "-m31", -1)
+					}
+				}
+			}
+			if target.PtrSize == 4 && goos == FreeBSD && goarch == AMD64 {
+				// A hack to let 32-bit "test" target tests run on FreeBSD:
+				// freebsd/386 requires a non-default DataOffset to avoid
+				// clobbering mappings created by the C runtime. Since that is the
+				// only target with this constraint, just special-case it for now.
+				target.DataOffset = List[goos][I386].DataOffset
 			}
 		}
 		target.BuildOS = goos
-		if runtime.GOOS == "freebsd" && runtime.GOARCH == "amd64" && target.PtrSize == 4 {
-			// -m32 alone does not work on freebsd with gcc.
-			// TODO(dvyukov): consider switching to clang on freebsd instead.
-			target.CFlags = append(target.CFlags, "-B/usr/lib32")
-			target.CrossCFlags = append(target.CrossCFlags, "-B/usr/lib32")
-		}
 	}
 }
 
@@ -458,25 +585,50 @@ func initTarget(target *Target, OS, arch string) {
 	if common, ok := oses[OS]; ok {
 		target.osCommon = common
 	}
+	target.init = new(sync.Once)
+	target.initOther = new(sync.Once)
 	target.OS = OS
 	target.Arch = arch
+	if target.KernelArch == "" {
+		target.KernelArch = target.Arch
+	}
 	if target.NeedSyscallDefine == nil {
 		target.NeedSyscallDefine = needSyscallDefine
 	}
-	target.DataOffset = 512 << 20
+	if target.DataOffset == 0 {
+		target.DataOffset = 512 << 20
+	}
 	target.NumPages = (16 << 20) / target.PageSize
-	if OS == "linux" && arch == runtime.GOARCH {
+	sourceDir := os.Getenv("SOURCEDIR_" + strings.ToUpper(OS))
+	if sourceDir == "" {
+		sourceDir = os.Getenv("SOURCEDIR")
+	}
+	for sourceDir != "" && sourceDir[len(sourceDir)-1] == '/' {
+		sourceDir = sourceDir[:len(sourceDir)-1]
+	}
+	target.replaceSourceDir(&target.CCompiler, sourceDir)
+	target.replaceSourceDir(&target.Objdump, sourceDir)
+	for i := range target.CFlags {
+		target.replaceSourceDir(&target.CFlags[i], sourceDir)
+	}
+	if OS == Linux && arch == runtime.GOARCH {
 		// Don't use cross-compiler for native compilation, there are cases when this does not work:
 		// https://github.com/google/syzkaller/pull/619
 		// https://github.com/google/syzkaller/issues/387
 		// https://github.com/google/syzkaller/commit/06db3cec94c54e1cf720cdd5db72761514569d56
-		target.CCompilerPrefix = ""
+		target.Triple = ""
 	}
 	if target.CCompiler == "" {
-		target.CCompiler = target.CCompilerPrefix + "gcc"
+		target.setCompiler(useClang)
 	}
 	if target.CPP == "" {
 		target.CPP = "cpp"
+	}
+	if target.Objdump == "" {
+		target.Objdump = "objdump"
+		if target.Triple != "" {
+			target.Objdump = target.Triple + "-objdump"
+		}
 	}
 	if target.BuildOS == "" {
 		target.BuildOS = OS
@@ -486,23 +638,120 @@ func initTarget(target *Target, OS, arch string) {
 		target.CCompiler = fmt.Sprintf("cant-build-%v-on-%v", target.OS, runtime.GOOS)
 		target.CPP = target.CCompiler
 	}
-	target.CrossCFlags = append(append([]string{}, commonCFlags...), target.CrossCFlags...)
+	for _, flags := range [][]string{commonCFlags, target.osCommon.cflags} {
+		target.CFlags = append(target.CFlags, flags...)
+	}
+	if OS == TestOS {
+		if runtime.GOARCH != S390x {
+			target.LittleEndian = true
+		} else {
+			target.LittleEndian = false
+		}
+	}
+	if target.LittleEndian {
+		target.HostEndian = binary.LittleEndian
+	} else {
+		target.HostEndian = binary.BigEndian
+	}
+}
+
+func (target *Target) Timeouts(slowdown int) Timeouts {
+	if slowdown <= 0 {
+		panic(fmt.Sprintf("bad slowdown %v", slowdown))
+	}
+	timeouts := target.timeouts
+	timeouts.Slowdown = slowdown
+	timeouts.Scale = time.Duration(slowdown)
+	if timeouts.Scale > 3 {
+		timeouts.Scale = 3
+	}
+	if timeouts.Syscall == 0 {
+		timeouts.Syscall = 50 * time.Millisecond
+	}
+	if timeouts.Program == 0 {
+		timeouts.Program = 5 * time.Second
+	}
+	if timeouts.NoOutput == 0 {
+		// The timeout used to be 3 mins for a long time.
+		// But (1) we were seeing flakes on linux where net namespace
+		// destruction can be really slow, and (2) gVisor watchdog timeout
+		// is 3 mins + 1/4 of that for checking period = 3m45s.
+		// Current linux max timeout is CONFIG_DEFAULT_HUNG_TASK_TIMEOUT=140
+		// and workqueue.watchdog_thresh=140 which both actually result
+		// in 140-280s detection delay.
+		// So the current timeout is 5 mins (300s).
+		// We don't want it to be too long too because it will waste time on real hangs.
+		timeouts.NoOutput = 5 * time.Minute
+	}
+	if timeouts.VMRunningTime == 0 {
+		timeouts.VMRunningTime = time.Hour
+	}
+	timeouts.Syscall *= time.Duration(slowdown)
+	timeouts.Program *= timeouts.Scale
+	timeouts.NoOutput *= timeouts.Scale
+	timeouts.VMRunningTime *= timeouts.Scale
+	timeouts.NoOutputRunningTime = timeouts.NoOutput + time.Minute
+	return timeouts
+}
+
+func (target *Target) setCompiler(clang bool) {
+	// setCompiler may be called effectively twice for target.other,
+	// so first we remove flags the previous call may have added.
+	pos := 0
+	for _, flag := range target.CFlags {
+		if flag == "-ferror-limit=0" ||
+			strings.HasPrefix(flag, "--target=") {
+			continue
+		}
+		target.CFlags[pos] = flag
+		pos++
+	}
+	target.CFlags = target.CFlags[:pos]
+	if clang {
+		target.CCompiler = "clang"
+		target.KernelCompiler = "clang"
+		target.KernelLinker = "ld.lld"
+		if target.Triple != "" {
+			target.CFlags = append(target.CFlags, "--target="+target.Triple)
+		}
+		target.CFlags = append(target.CFlags, "-ferror-limit=0")
+	} else {
+		target.CCompiler = "gcc"
+		target.KernelCompiler = ""
+		target.KernelLinker = ""
+		if target.Triple != "" {
+			target.CCompiler = target.Triple + "-" + target.CCompiler
+		}
+	}
+}
+
+func (target *Target) replaceSourceDir(param *string, sourceDir string) {
+	if !strings.Contains(*param, sourceDirVar) {
+		return
+	}
+	if sourceDir == "" {
+		target.BrokenCompiler = "SOURCEDIR is not set"
+		return
+	}
+	*param = strings.Replace(*param, sourceDirVar, sourceDir, -1)
 }
 
 func (target *Target) lazyInit() {
-	if runtime.GOOS != target.BuildOS {
+	if runtime.GOOS != target.BuildOS || target.BrokenCompiler != "" {
 		return
 	}
-	if target.OS != runtime.GOOS || !runningOnCI {
-		// On CI we want to fail loudly if cross-compilation breaks.
+	// Only fail on CI for native build.
+	// On CI we want to fail loudly if cross-compilation breaks.
+	// Also fail if SOURCEDIR_GOOS is set b/c in that case user probably assumes it will work.
+	if (target.OS != runtime.GOOS || !runningOnCI) && os.Getenv("SOURCEDIR_"+strings.ToUpper(target.OS)) == "" {
 		if _, err := exec.LookPath(target.CCompiler); err != nil {
-			target.BrokenCrossCompiler = fmt.Sprintf("%v is missing", target.CCompiler)
+			target.BrokenCompiler = fmt.Sprintf("%v is missing (%v)", target.CCompiler, err)
 			return
 		}
 	}
 	flags := make(map[string]*bool)
 	var wg sync.WaitGroup
-	for _, flag := range target.CrossCFlags {
+	for _, flag := range target.CFlags {
 		if !optionalCFlags[flag] {
 			continue
 		}
@@ -515,10 +764,10 @@ func (target *Target) lazyInit() {
 		}(flag)
 	}
 	wg.Wait()
-	for i := 0; i < len(target.CrossCFlags); i++ {
-		if res := flags[target.CrossCFlags[i]]; res != nil && !*res {
-			copy(target.CrossCFlags[i:], target.CrossCFlags[i+1:])
-			target.CrossCFlags = target.CrossCFlags[:len(target.CrossCFlags)-1]
+	for i := 0; i < len(target.CFlags); i++ {
+		if res := flags[target.CFlags[i]]; res != nil && !*res {
+			copy(target.CFlags[i:], target.CFlags[i+1:])
+			target.CFlags = target.CFlags[:len(target.CFlags)-1]
 			i--
 		}
 	}
@@ -528,15 +777,15 @@ func (target *Target) lazyInit() {
 	//	fatal error: asm/unistd.h: No such file or directory
 	//	fatal error: asm/errno.h: No such file or directory
 	//	collect2: error: ld terminated with signal 11 [Segmentation fault]
-	if runningOnCI {
+	if runningOnCI || os.Getenv("SOURCEDIR_"+strings.ToUpper(target.OS)) != "" {
 		return // On CI all compilers are expected to work, so we don't do the following check.
 	}
 	args := []string{"-x", "c++", "-", "-o", "/dev/null"}
-	args = append(args, target.CrossCFlags...)
+	args = append(args, target.CFlags...)
 	cmd := exec.Command(target.CCompiler, args...)
 	cmd.Stdin = strings.NewReader(simpleProg)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		target.BrokenCrossCompiler = string(out)
+		target.BrokenCompiler = string(out)
 		return
 	}
 }
@@ -547,18 +796,20 @@ func checkFlagSupported(target *Target, flag string) bool {
 	return cmd.Run() == nil
 }
 
-var runningOnCI = os.Getenv("CI") != ""
+func needSyscallDefine(nr uint64) bool     { return true }
+func dontNeedSyscallDefine(nr uint64) bool { return false }
 
-// <algorithm> is included by executor, so we test is as well.
-const simpleProg = `
+var (
+	runningOnCI = os.Getenv("CI") != ""
+	useClang    = os.Getenv("SYZ_CLANG") != ""
+)
+
+const (
+	sourceDirVar = "${SOURCEDIR}"
+	simpleProg   = `
 #include <stdio.h>
-#include <algorithm>
+#include <dirent.h> // ensures that system headers are installed
+#include <algorithm> // ensures that C++ headers are installed
 int main() { printf("Hello, World!\n"); }
 `
-
-func needSyscallDefine(nr uint64) bool {
-	return true
-}
-func dontNeedSyscallDefine(nr uint64) bool {
-	return false
-}
+)

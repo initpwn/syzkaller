@@ -9,7 +9,6 @@ import (
 	"os/exec"
 	"sync"
 	"syscall"
-	"unsafe"
 
 	"github.com/google/syzkaller/pkg/osutil"
 	"golang.org/x/sys/unix"
@@ -26,25 +25,23 @@ func OpenConsole(con string) (rc io.ReadCloser, err error) {
 			syscall.Close(fd)
 		}
 	}()
-	var term unix.Termios
-	_, _, errno := syscall.Syscall(unix.SYS_IOCTL, uintptr(fd), syscallTCGETS, uintptr(unsafe.Pointer(&term)))
-	if errno != 0 {
-		return nil, fmt.Errorf("failed to get console termios: %v", errno)
+	term, err := unix.IoctlGetTermios(fd, syscallTCGETS)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get console termios: %v", err)
 	}
-	// no parity bit, only need 1 stop bit, no hardware flowcontrol
+	// No parity bit, only need 1 stop bit, no hardware flowcontrol,
 	term.Cflag &^= unixCBAUD | unix.CSIZE | unix.PARENB | unix.CSTOPB | unixCRTSCTS
-	// ignore modem controls
+	// Ignore modem controls.
 	term.Cflag |= unix.B115200 | unix.CS8 | unix.CLOCAL | unix.CREAD
-	// setup for non-canonical mode
+	// Setup for non-canonical mode.
 	term.Iflag &^= unix.IGNBRK | unix.BRKINT | unix.PARMRK | unix.ISTRIP | unix.INLCR |
 		unix.IGNCR | unix.ICRNL | unix.IXON
 	term.Lflag &^= unix.ECHO | unix.ECHONL | unix.ICANON | unix.ISIG | unix.IEXTEN
 	term.Oflag &^= unix.OPOST
 	term.Cc[unix.VMIN] = 0
 	term.Cc[unix.VTIME] = 10 // 1 second timeout
-	_, _, errno = syscall.Syscall(unix.SYS_IOCTL, uintptr(fd), syscallTCSETS, uintptr(unsafe.Pointer(&term)))
-	if errno != 0 {
-		return nil, fmt.Errorf("failed to get console termios: %v", errno)
+	if err = unix.IoctlSetTermios(fd, syscallTCSETS, term); err != nil {
+		return nil, fmt.Errorf("failed to get console termios: %v", err)
 	}
 	tmp := fd
 	fd = -1
@@ -79,7 +76,7 @@ func (t *tty) Close() error {
 	return nil
 }
 
-// Open dmesg remotely
+// Open dmesg remotely.
 func OpenRemoteConsole(bin string, args ...string) (rc io.ReadCloser, err error) {
 	rpipe, wpipe, err := osutil.LongPipe()
 	if err != nil {

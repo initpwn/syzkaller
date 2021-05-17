@@ -14,7 +14,7 @@ import (
 
 type openbsd struct{}
 
-func (*openbsd) prepare(sourcedir string, build bool, arches []string) error {
+func (*openbsd) prepare(sourcedir string, build bool, arches []*Arch) error {
 	if sourcedir == "" {
 		return fmt.Errorf("provide path to kernel checkout via -sourcedir flag (or make extract SOURCEDIR)")
 	}
@@ -82,7 +82,8 @@ func (*openbsd) processFile(arch *Arch, info *compiler.ConstInfo) (map[string]ui
 		}
 	}
 	params := &extractParams{
-		AddSource: "#include <sys/syscall.h>",
+		AddSource:    "#include <sys/syscall.h>",
+		TargetEndian: arch.target.HostEndian,
 	}
 	res, undeclared, err := extract(info, "cc", args, params)
 	for orig, compats := range compatNames {

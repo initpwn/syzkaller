@@ -7,7 +7,6 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
-	"io"
 	"net/mail"
 	"os"
 	"os/exec"
@@ -16,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/syzkaller/pkg/debugtracer"
 	"github.com/google/syzkaller/pkg/hash"
 	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/pkg/osutil"
@@ -24,13 +24,25 @@ import (
 type git struct {
 	dir      string
 	ignoreCC map[string]bool
+	precious bool
+	sandbox  bool
 }
 
-func newGit(dir string, ignoreCC map[string]bool) *git {
-	return &git{
+func newGit(dir string, ignoreCC map[string]bool, opts []RepoOpt) *git {
+	git := &git{
 		dir:      dir,
 		ignoreCC: ignoreCC,
+		sandbox:  true,
 	}
+	for _, opt := range opts {
+		switch opt {
+		case OptPrecious:
+			git.precious = true
+		case OptDontSandbox:
+			git.sandbox = false
+		}
+	}
+	return git
 }
 
 func filterEnv() []string {
@@ -71,7 +83,7 @@ func (git *git) Poll(repo, branch string) (*Commit, error) {
 			return nil, err
 		}
 	}
-	if _, err := git.git("fetch"); err != nil {
+	if _, err := git.git("fetch", "--force"); err != nil {
 		// Something else is wrong, re-clone.
 		if err := git.clone(repo, branch); err != nil {
 			return nil, err
@@ -84,13 +96,13 @@ func (git *git) Poll(repo, branch string) (*Commit, error) {
 }
 
 func (git *git) CheckoutBranch(repo, branch string) (*Commit, error) {
-	git.reset()
-	if _, err := git.git("reset", "--hard"); err != nil {
-		if err := git.initRepo(err); err != nil {
-			return nil, err
-		}
+	if err := git.repair(); err != nil {
+		return nil, err
 	}
-	_, err := git.git("fetch", repo, branch)
+	repoHash := hash.String([]byte(repo))
+	// Ignore error as we can double add the same remote and that will fail.
+	git.git("remote", "add", repoHash, repo)
+	_, err := git.git("fetch", "--force", repoHash, branch)
 	if err != nil {
 		return nil, err
 	}
@@ -101,11 +113,8 @@ func (git *git) CheckoutBranch(repo, branch string) (*Commit, error) {
 }
 
 func (git *git) CheckoutCommit(repo, commit string) (*Commit, error) {
-	git.reset()
-	if _, err := git.git("reset", "--hard"); err != nil {
-		if err := git.initRepo(err); err != nil {
-			return nil, err
-		}
+	if err := git.repair(); err != nil {
+		return nil, err
 	}
 	if err := git.fetchRemote(repo); err != nil {
 		return nil, err
@@ -117,12 +126,15 @@ func (git *git) fetchRemote(repo string) error {
 	repoHash := hash.String([]byte(repo))
 	// Ignore error as we can double add the same remote and that will fail.
 	git.git("remote", "add", repoHash, repo)
-	_, err := git.git("fetch", "--tags", repoHash)
+	_, err := git.git("fetch", "--force", "--tags", repoHash)
 	return err
 }
 
 func (git *git) SwitchCommit(commit string) (*Commit, error) {
-	git.git("reset", "--hard")
+	if !git.precious {
+		git.git("reset", "--hard")
+		git.git("clean", "-fdx")
+	}
 	if _, err := git.git("checkout", commit); err != nil {
 		return nil, err
 	}
@@ -130,6 +142,9 @@ func (git *git) SwitchCommit(commit string) (*Commit, error) {
 }
 
 func (git *git) clone(repo, branch string) error {
+	if git.precious {
+		return fmt.Errorf("won't reinit precious repo")
+	}
 	if err := git.initRepo(nil); err != nil {
 		return err
 	}
@@ -142,11 +157,23 @@ func (git *git) clone(repo, branch string) error {
 	return nil
 }
 
-func (git *git) reset() {
+func (git *git) reset() error {
 	// This function tries to reset git repo state to a known clean state.
+	if git.precious {
+		return nil
+	}
 	git.git("reset", "--hard")
+	git.git("clean", "-fdx")
 	git.git("bisect", "reset")
-	git.git("reset", "--hard")
+	_, err := git.git("reset", "--hard")
+	return err
+}
+
+func (git *git) repair() error {
+	if err := git.reset(); err != nil {
+		return git.initRepo(err)
+	}
+	return nil
 }
 
 func (git *git) initRepo(reason error) error {
@@ -159,8 +186,10 @@ func (git *git) initRepo(reason error) error {
 	if err := osutil.MkdirAll(git.dir); err != nil {
 		return fmt.Errorf("failed to create repo dir: %v", err)
 	}
-	if err := osutil.SandboxChown(git.dir); err != nil {
-		return err
+	if git.sandbox {
+		if err := osutil.SandboxChown(git.dir); err != nil {
+			return err
+		}
 	}
 	if _, err := git.git("init"); err != nil {
 		return err
@@ -168,30 +197,26 @@ func (git *git) initRepo(reason error) error {
 	return nil
 }
 
+func (git *git) Contains(commit string) (bool, error) {
+	_, err := git.git("merge-base", "--is-ancestor", commit, "HEAD")
+	return err == nil, nil
+}
+
 func (git *git) HeadCommit() (*Commit, error) {
 	return git.getCommit("HEAD")
 }
 
 func (git *git) getCommit(commit string) (*Commit, error) {
-	output, err := git.git("log", "--format=%H%n%s%n%ae%n%an%n%ad%n%P%n%b", "-n", "1", commit)
+	output, err := git.git("log", "--format=%H%n%s%n%ae%n%an%n%ad%n%P%n%cd%n%b", "-n", "1", commit)
 	if err != nil {
 		return nil, err
 	}
 	return gitParseCommit(output, nil, nil, git.ignoreCC)
 }
 
-func isEmpty(lines [][]byte) bool {
-	for _, line := range lines {
-		if len(line) > 0 {
-			return false
-		}
-	}
-	return true
-}
-
 func gitParseCommit(output, user, domain []byte, ignoreCC map[string]bool) (*Commit, error) {
 	lines := bytes.Split(output, []byte{'\n'})
-	if len(lines) < 4 || len(lines[0]) != 40 {
+	if len(lines) < 8 || len(lines[0]) != 40 {
 		return nil, fmt.Errorf("unexpected git log output: %q", output)
 	}
 	const dateFormat = "Mon Jan 2 15:04:05 2006 -0700"
@@ -199,15 +224,15 @@ func gitParseCommit(output, user, domain []byte, ignoreCC map[string]bool) (*Com
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse date in git log output: %v\n%q", err, output)
 	}
-	cc := make(map[string]bool)
-	cc[strings.ToLower(string(lines[2]))] = true
-	var tags []string
-	bodyLines := lines[6:]
-	if isEmpty(bodyLines) {
-		// Body is empty, use summary instead.
-		bodyLines = [][]byte{lines[1]}
+	commitDate, err := time.Parse(dateFormat, string(lines[6]))
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse date in git log output: %v\n%q", err, output)
 	}
-	for _, line := range bodyLines {
+	recipients := make(map[string]bool)
+	recipients[strings.ToLower(string(lines[2]))] = true
+	var tags []string
+	// Use summary line + all description lines.
+	for _, line := range append([][]byte{lines[1]}, lines[7:]...) {
 		if user != nil {
 			userPos := bytes.Index(line, user)
 			if userPos != -1 {
@@ -242,15 +267,15 @@ func gitParseCommit(output, user, domain []byte, ignoreCC map[string]bool) (*Com
 			if ignoreCC[email] {
 				continue
 			}
-			cc[email] = true
+			recipients[email] = true
 			break
 		}
 	}
-	sortedCC := make([]string, 0, len(cc))
-	for addr := range cc {
-		sortedCC = append(sortedCC, addr)
+	sortedRecipients := make(Recipients, 0, len(recipients))
+	for addr := range recipients {
+		sortedRecipients = append(sortedRecipients, RecipientInfo{mail.Address{Address: addr}, To})
 	}
-	sort.Strings(sortedCC)
+	sort.Sort(sortedRecipients)
 	parents := strings.Split(string(lines[5]), " ")
 	com := &Commit{
 		Hash:       string(lines[0]),
@@ -258,9 +283,10 @@ func gitParseCommit(output, user, domain []byte, ignoreCC map[string]bool) (*Com
 		Author:     string(lines[2]),
 		AuthorName: string(lines[3]),
 		Parents:    parents,
-		CC:         sortedCC,
+		Recipients: sortedRecipients,
 		Tags:       tags,
 		Date:       date,
+		CommitDate: commitDate,
 	}
 	return com, nil
 }
@@ -325,7 +351,7 @@ func (git *git) ExtractFixTagsFromCommits(baseCommit, email string) ([]*Commit, 
 
 func (git *git) fetchCommits(since, base, user, domain string, greps []string, fixedStrings bool) ([]*Commit, error) {
 	const commitSeparator = "---===syzkaller-commit-separator===---"
-	args := []string{"log", "--since", since, "--format=%H%n%s%n%ae%n%an%n%ad%n%P%n%b%n" + commitSeparator}
+	args := []string{"log", "--since", since, "--format=%H%n%s%n%ae%n%an%n%ad%n%P%n%cd%n%b%n" + commitSeparator}
 	if fixedStrings {
 		args = append(args, "--fixed-strings")
 	}
@@ -336,8 +362,10 @@ func (git *git) fetchCommits(since, base, user, domain string, greps []string, f
 	cmd := exec.Command("git", args...)
 	cmd.Dir = git.dir
 	cmd.Env = filterEnv()
-	if err := osutil.Sandbox(cmd, true, false); err != nil {
-		return nil, err
+	if git.sandbox {
+		if err := osutil.Sandbox(cmd, true, false); err != nil {
+			return nil, err
+		}
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -380,7 +408,15 @@ func (git *git) fetchCommits(since, base, user, domain string, greps []string, f
 }
 
 func (git *git) git(args ...string) ([]byte, error) {
-	return runSandboxedEnv(git.dir, "git", filterEnv(), args...)
+	cmd := osutil.Command("git", args...)
+	cmd.Dir = git.dir
+	cmd.Env = filterEnv()
+	if git.sandbox {
+		if err := osutil.Sandbox(cmd, true, false); err != nil {
+			return nil, err
+		}
+	}
+	return osutil.Run(time.Hour, cmd)
 }
 
 func splitEmail(email string) (user, domain string, err error) {
@@ -400,7 +436,8 @@ func splitEmail(email string) (user, domain string, err error) {
 	return
 }
 
-func (git *git) Bisect(bad, good string, trace io.Writer, pred func() (BisectResult, error)) ([]*Commit, error) {
+func (git *git) Bisect(bad, good string, dt debugtracer.DebugTracer, pred func() (BisectResult,
+	error)) ([]*Commit, error) {
 	git.reset()
 	firstBad, err := git.getCommit(bad)
 	if err != nil {
@@ -411,7 +448,7 @@ func (git *git) Bisect(bad, good string, trace io.Writer, pred func() (BisectRes
 		return nil, err
 	}
 	defer git.reset()
-	fmt.Fprintf(trace, "# git bisect start %v %v\n%s", bad, good, output)
+	dt.Log("# git bisect start %v %v\n%s", bad, good, output)
 	current, err := git.HeadCommit()
 	if err != nil {
 		return nil, err
@@ -432,7 +469,7 @@ func (git *git) Bisect(bad, good string, trace io.Writer, pred func() (BisectRes
 			firstBad = current
 		}
 		output, err = git.git("bisect", bisectTerms[res])
-		fmt.Fprintf(trace, "# git bisect %v %v\n%s", bisectTerms[res], current.Hash, output)
+		dt.Log("# git bisect %v %v\n%s", bisectTerms[res], current.Hash, output)
 		if err != nil {
 			if bytes.Contains(output, []byte("There are only 'skip'ped commits left to test")) {
 				return git.bisectInconclusive(output)
@@ -474,36 +511,47 @@ func (git *git) bisectInconclusive(output []byte) ([]*Commit, error) {
 	return commits, nil
 }
 
-func (git *git) previousReleaseTags(commit string, self bool) ([]string, error) {
+func (git *git) ReleaseTag(commit string) (string, error) {
+	tags, err := git.previousReleaseTags(commit, true, true, true)
+	if err != nil {
+		return "", err
+	}
+	if len(tags) == 0 {
+		return "", fmt.Errorf("no release tags found for commit %v", commit)
+	}
+	return tags[0], nil
+}
+
+func (git *git) previousReleaseTags(commit string, self, onlyTop, includeRC bool) ([]string, error) {
 	var tags []string
 	if self {
 		output, err := git.git("tag", "--list", "--points-at", commit, "--merged", commit, "v*.*")
 		if err != nil {
 			return nil, err
 		}
-		tags, err = gitParseReleaseTags(output)
-		if err != nil {
-			return nil, err
+		tags = gitParseReleaseTags(output, includeRC)
+		if onlyTop && len(tags) != 0 {
+			return tags, nil
 		}
 	}
 	output, err := git.git("tag", "--no-contains", commit, "--merged", commit, "v*.*")
 	if err != nil {
 		return nil, err
 	}
-	tags1, err := gitParseReleaseTags(output)
-	if err != nil {
-		return nil, err
-	}
+	tags1 := gitParseReleaseTags(output, includeRC)
 	tags = append(tags, tags1...)
+	if len(tags) == 0 {
+		return nil, fmt.Errorf("no release tags found for commit %v", commit)
+	}
 	return tags, nil
 }
 
 func (git *git) IsRelease(commit string) (bool, error) {
-	tags1, err := git.previousReleaseTags(commit, true)
+	tags1, err := git.previousReleaseTags(commit, true, false, false)
 	if err != nil {
 		return false, err
 	}
-	tags2, err := git.previousReleaseTags(commit, false)
+	tags2, err := git.previousReleaseTags(commit, false, false, false)
 	if err != nil {
 		return false, err
 	}

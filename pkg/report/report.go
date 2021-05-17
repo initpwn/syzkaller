@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/google/syzkaller/pkg/mgrconfig"
+	"github.com/google/syzkaller/pkg/vcs"
 	"github.com/google/syzkaller/sys/targets"
 )
 
@@ -31,6 +32,9 @@ type Reporter interface {
 type Report struct {
 	// Title contains a representative description of the first oops.
 	Title string
+	// Alternative titles, used for better deduplication.
+	// If two crashes have a non-empty intersection of Title/AltTitles, they are considered the same bug.
+	AltTitles []string
 	// Bug type (e.g. hang, memory leak, etc).
 	Type Type
 	// The indicative function name.
@@ -42,14 +46,16 @@ type Report struct {
 	// StartPos/EndPos denote region of output with oops message(s).
 	StartPos int
 	EndPos   int
+	// SkipPos is position in output where parsing for the next report should start.
+	SkipPos int
 	// Suppressed indicates whether the report should not be reported to user.
 	Suppressed bool
 	// Corrupted indicates whether the report is truncated of corrupted in some other way.
 	Corrupted bool
 	// CorruptedReason contains reason why the report is marked as corrupted.
 	CorruptedReason string
-	// Maintainers is list of maintainer emails (filled in by Symbolize).
-	Maintainers []string
+	// Recipients is a list of RecipientInfo with Email, Display Name, and type.
+	Recipients vcs.Recipients
 	// guiltyFile is the source file that we think is to blame for the crash  (filled in by Symbolize).
 	guiltyFile string
 	// reportPrefixLen is length of additional prefix lines that we added before actual crash report.
@@ -97,12 +103,8 @@ func NewReporter(cfg *mgrconfig.Config) (Reporter, error) {
 	if err != nil {
 		return nil, err
 	}
-	target := targets.Get(cfg.TargetOS, cfg.TargetArch)
-	if target == nil && typ != "gvisor" {
-		return nil, fmt.Errorf("unknown target %v/%v", cfg.TargetOS, cfg.TargetArch)
-	}
 	config := &config{
-		target:         target,
+		target:         cfg.SysTarget,
 		kernelSrc:      cfg.KernelSrc,
 		kernelBuildSrc: cfg.KernelBuildSrc,
 		kernelObj:      cfg.KernelObj,
@@ -120,8 +122,6 @@ func NewReporter(cfg *mgrconfig.Config) (Reporter, error) {
 }
 
 const (
-	VMDiagnosisStart = "\nVM DIAGNOSIS:\n"
-
 	unexpectedKernelReboot = "unexpected kernel reboot"
 	memoryLeakPrefix       = "memory leak in "
 	dataRacePrefix         = "KCSAN: data-race"
@@ -129,14 +129,14 @@ const (
 )
 
 var ctors = map[string]fn{
-	"akaros":  ctorAkaros,
-	"linux":   ctorLinux,
-	"gvisor":  ctorGvisor,
-	"freebsd": ctorFreebsd,
-	"netbsd":  ctorNetbsd,
-	"openbsd": ctorOpenbsd,
-	"fuchsia": ctorFuchsia,
-	"windows": ctorStub,
+	targets.Akaros:  ctorAkaros,
+	targets.Linux:   ctorLinux,
+	"gvisor":        ctorGvisor,
+	targets.FreeBSD: ctorFreebsd,
+	targets.NetBSD:  ctorNetbsd,
+	targets.OpenBSD: ctorOpenbsd,
+	targets.Fuchsia: ctorFuchsia,
+	targets.Windows: ctorStub,
 }
 
 type config struct {
@@ -173,6 +173,9 @@ func (wrap *reporterWrapper) Parse(output []byte) *Report {
 		return nil
 	}
 	rep.Title = sanitizeTitle(replaceTable(dynamicTitleReplacement, rep.Title))
+	for i, title := range rep.AltTitles {
+		rep.AltTitles[i] = sanitizeTitle(replaceTable(dynamicTitleReplacement, title))
+	}
 	rep.Suppressed = matchesAny(rep.Output, wrap.suppressions)
 	if bytes.Contains(rep.Output, gceConsoleHangup) {
 		rep.Corrupted = true
@@ -181,8 +184,14 @@ func (wrap *reporterWrapper) Parse(output []byte) *Report {
 	if match := reportFrameRe.FindStringSubmatch(rep.Title); match != nil {
 		rep.Frame = match[1]
 	}
-	if pos := bytes.Index(rep.Report, []byte(VMDiagnosisStart)); pos != -1 {
-		rep.Report = rep.Report[:pos]
+	rep.SkipPos = len(output)
+	if pos := bytes.IndexByte(output[rep.StartPos:], '\n'); pos != -1 {
+		rep.SkipPos = rep.StartPos + pos
+	}
+	if rep.EndPos < rep.SkipPos {
+		// This generally should not happen.
+		// But openbsd does some hacks with /r/n which may lead to off-by-one EndPos.
+		rep.EndPos = rep.SkipPos
 	}
 	return rep
 }
@@ -202,7 +211,8 @@ func extractReportType(rep *Report) Type {
 	}
 	if strings.HasPrefix(rep.Title, "INFO: rcu detected stall") ||
 		strings.HasPrefix(rep.Title, "INFO: task hung") ||
-		strings.HasPrefix(rep.Title, "BUG: soft lockup") {
+		strings.HasPrefix(rep.Title, "BUG: soft lockup") ||
+		strings.HasPrefix(rep.Title, "INFO: task can't die") {
 		return Hang
 	}
 	return Unknown
@@ -211,6 +221,18 @@ func extractReportType(rep *Report) Type {
 func IsSuppressed(reporter Reporter, output []byte) bool {
 	return matchesAny(output, reporter.(*reporterWrapper).suppressions) ||
 		bytes.Contains(output, gceConsoleHangup)
+}
+
+// ParseAll returns all successive reports in output.
+func ParseAll(reporter Reporter, output []byte) (reports []*Report) {
+	for {
+		rep := reporter.Parse(output)
+		if rep == nil {
+			return
+		}
+		reports = append(reports, rep)
+		output = output[rep.SkipPos:]
+	}
 }
 
 // GCE console connection sometimes fails with this message.
@@ -240,20 +262,25 @@ var dynamicTitleReplacement = []replacement{
 		"syz-executor",
 	},
 	{
-		// syzkaller binaries are coming from repro.
+		// Executor process IDs are dynamic and are not interesting.
 		regexp.MustCompile(`syzkaller[0-9]+((/|:)[0-9]+)?`),
 		"syzkaller",
 	},
 	{
 		// Replace that everything looks like an address with "ADDR",
 		// addresses in descriptions can't be good regardless of the oops regexps.
-		regexp.MustCompile(`([^a-zA-Z])(?:0x)?[0-9a-f]{6,}`),
+		regexp.MustCompile(`([^a-zA-Z0])(?:0x)?[0-9a-f]{6,}`),
 		"${1}ADDR",
 	},
 	{
 		// Replace that everything looks like a decimal number with "NUM".
-		regexp.MustCompile(`([^a-zA-Z])[0-9]{5,}`),
+		regexp.MustCompile(`([^a-zA-Z0-9])[0-9]{5,}`),
 		"${1}NUM",
+	},
+	{
+		// Replace IP addresses.
+		regexp.MustCompile(`([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})`),
+		"IP",
 	},
 	{
 		// Replace that everything looks like a file line number with "LINE".
@@ -308,6 +335,9 @@ type oopsFormat struct {
 	// Strings captured by title (or by report if present) are passed as input.
 	// If stack is not nil, extracted function name is passed as an additional last argument.
 	fmt string
+	// Alternative titles used for better crash deduplication.
+	// Format is the same as for fmt.
+	alt []string
 	// If not nil, a function name is extracted from the report and passed to fmt.
 	// If not nil but frame extraction fails, the report is considered corrupted.
 	stack        *stackFmt
@@ -333,7 +363,7 @@ type stackFmt struct {
 	extractor frameExtractor
 }
 
-type frameExtractor func(frames []string) (frame string, corrupted string)
+type frameExtractor func(frames []string) (frame, corrupted string)
 
 var parseStackTrace *regexp.Regexp
 
@@ -378,7 +408,7 @@ func matchOops(line []byte, oops *oops, ignores []*regexp.Regexp) bool {
 }
 
 func extractDescription(output []byte, oops *oops, params *stackParams) (
-	desc string, corrupted string, format oopsFormat) {
+	desc, corrupted string, altTitles []string, format oopsFormat) {
 	startPos := len(output)
 	matchedTitle := false
 	for _, f := range oops.formats {
@@ -418,6 +448,9 @@ func extractDescription(output []byte, oops *oops, params *stackParams) (
 			args = append(args, frame)
 		}
 		desc = fmt.Sprintf(f.fmt, args...)
+		for _, alt := range f.alt {
+			altTitles = append(altTitles, fmt.Sprintf(alt, args...))
+		}
 		format = f
 	}
 	if desc == "" {
@@ -455,6 +488,9 @@ type stackParams struct {
 	// If we looked at any lines that match corruptedLines during report analysis,
 	// then the report is marked as corrupted.
 	corruptedLines []*regexp.Regexp
+	// Prefixes that need to be removed from frames.
+	// E.g. syscall prefixes as different arches have different prefixes.
+	stripFramePrefixes []string
 }
 
 func extractStackFrame(params *stackParams, stack *stackFmt, output []byte) (string, string) {
@@ -485,7 +521,7 @@ nextPart:
 	for _, part := range parts {
 		if part == parseStackTrace {
 			for s.Scan() {
-				ln := bytes.Trim(s.Bytes(), "\r")
+				ln := s.Bytes()
 				if matchesAny(ln, params.corruptedLines) {
 					break nextPart
 				}
@@ -499,11 +535,11 @@ nextPart:
 						break
 					}
 				}
-				frames = appendStackFrame(frames, match, skipRe)
+				frames = appendStackFrame(frames, match, params, skipRe)
 			}
 		} else {
 			for s.Scan() {
-				ln := bytes.Trim(s.Bytes(), "\r")
+				ln := s.Bytes()
 				if matchesAny(ln, params.corruptedLines) {
 					break nextPart
 				}
@@ -511,7 +547,7 @@ nextPart:
 				if match == nil {
 					continue
 				}
-				frames = appendStackFrame(frames, match, skipRe)
+				frames = appendStackFrame(frames, match, params, skipRe)
 				break
 			}
 		}
@@ -522,13 +558,17 @@ nextPart:
 	return extractor(frames)
 }
 
-func appendStackFrame(frames []string, match [][]byte, skipRe *regexp.Regexp) []string {
+func appendStackFrame(frames []string, match [][]byte, params *stackParams, skipRe *regexp.Regexp) []string {
 	if len(match) < 2 {
 		return frames
 	}
 	for _, frame := range match[1:] {
 		if frame != nil && (skipRe == nil || !skipRe.Match(frame)) {
-			frames = append(frames, string(frame))
+			frameName := string(frame)
+			for _, prefix := range params.stripFramePrefixes {
+				frameName = strings.TrimPrefix(frameName, prefix)
+			}
+			frames = append(frames, frameName)
 			break
 		}
 	}
@@ -564,8 +604,9 @@ func simpleLineParser(output []byte, oopses []*oops, params *stackParams, ignore
 	if oops == nil {
 		return nil
 	}
-	title, corrupted, _ := extractDescription(output[rep.StartPos:], oops, params)
+	title, corrupted, altTitles, _ := extractDescription(output[rep.StartPos:], oops, params)
 	rep.Title = title
+	rep.AltTitles = altTitles
 	rep.Report = output[rep.StartPos:]
 	rep.Corrupted = corrupted != ""
 	rep.CorruptedReason = corrupted
@@ -596,7 +637,7 @@ func replace(where []byte, start, end int, what []byte) []byte {
 }
 
 var (
-	filenameRe    = regexp.MustCompile(`[a-zA-Z0-9_\-\./]*[a-zA-Z0-9_\-]+\.(c|h):[0-9]+`)
+	filenameRe    = regexp.MustCompile(`([a-zA-Z0-9_\-\./]*[a-zA-Z0-9_\-]+\.(c|h)):[0-9]+`)
 	reportFrameRe = regexp.MustCompile(`.* in ([a-zA-Z0-9_]+)`)
 )
 
@@ -604,8 +645,26 @@ var (
 // But also catches crashes in Go programs in gvisor/fuchsia.
 var commonOopses = []*oops{
 	{
+		// Errors produced by executor's fail function.
+		[]byte("SYZFAIL:"),
+		[]oopsFormat{
+			{
+				title:        compile("SYZFAIL:(.*)"),
+				fmt:          "SYZFAIL:%[1]v",
+				noStackTrace: true,
+			},
+		},
+		[]*regexp.Regexp{},
+	},
+	{
 		[]byte("panic:"),
 		[]oopsFormat{
+			{
+				// This is gvisor-specific, but we need to handle it here since we handle "panic:" here.
+				title:        compile("panic: Sentry detected .* stuck task"),
+				fmt:          "panic: Sentry detected stuck tasks",
+				noStackTrace: true,
+			},
 			{
 				title:        compile("panic:(.*)"),
 				fmt:          "panic:%[1]v",
@@ -615,6 +674,10 @@ var commonOopses = []*oops{
 		[]*regexp.Regexp{
 			// This can match some kernel functions (skb_panic, skb_over_panic).
 			compile("_panic:"),
+			// Android prints this sometimes during boot.
+			compile("xlog_status:"),
+			compile(`ddb\.onpanic:`),
+			compile(`evtlog_status:`),
 		},
 	},
 }

@@ -13,7 +13,6 @@ import (
 	"strings"
 
 	"github.com/google/syzkaller/pkg/ifuzz"
-	_ "github.com/google/syzkaller/pkg/ifuzz/generated" // pull in generated instruction descriptions
 )
 
 const (
@@ -26,9 +25,9 @@ const (
 
 type randGen struct {
 	*rand.Rand
-	target           *Target
-	inCreateResource bool
-	recDepth         map[string]int
+	target             *Target
+	inGenerateResource bool
+	recDepth           map[string]int
 }
 
 func newRand(target *Target, rs rand.Source) *randGen {
@@ -175,7 +174,7 @@ func (r *randGen) randPageCount() (n uint64) {
 	case r.nOutOf(5, 6):
 		n = r.rand(20) + 1
 	default:
-		n = (r.rand(3) + 1) * 512
+		n = (r.rand(3) + 1) * r.target.NumPages / 4
 	}
 	return
 }
@@ -231,7 +230,9 @@ func (r *randGen) flags(vv []uint64, bitmask bool, oldVal uint64) uint64 {
 	}
 	// We don't want to return 0 here, because we already given 0
 	// fixed probability above (otherwise we get 0 too frequently).
-	for v == 0 || r.nOutOf(2, 3) {
+	// Note: this loop can hang if all values are equal to 0. We don't generate such flags in the compiler now,
+	// but it used to hang occasionally, so we keep the try < 10 logic b/c we don't have a local check for values.
+	for try := 0; try < 10 && (v == 0 || r.nOutOf(2, 3)); try++ {
 		flag := vv[r.rand(len(vv))]
 		if r.oneOf(20) {
 			// Try choosing adjacent bit values in case we forgot
@@ -249,7 +250,7 @@ func (r *randGen) flags(vv []uint64, bitmask bool, oldVal uint64) uint64 {
 
 func (r *randGen) filename(s *state, typ *BufferType) string {
 	fn := r.filenameImpl(s)
-	if len(fn) != 0 && fn[len(fn)-1] == 0 {
+	if fn != "" && fn[len(fn)-1] == 0 {
 		panic(fmt.Sprintf("zero-terminated filename: %q", fn))
 	}
 	if escapingFilename(fn) {
@@ -284,7 +285,7 @@ func (r *randGen) filenameImpl(s *state) string {
 		dir := "."
 		if r.oneOf(2) && len(s.files) != 0 {
 			dir = r.randFromMap(s.files)
-			if len(dir) > 0 && dir[len(dir)-1] == 0 {
+			if dir != "" && dir[len(dir)-1] == 0 {
 				dir = dir[:len(dir)-1]
 			}
 			if r.oneOf(10) && filepath.Clean(dir)[0] != '.' {
@@ -323,15 +324,9 @@ func (r *randGen) randString(s *state, t *BufferType) []byte {
 		'/', ':', '.', ',', '-', '\'', '[', ']', '{', '}'}
 	buf := new(bytes.Buffer)
 	for r.nOutOf(3, 4) {
-		switch {
-		case r.nOutOf(10, 21):
-			dict := r.target.StringDictionary
-			if len(dict) != 0 {
-				buf.WriteString(dict[r.Intn(len(dict))])
-			}
-		case r.nOutOf(10, 11):
+		if r.nOutOf(10, 11) {
 			buf.Write([]byte{punct[r.Intn(len(punct))]})
-		default:
+		} else {
 			buf.Write([]byte{byte(r.Intn(256))})
 		}
 	}
@@ -342,7 +337,7 @@ func (r *randGen) randString(s *state, t *BufferType) []byte {
 }
 
 func (r *randGen) allocAddr(s *state, typ Type, dir Dir, size uint64, data Arg) *PointerArg {
-	return MakePointerArg(typ, dir, s.ma.alloc(r, size), data)
+	return MakePointerArg(typ, dir, s.ma.alloc(r, size, data.Type().Alignment()), data)
 }
 
 func (r *randGen) allocVMA(s *state, typ Type, dir Dir, numPages uint64) *PointerArg {
@@ -351,12 +346,6 @@ func (r *randGen) allocVMA(s *state, typ Type, dir Dir, numPages uint64) *Pointe
 }
 
 func (r *randGen) createResource(s *state, res *ResourceType, dir Dir) (arg Arg, calls []*Call) {
-	if r.inCreateResource {
-		return nil, nil
-	}
-	r.inCreateResource = true
-	defer func() { r.inCreateResource = false }()
-
 	kind := res.Desc.Name
 	// We may have no resources, but still be in createResource due to ANYRES.
 	if len(r.target.resourceMap) != 0 && r.oneOf(1000) {
@@ -401,6 +390,9 @@ func (r *randGen) createResource(s *state, res *ResourceType, dir Dir) (arg Arg,
 				allres = append(allres, res1...)
 			}
 		}
+		sort.SliceStable(allres, func(i, j int) bool {
+			return allres[i].Type().Name() < allres[j].Type().Name()
+		})
 		if len(allres) != 0 {
 			// Bingo!
 			arg := MakeResultArg(res, dir, allres[r.Intn(len(allres))], 0)
@@ -432,8 +424,7 @@ func (r *randGen) createResource(s *state, res *ResourceType, dir Dir) (arg Arg,
 func (r *randGen) generateText(kind TextKind) []byte {
 	switch kind {
 	case TextTarget:
-		if r.target.Arch == "amd64" || r.target.Arch == "386" {
-			cfg := createTargetIfuzzConfig(r.target)
+		if cfg := createTargetIfuzzConfig(r.target); cfg != nil {
 			return ifuzz.Generate(cfg, r.Rand)
 		}
 		fallthrough
@@ -453,8 +444,7 @@ func (r *randGen) generateText(kind TextKind) []byte {
 func (r *randGen) mutateText(kind TextKind, text []byte) []byte {
 	switch kind {
 	case TextTarget:
-		if r.target.Arch == "amd64" || r.target.Arch == "386" {
-			cfg := createTargetIfuzzConfig(r.target)
+		if cfg := createTargetIfuzzConfig(r.target); cfg != nil {
 			return ifuzz.Mutate(cfg, r.Rand, text)
 		}
 		fallthrough
@@ -483,13 +473,17 @@ func createTargetIfuzzConfig(target *Target) *ifuzz.Config {
 	switch target.Arch {
 	case "amd64":
 		cfg.Mode = ifuzz.ModeLong64
+		cfg.Arch = ifuzz.ArchX86
 	case "386":
 		cfg.Mode = ifuzz.ModeProt32
+		cfg.Arch = ifuzz.ArchX86
+	case "ppc64":
+		cfg.Mode = ifuzz.ModeLong64
+		cfg.Arch = ifuzz.ArchPowerPC
 	default:
-		panic("unknown text kind")
+		return nil
 	}
 	return cfg
-
 }
 
 func createIfuzzConfig(kind TextKind) *ifuzz.Config {
@@ -514,12 +508,19 @@ func createIfuzzConfig(kind TextKind) *ifuzz.Config {
 	switch kind {
 	case TextX86Real:
 		cfg.Mode = ifuzz.ModeReal16
+		cfg.Arch = ifuzz.ArchX86
 	case TextX86bit16:
 		cfg.Mode = ifuzz.ModeProt16
+		cfg.Arch = ifuzz.ArchX86
 	case TextX86bit32:
 		cfg.Mode = ifuzz.ModeProt32
+		cfg.Arch = ifuzz.ArchX86
 	case TextX86bit64:
 		cfg.Mode = ifuzz.ModeLong64
+		cfg.Arch = ifuzz.ArchX86
+	case TextPpc64:
+		cfg.Mode = ifuzz.ModeLong64
+		cfg.Arch = ifuzz.ArchPowerPC
 	default:
 		panic("unknown text kind")
 	}
@@ -599,7 +600,7 @@ func (r *randGen) generateArgs(s *state, fields []Field, dir Dir) ([]Arg, []*Cal
 
 	// Generate all args. Size args have the default value 0 for now.
 	for i, field := range fields {
-		arg, calls1 := r.generateArg(s, field.Type, dir)
+		arg, calls1 := r.generateArg(s, field.Type, field.Dir(dir))
 		if arg == nil {
 			panic(fmt.Sprintf("generated arg is nil for field '%v', fields: %+v", field.Type.Name(), fields))
 		}
@@ -665,20 +666,28 @@ func (r *randGen) generateArgImpl(s *state, typ Type, dir Dir, ignoreSpecial boo
 }
 
 func (a *ResourceType) generate(r *randGen, s *state, dir Dir) (arg Arg, calls []*Call) {
-	if r.oneOf(3) {
+	if !r.inGenerateResource {
+		// Don't allow recursion for resourceCentric/createResource.
+		// That can lead to generation of huge programs and may be very slow
+		// (esp. if we are generating some failing attempts in createResource already).
+		r.inGenerateResource = true
+		defer func() { r.inGenerateResource = false }()
+
+		if r.oneOf(4) {
+			arg, calls = r.resourceCentric(s, a, dir)
+			if arg != nil {
+				return
+			}
+		}
+		if r.oneOf(3) {
+			arg, calls = r.createResource(s, a, dir)
+			if arg != nil {
+				return
+			}
+		}
+	}
+	if r.nOutOf(9, 10) {
 		arg = r.existingResource(s, a, dir)
-		if arg != nil {
-			return
-		}
-	}
-	if r.nOutOf(2, 3) {
-		arg, calls = r.resourceCentric(s, a, dir)
-		if arg != nil {
-			return
-		}
-	}
-	if r.nOutOf(4, 5) {
-		arg, calls = r.createResource(s, a, dir)
 		if arg != nil {
 			return
 		}
@@ -790,8 +799,8 @@ func (a *StructType) generate(r *randGen, s *state, dir Dir) (arg Arg, calls []*
 
 func (a *UnionType) generate(r *randGen, s *state, dir Dir) (arg Arg, calls []*Call) {
 	index := r.Intn(len(a.Fields))
-	optType := a.Fields[index].Type
-	opt, calls := r.generateArg(s, optType, dir)
+	optType, optDir := a.Fields[index].Type, a.Fields[index].Dir(dir)
+	opt, calls := r.generateArg(s, optType, optDir)
 	return MakeUnionArg(a, dir, opt, index), calls
 }
 

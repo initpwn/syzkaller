@@ -73,6 +73,8 @@ type Bug struct {
 	Namespace      string
 	Seq            int64 // sequences of the bug with the same title
 	Title          string
+	MergedTitles   []string // crash titles that we already merged into this bug
+	AltTitles      []string // alternative crash titles that we may merge into this bug
 	Status         int
 	DupOf          string
 	NumCrashes     int64
@@ -95,6 +97,10 @@ type Bug struct {
 	HappenedOn     []string // list of managers
 	PatchedOn      []string `datastore:",noindex"` // list of managers
 	UNCC           []string // don't CC these emails on this bug
+	// Kcidb publishing status bitmask:
+	// bit 0 - the bug is published
+	// bit 1 - don't want to publish it (syzkaller build/test errors)
+	KcidbStatus int64
 }
 
 type Commit struct {
@@ -121,6 +127,9 @@ type BugReporting struct {
 }
 
 type Crash struct {
+	// May be different from bug.Title due to AltTitles.
+	// May be empty for old bugs, in such case bug.Title is the right title.
+	Title       string
 	Manager     string
 	BuildID     string
 	Time        time.Time
@@ -131,6 +140,7 @@ type Crash struct {
 	ReproOpts   []byte    `datastore:",noindex"`
 	ReproSyz    int64     // reference to ReproSyz text entity
 	ReproC      int64     // reference to ReproC text entity
+	MachineInfo int64     // Reference to MachineInfo text entity.
 	// Custom crash priority for reporting (greater values are higher priority).
 	// For example, a crash in mainline kernel has higher priority than a crash in a side branch.
 	// For historical reasons this is called ReportLen.
@@ -199,6 +209,19 @@ const (
 	JobBisectFix
 )
 
+func (typ JobType) toDashapiReportType() dashapi.ReportType {
+	switch typ {
+	case JobTestPatch:
+		return dashapi.ReportTestPatch
+	case JobBisectCause:
+		return dashapi.ReportBisectCause
+	case JobBisectFix:
+		return dashapi.ReportBisectFix
+	default:
+		panic(fmt.Sprintf("unknown job type %v", typ))
+	}
+}
+
 type JobFlags int64
 
 const (
@@ -206,7 +229,28 @@ const (
 	BisectResultMerge JobFlags = 1 << iota
 	BisectResultNoop
 	BisectResultRelease
+	BisectResultIgnore
 )
+
+func (flags JobFlags) String() string {
+	res := ""
+	if flags&BisectResultMerge != 0 {
+		res += "merge "
+	}
+	if flags&BisectResultNoop != 0 {
+		res += "no-op "
+	}
+	if flags&BisectResultRelease != 0 {
+		res += "release "
+	}
+	if flags&BisectResultIgnore != 0 {
+		res += "ignored "
+	}
+	if res == "" {
+		return res
+	}
+	return "[" + res + "commit]"
+}
 
 func (job *Job) isUnreliableBisect() bool {
 	if job.Type != JobBisectCause && job.Type != JobBisectFix {
@@ -216,7 +260,8 @@ func (job *Job) isUnreliableBisect() bool {
 	// it is considered an unreliable/wrong result and should not be reported in emails.
 	return job.Flags&BisectResultMerge != 0 ||
 		job.Flags&BisectResultNoop != 0 ||
-		job.Flags&BisectResultRelease != 0
+		job.Flags&BisectResultRelease != 0 ||
+		job.Flags&BisectResultIgnore != 0
 }
 
 // Text holds text blobs (crash logs, reports, reproducers, etc).
@@ -230,6 +275,7 @@ const (
 	textCrashReport  = "CrashReport"
 	textReproSyz     = "ReproSyz"
 	textReproC       = "ReproC"
+	textMachineInfo  = "MachineInfo"
 	textKernelConfig = "KernelConfig"
 	textPatch        = "Patch"
 	textLog          = "Log"
@@ -266,8 +312,29 @@ const (
 	BisectNot BisectStatus = iota
 	BisectPending
 	BisectError
-	BisectYes
+	BisectYes          // have 1 commit
+	BisectUnreliable   // have 1 commit, but suspect it's wrong
+	BisectInconclusive // multiple commits due to skips
+	BisectHorizont     // happens on the oldest commit we can test (or HEAD for fix bisection)
+	bisectStatusLast   // this value can be changed (not stored in datastore)
 )
+
+func (status BisectStatus) String() string {
+	switch status {
+	case BisectError:
+		return "error"
+	case BisectYes:
+		return "done"
+	case BisectUnreliable:
+		return "unreliable"
+	case BisectInconclusive:
+		return "inconclusive"
+	case BisectHorizont:
+		return "inconclusive"
+	default:
+		return ""
+	}
+}
 
 func mgrKey(c context.Context, ns, name string) *db.Key {
 	return db.NewKey(c, "Manager", fmt.Sprintf("%v-%v", ns, name), 0, nil)
@@ -438,10 +505,17 @@ func bugKeyHash(ns, title string, seq int64) string {
 	return hash.String([]byte(fmt.Sprintf("%v-%v-%v-%v", config.Namespaces[ns].Key, ns, title, seq)))
 }
 
+// Since these IDs appear in Reported-by tags in commit, we slightly limit their size.
+const reportingHashLen = 20
+
 func bugReportingHash(bugHash, reporting string) string {
-	// Since these IDs appear in Reported-by tags in commit, we slightly limit their size.
-	const hashLen = 20
-	return hash.String([]byte(fmt.Sprintf("%v-%v", bugHash, reporting)))[:hashLen]
+	return hash.String([]byte(fmt.Sprintf("%v-%v", bugHash, reporting)))[:reportingHashLen]
+}
+
+func looksLikeReportingHash(id string) bool {
+	// This is only used as best-effort check.
+	// Now we produce 20-chars ids, but we used to use full sha1 hash.
+	return len(id) == reportingHashLen || len(id) == 2*len(hash.Sig{})
 }
 
 func (bug *Bug) updateCommits(commits []string, now time.Time) {
@@ -504,4 +578,27 @@ func textLink(tag string, id int64) string {
 func timeDate(t time.Time) int {
 	year, month, day := t.Date()
 	return year*10000 + int(month)*100 + day
+}
+
+func stringInList(list []string, str string) bool {
+	for _, s := range list {
+		if s == str {
+			return true
+		}
+	}
+	return false
+}
+
+func mergeString(list []string, str string) []string {
+	if !stringInList(list, str) {
+		list = append(list, str)
+	}
+	return list
+}
+
+func mergeStringList(list, add []string) []string {
+	for _, str := range add {
+		list = mergeString(list, str)
+	}
+	return list
 }

@@ -37,7 +37,7 @@ setxattr_flags = XATTR_CREATE, XATTR_REPLACE
 
 xattr_prefix = "system.", "trusted.", "security.", "user.", "btrfs.", "osx.", "os2."
 
-xattr_names = "system.posix_acl_access", "system.posix_acl_default", "system.advise", "system.sockprotoname", "com.apple.FinderInfo", "com.apple.system.Security", "user.syz", "trusted.syz", "security.apparmor", "trusted.overlay.opaque", "trusted.overlay.redirect", "trusted.overlay.origin", "trusted.overlay.impure", "trusted.overlay.nlink", "trusted.overlay.upper", "trusted.overlay.metacopy"
+xattr_names = "system.posix_acl_access", "system.posix_acl_default", "system.advise", "system.sockprotoname", "com.apple.FinderInfo", "com.apple.system.Security", "user.syz", "trusted.syz", "security.apparmor", "trusted.overlay.opaque", "trusted.overlay.redirect", "trusted.overlay.origin", "trusted.overlay.impure", "trusted.overlay.nlink", "trusted.overlay.upper", "trusted.overlay.metacopy", "security.selinux", "user.incfs.id", "user.incfs.size", "user.incfs.metadata"
 
 setxattr$system_posix_acl(path ptr[in, filename], name ptr[in, string[xattr_posix_acl_names]], val ptr[in, xattr_system_posix_acl_access], size len[val], flags flags[setxattr_flags])
 lsetxattr$system_posix_acl(path ptr[in, filename], name ptr[in, string[xattr_posix_acl_names]], val ptr[in, xattr_system_posix_acl_access], size len[val], flags flags[setxattr_flags])
@@ -182,6 +182,11 @@ ovl_fb {
 	type	int8
 	uuid	uuid_t
 	fid	array[int8]
+} [packed]
+
+ovl_fh {
+	padding	array[const[0, int8], 3]
+	fb	ovl_fb
 } [packed]
 
 type uuid_t array[int8, UUID_SIZE]

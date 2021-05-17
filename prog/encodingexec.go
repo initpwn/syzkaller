@@ -20,6 +20,7 @@
 package prog
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 )
@@ -51,7 +52,11 @@ const (
 const (
 	ExecBufferSize = 4 << 20 // keep in sync with kMaxInput in executor.cc
 	ExecNoCopyout  = ^uint64(0)
+
+	execMaxCommands = 1000 // executor knows about this constant (kMaxCommands)
 )
+
+var ErrExecBufferTooSmall = errors.New("encodingexec: provided buffer is too small")
 
 // SerializeForExec serializes program p for execution by process pid into the provided buffer.
 // Returns number of bytes written to the buffer.
@@ -69,8 +74,8 @@ func (p *Prog) SerializeForExec(buffer []byte) (int, error) {
 		w.serializeCall(c)
 	}
 	w.write(execInstrEOF)
-	if w.eof {
-		return 0, fmt.Errorf("provided buffer is too small")
+	if w.eof || w.copyoutSeq > execMaxCommands {
+		return 0, ErrExecBufferTooSmall
 	}
 	return len(buffer) - len(w.buf), nil
 }
@@ -221,14 +226,7 @@ func (w *execContext) write(v uint64) {
 		w.eof = true
 		return
 	}
-	w.buf[0] = byte(v >> 0)
-	w.buf[1] = byte(v >> 8)
-	w.buf[2] = byte(v >> 16)
-	w.buf[3] = byte(v >> 24)
-	w.buf[4] = byte(v >> 32)
-	w.buf[5] = byte(v >> 40)
-	w.buf[6] = byte(v >> 48)
-	w.buf[7] = byte(v >> 56)
+	HostEndian.PutUint64(w.buf, v)
 	w.buf = w.buf[8:]
 }
 
@@ -275,6 +273,7 @@ func (w *execContext) writeArg(arg Arg) {
 			w.eof = true
 		} else {
 			copy(w.buf, data)
+			copy(w.buf[len(data):], make([]byte, 8))
 			w.buf = w.buf[padded:]
 		}
 	case *UnionArg:

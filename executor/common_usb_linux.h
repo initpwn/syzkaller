@@ -5,6 +5,8 @@
 
 // Linux-specific implementation of syz_usb_* pseudo-syscalls.
 
+#include "common_usb.h"
+
 #define UDC_NAME_LENGTH_MAX 128
 
 struct usb_raw_init {
@@ -32,6 +34,36 @@ struct usb_raw_ep_io {
 	__u8 data[0];
 };
 
+#define USB_RAW_EPS_NUM_MAX 30
+#define USB_RAW_EP_NAME_MAX 16
+#define USB_RAW_EP_ADDR_ANY 0xff
+
+struct usb_raw_ep_caps {
+	__u32 type_control : 1;
+	__u32 type_iso : 1;
+	__u32 type_bulk : 1;
+	__u32 type_int : 1;
+	__u32 dir_in : 1;
+	__u32 dir_out : 1;
+};
+
+struct usb_raw_ep_limits {
+	__u16 maxpacket_limit;
+	__u16 max_streams;
+	__u32 reserved;
+};
+
+struct usb_raw_ep_info {
+	__u8 name[USB_RAW_EP_NAME_MAX];
+	__u32 addr;
+	struct usb_raw_ep_caps caps;
+	struct usb_raw_ep_limits limits;
+};
+
+struct usb_raw_eps_info {
+	struct usb_raw_ep_info eps[USB_RAW_EPS_NUM_MAX];
+};
+
 #define USB_RAW_IOCTL_INIT _IOW('U', 0, struct usb_raw_init)
 #define USB_RAW_IOCTL_RUN _IO('U', 1)
 #define USB_RAW_IOCTL_EVENT_FETCH _IOR('U', 2, struct usb_raw_event)
@@ -43,6 +75,11 @@ struct usb_raw_ep_io {
 #define USB_RAW_IOCTL_EP_READ _IOWR('U', 8, struct usb_raw_ep_io)
 #define USB_RAW_IOCTL_CONFIGURE _IO('U', 9)
 #define USB_RAW_IOCTL_VBUS_DRAW _IOW('U', 10, __u32)
+#define USB_RAW_IOCTL_EPS_INFO _IOR('U', 11, struct usb_raw_eps_info)
+#define USB_RAW_IOCTL_EP0_STALL _IO('U', 12)
+#define USB_RAW_IOCTL_EP_SET_HALT _IOW('U', 13, __u32)
+#define USB_RAW_IOCTL_EP_CLEAR_HALT _IOW('U', 14, __u32)
+#define USB_RAW_IOCTL_EP_SET_WEDGE _IOW('U', 15, __u32)
 
 static int usb_raw_open()
 {
@@ -112,16 +149,19 @@ static int usb_raw_vbus_draw(int fd, uint32 power)
 	return ioctl(fd, USB_RAW_IOCTL_VBUS_DRAW, power);
 }
 
+static int usb_raw_ep0_stall(int fd)
+{
+	return ioctl(fd, USB_RAW_IOCTL_EP0_STALL, 0);
+}
+
 #if SYZ_EXECUTOR || __NR_syz_usb_control_io
 static int lookup_interface(int fd, uint8 bInterfaceNumber, uint8 bAlternateSetting)
 {
 	struct usb_device_index* index = lookup_usb_index(fd);
-	int i;
-
 	if (!index)
 		return -1;
 
-	for (i = 0; i < index->ifaces_num; i++) {
+	for (int i = 0; i < index->ifaces_num; i++) {
 		if (index->ifaces[i].bInterfaceNumber == bInterfaceNumber &&
 		    index->ifaces[i].bAlternateSetting == bAlternateSetting)
 			return i;
@@ -130,31 +170,50 @@ static int lookup_interface(int fd, uint8 bInterfaceNumber, uint8 bAlternateSett
 }
 #endif // SYZ_EXECUTOR || __NR_syz_usb_control_io
 
+#if SYZ_EXECUTOR || __NR_syz_usb_ep_write || __NR_syz_usb_ep_read
+static int lookup_endpoint(int fd, uint8 bEndpointAddress)
+{
+	struct usb_device_index* index = lookup_usb_index(fd);
+	if (!index)
+		return -1;
+	if (index->iface_cur < 0)
+		return -1;
+
+	for (int ep = 0; index->ifaces[index->iface_cur].eps_num; ep++)
+		if (index->ifaces[index->iface_cur].eps[ep].desc.bEndpointAddress == bEndpointAddress)
+			return index->ifaces[index->iface_cur].eps[ep].handle;
+	return -1;
+}
+#endif // SYZ_EXECUTOR || __NR_syz_usb_ep_write || __NR_syz_usb_ep_read
+
 static void set_interface(int fd, int n)
 {
 	struct usb_device_index* index = lookup_usb_index(fd);
-	int ep;
-
 	if (!index)
 		return;
 
 	if (index->iface_cur >= 0 && index->iface_cur < index->ifaces_num) {
-		for (ep = 0; ep < index->ifaces[index->iface_cur].eps_num; ep++) {
-			int rv = usb_raw_ep_disable(fd, ep);
+		for (int ep = 0; ep < index->ifaces[index->iface_cur].eps_num; ep++) {
+			int rv = usb_raw_ep_disable(fd, index->ifaces[index->iface_cur].eps[ep].handle);
 			if (rv < 0) {
-				debug("set_interface: failed to disable endpoint %d\n", ep);
+				debug("set_interface: failed to disable endpoint 0x%02x\n",
+				      index->ifaces[index->iface_cur].eps[ep].desc.bEndpointAddress);
 			} else {
-				debug("set_interface: endpoint %d disabled\n", ep);
+				debug("set_interface: endpoint 0x%02x disabled\n",
+				      index->ifaces[index->iface_cur].eps[ep].desc.bEndpointAddress);
 			}
 		}
 	}
 	if (n >= 0 && n < index->ifaces_num) {
-		for (ep = 0; ep < index->ifaces[n].eps_num; ep++) {
-			int rv = usb_raw_ep_enable(fd, &index->ifaces[n].eps[ep]);
+		for (int ep = 0; ep < index->ifaces[n].eps_num; ep++) {
+			int rv = usb_raw_ep_enable(fd, &index->ifaces[n].eps[ep].desc);
 			if (rv < 0) {
-				debug("set_interface: failed to enable endpoint %d\n", ep);
+				debug("set_interface: failed to enable endpoint 0x%02x\n",
+				      index->ifaces[n].eps[ep].desc.bEndpointAddress);
 			} else {
-				debug("set_interface: endpoint %d enabled as %d\n", ep, rv);
+				debug("set_interface: endpoint 0x%02x enabled as %d\n",
+				      index->ifaces[n].eps[ep].desc.bEndpointAddress, rv);
+				index->ifaces[n].eps[ep].handle = rv;
 			}
 		}
 		index->iface_cur = n;
@@ -228,7 +287,7 @@ static volatile long syz_usb_connect_impl(uint64 speed, uint64 dev_len, const ch
 	debug("syz_usb_connect: add_usb_index success\n");
 
 #if USB_DEBUG
-	NONFAILING(analyze_usb_device(index));
+	analyze_usb_device(index);
 #endif
 
 	// TODO: consider creating two dummy_udc's per proc to increace the chance of
@@ -274,16 +333,16 @@ static volatile long syz_usb_connect_impl(uint64 speed, uint64 dev_len, const ch
 		uint32 response_length = 0;
 
 		if (event.ctrl.bRequestType & USB_DIR_IN) {
-			bool response_found = false;
-			NONFAILING(response_found = lookup_connect_response_in(fd, descs, &event.ctrl, &response_data, &response_length));
-			if (!response_found) {
-				debug("syz_usb_connect: unknown control IN request\n");
-				return -1;
+			if (!lookup_connect_response_in(fd, descs, &event.ctrl, &response_data, &response_length)) {
+				debug("syz_usb_connect: unknown request, stalling\n");
+				usb_raw_ep0_stall(fd);
+				continue;
 			}
 		} else {
 			if (!lookup_connect_response_out(fd, descs, &event.ctrl, &done)) {
-				debug("syz_usb_connect: unknown control OUT request\n");
-				return -1;
+				debug("syz_usb_connect: unknown request, stalling\n");
+				usb_raw_ep0_stall(fd);
+				continue;
 			}
 			response_data = NULL;
 			response_length = event.ctrl.wLength;
@@ -384,14 +443,13 @@ static volatile long syz_usb_control_io(volatile long a0, volatile long a1, vola
 	analyze_control_request(fd, &event.ctrl);
 #endif
 
-	bool response_found = false;
 	char* response_data = NULL;
 	uint32 response_length = 0;
 
 	if ((event.ctrl.bRequestType & USB_DIR_IN) && event.ctrl.wLength) {
-		NONFAILING(response_found = lookup_control_response(descs, resps, &event.ctrl, &response_data, &response_length));
-		if (!response_found) {
-			debug("syz_usb_control_io: unknown control IN request\n");
+		if (!lookup_control_response(descs, resps, &event.ctrl, &response_data, &response_length)) {
+			debug("syz_usb_connect: unknown request, stalling\n");
+			usb_raw_ep0_stall(fd);
 			return -1;
 		}
 	} else {
@@ -453,17 +511,24 @@ static volatile long syz_usb_control_io(volatile long a0, volatile long a1, vola
 static volatile long syz_usb_ep_write(volatile long a0, volatile long a1, volatile long a2, volatile long a3)
 {
 	int fd = a0;
-	uint16 ep = a1;
+	uint8 ep = a1;
 	uint32 len = a2;
 	char* data = (char*)a3;
 
+	int ep_handle = lookup_endpoint(fd, ep);
+	if (ep_handle < 0) {
+		debug("syz_usb_ep_write: endpoint not found\n");
+		return -1;
+	}
+	debug("syz_usb_ep_write: endpoint handle: %d\n", ep_handle);
+
 	struct usb_raw_ep_io_data io_data;
-	io_data.inner.ep = ep;
+	io_data.inner.ep = ep_handle;
 	io_data.inner.flags = 0;
 	if (len > sizeof(io_data.data))
 		len = sizeof(io_data.data);
 	io_data.inner.length = len;
-	NONFAILING(memcpy(&io_data.data[0], data, len));
+	memcpy(&io_data.data[0], data, len);
 
 	int rv = usb_raw_ep_write(fd, (struct usb_raw_ep_io*)&io_data);
 	if (rv < 0) {
@@ -481,12 +546,19 @@ static volatile long syz_usb_ep_write(volatile long a0, volatile long a1, volati
 static volatile long syz_usb_ep_read(volatile long a0, volatile long a1, volatile long a2, volatile long a3)
 {
 	int fd = a0;
-	uint16 ep = a1;
+	uint8 ep = a1;
 	uint32 len = a2;
 	char* data = (char*)a3;
 
+	int ep_handle = lookup_endpoint(fd, ep);
+	if (ep_handle < 0) {
+		debug("syz_usb_ep_read: endpoint not found\n");
+		return -1;
+	}
+	debug("syz_usb_ep_read: endpoint handle: %d\n", ep_handle);
+
 	struct usb_raw_ep_io_data io_data;
-	io_data.inner.ep = ep;
+	io_data.inner.ep = ep_handle;
 	io_data.inner.flags = 0;
 	if (len > sizeof(io_data.data))
 		len = sizeof(io_data.data);
@@ -498,7 +570,7 @@ static volatile long syz_usb_ep_read(volatile long a0, volatile long a1, volatil
 		return rv;
 	}
 
-	NONFAILING(memcpy(&data[0], &io_data.data[0], io_data.inner.length));
+	memcpy(&data[0], &io_data.data[0], io_data.inner.length);
 
 	debug("syz_usb_ep_read: received data:\n");
 	debug_dump_data(&io_data.data[0], io_data.inner.length);

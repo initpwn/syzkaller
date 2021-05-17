@@ -16,15 +16,14 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/prog"
+	"github.com/google/syzkaller/sys/targets"
 )
 
 func isSupported(c *prog.Syscall, target *prog.Target, sandbox string) (bool, string) {
-	log.Logf(2, "checking support for %v", c.Name)
 	if strings.HasPrefix(c.CallName, "syz_") {
-		return isSupportedSyzkall(sandbox, c)
+		return isSupportedSyzkall(c, target, sandbox)
 	}
 	if reason := isSupportedLSM(c); reason != "" {
 		return false, reason
@@ -43,6 +42,10 @@ func isSupported(c *prog.Syscall, target *prog.Target, sandbox string) (bool, st
 		// Don't shutdown root filesystem.
 		return false, "unsafe with sandbox=none"
 	}
+	return isSupportedSyscall(c, target)
+}
+
+func isSupportedSyscall(c *prog.Syscall, target *prog.Target) (bool, string) {
 	// There are 3 possible strategies for detecting supported syscalls:
 	// 1. Executes all syscalls with presumably invalid arguments and check for ENOprog.
 	//    But not all syscalls are safe to execute. For example, pause will hang,
@@ -72,21 +75,24 @@ func parseKallsyms(kallsyms []byte, arch string) map[string]bool {
 	set := make(map[string]bool)
 	var re *regexp.Regexp
 	switch arch {
-	case "386", "amd64":
+	case targets.I386, targets.AMD64:
 		re = regexp.MustCompile(` T (__ia32_|__x64_)?sys_([^\n]+)\n`)
-	case "arm", "arm64":
+	case targets.ARM, targets.ARM64:
 		re = regexp.MustCompile(` T (__arm64_)?sys_([^\n]+)\n`)
-	case "ppc64le":
+	case targets.PPC64LE:
 		re = regexp.MustCompile(` T ()?sys_([^\n]+)\n`)
-	case "mips64le":
+	case targets.MIPS64LE:
 		re = regexp.MustCompile(` T sys_(mips_)?([^\n]+)\n`)
+	case targets.S390x:
+		re = regexp.MustCompile(` T (__s390_|__s390x_)?sys_([^\n]+)\n`)
+	case targets.RiscV64:
+		re = regexp.MustCompile(` T sys_(riscv_)?([^\n]+)\n`)
 	default:
 		panic("unsupported arch for kallsyms parsing")
 	}
 	matches := re.FindAllSubmatch(kallsyms, -1)
 	for _, m := range matches {
 		name := string(m[2])
-		log.Logf(2, "found in kallsyms: %v", name)
 		set[name] = true
 	}
 	return set
@@ -159,107 +165,201 @@ var (
 	lsmDisabled     map[string]bool
 )
 
-// The function is lengthy as it handles all pseudo-syscalls,
-// but it does not seem to cause comprehension problems as there is no shared state.
-// Splitting this per-syscall will only increase code size.
-// nolint: gocyclo
-func isSupportedSyzkall(sandbox string, c *prog.Syscall) (bool, string) {
-	switch c.CallName {
-	case "syz_open_dev":
-		if _, ok := c.Args[0].Type.(*prog.ConstType); ok {
-			// This is for syz_open_dev$char/block.
+func isSyzUsbSupported(c *prog.Syscall, target *prog.Target, sandbox string) (bool, string) {
+	reason := checkUSBEmulation()
+	return reason == "", reason
+}
+
+func alwaysSupported(c *prog.Syscall, target *prog.Target, sandbox string) (bool, string) {
+	return true, ""
+}
+
+func isNetInjectionSupported(c *prog.Syscall, target *prog.Target, sandbox string) (bool, string) {
+	reason := checkNetInjection()
+	return reason == "", reason
+}
+
+func isVhciInjectionSupported(c *prog.Syscall, target *prog.Target, sandbox string) (bool, string) {
+	reason := checkVhciInjection()
+	return reason == "", reason
+}
+
+func isWifiEmulationSupported(c *prog.Syscall, target *prog.Target, sandbox string) (bool, string) {
+	reason := checkWifiEmulation()
+	return reason == "", reason
+}
+
+func isSyzKvmSetupCPUSupported(c *prog.Syscall, target *prog.Target, sandbox string) (bool, string) {
+	switch c.Name {
+	case "syz_kvm_setup_cpu$x86":
+		if runtime.GOARCH == targets.AMD64 || runtime.GOARCH == targets.I386 {
 			return true, ""
 		}
-		fname, ok := extractStringConst(c.Args[0].Type)
-		if !ok {
-			panic("first open arg is not a pointer to string const")
+	case "syz_kvm_setup_cpu$arm64":
+		if runtime.GOARCH == targets.ARM64 {
+			return true, ""
 		}
-		if !strings.Contains(fname, "#") {
-			panic(fmt.Sprintf("%v does not contain # in the file name (should be openat)", c.Name))
+	case "syz_kvm_setup_cpu$ppc64":
+		if runtime.GOARCH == "ppc64le" || runtime.GOARCH == "ppc64" {
+			return true, ""
 		}
-		if checkUSBEmulation() == "" {
-			// These entries might not be available at boot time,
-			// but will be created by connected USB devices.
-			USBDevicePrefixes := []string{
-				"/dev/hidraw", "/dev/usb/hiddev", "/dev/input/",
-			}
-			for _, prefix := range USBDevicePrefixes {
-				if strings.HasPrefix(fname, prefix) {
-					return true, ""
-				}
-			}
-		}
-		var check func(dev string) bool
-		check = func(dev string) bool {
-			if !strings.Contains(dev, "#") {
-				// Note: don't try to open them all, some can hang (e.g. /dev/snd/pcmC#D#p).
-				return osutil.IsExist(dev)
-			}
-			for i := 0; i < 10; i++ {
-				if check(strings.Replace(dev, "#", strconv.Itoa(i), 1)) {
-					return true
-				}
-			}
-			return false
-		}
-		if !check(fname) {
-			return false, fmt.Sprintf("file %v does not exist", fname)
-		}
-		return onlySandboxNoneOrNamespace(sandbox)
-	case "syz_open_procfs":
-		return true, ""
-	case "syz_open_pts":
-		return true, ""
-	case "syz_emit_ethernet", "syz_extract_tcp_res":
-		reason := checkNetInjection()
-		return reason == "", reason
-	case "syz_usb_connect", "syz_usb_connect_ath9k", "syz_usb_disconnect",
-		"syz_usb_control_io", "syz_usb_ep_write", "syz_usb_ep_read":
-		reason := checkUSBEmulation()
-		return reason == "", reason
-	case "syz_kvm_setup_cpu":
-		switch c.Name {
-		case "syz_kvm_setup_cpu$x86":
-			if runtime.GOARCH == "amd64" || runtime.GOARCH == "386" {
-				return true, ""
-			}
-		case "syz_kvm_setup_cpu$arm64":
-			if runtime.GOARCH == "arm64" {
-				return true, ""
-			}
-		}
-		return false, "unsupported arch"
-	case "syz_init_net_socket":
-		// Unfortunately this only works with sandbox none at the moment.
-		// The problem is that setns of a network namespace requires CAP_SYS_ADMIN
-		// in the target namespace, and we've lost all privs in the init namespace
-		// during creation of a user namespace.
-		if ok, reason := onlySandboxNone(sandbox); !ok {
-			return false, reason
-		}
-		return isSupportedSocket(c)
-	case "syz_genetlink_get_family_id":
-		fd, err := syscall.Socket(syscall.AF_NETLINK, syscall.SOCK_RAW, syscall.NETLINK_GENERIC)
-		if fd == -1 {
-			return false, fmt.Sprintf("socket(AF_NETLINK, SOCK_RAW, NETLINK_GENERIC) failed: %v", err)
-		}
-		syscall.Close(fd)
-		return true, ""
-	case "syz_mount_image":
-		if ok, reason := onlySandboxNone(sandbox); !ok {
-			return ok, reason
-		}
-		fstype, ok := extractStringConst(c.Args[0].Type)
-		if !ok {
-			panic("syz_mount_image arg is not string")
-		}
-		return isSupportedFilesystem(fstype)
-	case "syz_read_part_table":
-		return onlySandboxNone(sandbox)
-	case "syz_execute_func":
-		return true, ""
+	}
+	return false, "unsupported arch"
+}
+
+func isSyzOpenDevSupported(c *prog.Syscall, target *prog.Target, sandbox string) (bool, string) {
+	return isSupportedSyzOpenDev(sandbox, c)
+}
+
+func isSyzInitNetSocketSupported(c *prog.Syscall, target *prog.Target, sandbox string) (bool, string) {
+	if ok, reason := onlySandboxNone(sandbox); !ok {
+		return false, reason
+	}
+	return isSupportedSocket(c)
+}
+
+func isSyzGenetlinkGetFamilyIDSupported(c *prog.Syscall, target *prog.Target, sandbox string) (bool, string) {
+	fd, err := syscall.Socket(syscall.AF_NETLINK, syscall.SOCK_RAW, syscall.NETLINK_GENERIC)
+	if fd == -1 {
+		return false, fmt.Sprintf("socket(AF_NETLINK, SOCK_RAW, NETLINK_GENERIC) failed: %v", err)
+	}
+	// TODO: try to obtain actual family ID here. It will disable whole sets of sendmsg syscalls.
+	syscall.Close(fd)
+	return true, ""
+}
+
+func isSyzMountImageSupported(c *prog.Syscall, target *prog.Target, sandbox string) (bool, string) {
+	if ok, reason := onlySandboxNone(sandbox); !ok {
+		return ok, reason
+	}
+	fstype, ok := extractStringConst(c.Args[0].Type)
+	if !ok {
+		panic("syz_mount_image arg is not string")
+	}
+	return isSupportedFilesystem(fstype)
+}
+
+func isSyzReadPartTableSupported(c *prog.Syscall, target *prog.Target, sandbox string) (bool, string) {
+	return onlySandboxNone(sandbox)
+}
+
+func isSyzIoUringSupported(c *prog.Syscall, target *prog.Target, sandbox string) (bool, string) {
+	ioUringSyscallName := "io_uring_setup"
+	ioUringSyscall := target.SyscallMap[ioUringSyscallName]
+	if ioUringSyscall == nil {
+		return false, fmt.Sprintf("sys_%v is not present in the target", ioUringSyscallName)
+	}
+	return isSupportedSyscall(ioUringSyscall, target)
+}
+
+func isBtfVmlinuxSupported(c *prog.Syscall, target *prog.Target, sandbox string) (bool, string) {
+	if err := osutil.IsAccessible("/sys/kernel/btf/vmlinux"); err != nil {
+		return false, err.Error()
+	}
+	return onlySandboxNone(sandbox)
+}
+
+func isSyzFuseSupported(c *prog.Syscall, target *prog.Target, sandbox string) (bool, string) {
+	if ok, reason := isSupportedFilesystem("fuse"); !ok {
+		return ok, reason
+	}
+	if ok, reason := onlySandboxNoneOrNamespace(sandbox); !ok {
+		return false, reason
+	}
+	return true, ""
+}
+
+func isSyzUsbIPSupported(c *prog.Syscall, target *prog.Target, sandbox string) (bool, string) {
+	if err := osutil.IsWritable("/sys/devices/platform/vhci_hcd.0/attach"); err != nil {
+		return false, err.Error()
+	}
+	return onlySandboxNoneOrNamespace(sandbox)
+}
+
+var syzkallSupport = map[string]func(*prog.Syscall, *prog.Target, string) (bool, string){
+	"syz_open_dev":                isSyzOpenDevSupported,
+	"syz_open_procfs":             isSyzOpenProcfsSupported,
+	"syz_open_pts":                alwaysSupported,
+	"syz_execute_func":            alwaysSupported,
+	"syz_emit_ethernet":           isNetInjectionSupported,
+	"syz_extract_tcp_res":         isNetInjectionSupported,
+	"syz_usb_connect":             isSyzUsbSupported,
+	"syz_usb_connect_ath9k":       isSyzUsbSupported,
+	"syz_usb_disconnect":          isSyzUsbSupported,
+	"syz_usb_control_io":          isSyzUsbSupported,
+	"syz_usb_ep_write":            isSyzUsbSupported,
+	"syz_usb_ep_read":             isSyzUsbSupported,
+	"syz_kvm_setup_cpu":           isSyzKvmSetupCPUSupported,
+	"syz_emit_vhci":               isVhciInjectionSupported,
+	"syz_init_net_socket":         isSyzInitNetSocketSupported,
+	"syz_genetlink_get_family_id": isSyzGenetlinkGetFamilyIDSupported,
+	"syz_mount_image":             isSyzMountImageSupported,
+	"syz_read_part_table":         isSyzReadPartTableSupported,
+	"syz_io_uring_submit":         isSyzIoUringSupported,
+	"syz_io_uring_complete":       isSyzIoUringSupported,
+	"syz_io_uring_setup":          isSyzIoUringSupported,
+	// syz_memcpy_off is only used for io_uring descriptions, thus, enable it
+	// only if io_uring syscalls are enabled.
+	"syz_memcpy_off":         isSyzIoUringSupported,
+	"syz_btf_id_by_name":     isBtfVmlinuxSupported,
+	"syz_fuse_handle_req":    isSyzFuseSupported,
+	"syz_80211_inject_frame": isWifiEmulationSupported,
+	"syz_80211_join_ibss":    isWifiEmulationSupported,
+	"syz_usbip_server_init":  isSyzUsbIPSupported,
+}
+
+func isSupportedSyzkall(c *prog.Syscall, target *prog.Target, sandbox string) (bool, string) {
+	if isSupported, ok := syzkallSupport[c.CallName]; ok {
+		return isSupported(c, target, sandbox)
 	}
 	panic("unknown syzkall: " + c.Name)
+}
+
+func isSupportedSyzOpenDev(sandbox string, c *prog.Syscall) (bool, string) {
+	if _, ok := c.Args[0].Type.(*prog.ConstType); ok {
+		// This is for syz_open_dev$char/block.
+		return true, ""
+	}
+	fname, ok := extractStringConst(c.Args[0].Type)
+	if !ok {
+		panic("first open arg is not a pointer to string const")
+	}
+	if strings.Contains(fname, "/dev/raw/raw#") {
+		// For syz_open_dev$char_raw, these files don't exist initially.
+		return true, ""
+	}
+	if !strings.Contains(fname, "#") {
+		panic(fmt.Sprintf("%v does not contain # in the file name (should be openat)", c.Name))
+	}
+	if checkUSBEmulation() == "" {
+		// These entries might not be available at boot time,
+		// but will be created by connected USB devices.
+		USBDevicePrefixes := []string{
+			"/dev/hidraw", "/dev/usb/hiddev", "/dev/input/",
+		}
+		for _, prefix := range USBDevicePrefixes {
+			if strings.HasPrefix(fname, prefix) {
+				return true, ""
+			}
+		}
+	}
+	var check func(dev string) bool
+	check = func(dev string) bool {
+		if !strings.Contains(dev, "#") {
+			// Note: don't try to open them all, some can hang (e.g. /dev/snd/pcmC#D#p).
+			return osutil.IsExist(dev)
+		}
+		for i := 0; i < 10; i++ {
+			if check(strings.Replace(dev, "#", strconv.Itoa(i), 1)) {
+				return true
+			}
+		}
+		return false
+	}
+	if !check(fname) {
+		return false, fmt.Sprintf("file %v does not exist", fname)
+	}
+	return onlySandboxNoneOrNamespace(sandbox)
 }
 
 func isSupportedLSM(c *prog.Syscall) string {
@@ -340,23 +440,30 @@ func isSupportedSocket(c *prog.Syscall) (bool, string) {
 	return false, err.Error()
 }
 
+func isSyzOpenProcfsSupported(c *prog.Syscall, target *prog.Target, sandbox string) (bool, string) {
+	return isSupportedOpenFile(c, 1, nil)
+}
+
 func isSupportedOpenAt(c *prog.Syscall) (bool, string) {
-	var fd int
-	var err error
-
-	fname, ok := extractStringConst(c.Args[1].Type)
-	if !ok || len(fname) == 0 || fname[0] != '/' {
-		return true, ""
-	}
-
-	modes := []int{syscall.O_RDONLY, syscall.O_WRONLY, syscall.O_RDWR}
-
-	// Attempt to extract flags from the syscall description
+	// Attempt to extract flags from the syscall description.
+	var modes []int
 	if mode, ok := c.Args[2].Type.(*prog.ConstType); ok {
 		modes = []int{int(mode.Val)}
 	}
+	return isSupportedOpenFile(c, 1, modes)
+}
 
+func isSupportedOpenFile(c *prog.Syscall, filenameArg int, modes []int) (bool, string) {
+	fname, ok := extractStringConst(c.Args[filenameArg].Type)
+	if !ok || fname == "" || fname[0] != '/' {
+		return true, ""
+	}
+	if len(modes) == 0 {
+		modes = []int{syscall.O_RDONLY, syscall.O_WRONLY, syscall.O_RDWR}
+	}
+	var err error
 	for _, mode := range modes {
+		var fd int
 		fd, err = syscall.Open(fname, mode, 0)
 		if fd != -1 {
 			syscall.Close(fd)
@@ -365,7 +472,6 @@ func isSupportedOpenAt(c *prog.Syscall) (bool, string) {
 			return true, ""
 		}
 	}
-
 	return false, fmt.Sprintf("open(%v) failed: %v", fname, err)
 }
 
@@ -408,7 +514,7 @@ func extractStringConst(typ prog.Type) (string, bool) {
 		return "", false
 	}
 	v := str.Values[0]
-	for len(v) != 0 && v[len(v)-1] == 0 {
+	for v != "" && v[len(v)-1] == 0 {
 		v = v[:len(v)-1] // string terminating \x00
 	}
 	return v, true

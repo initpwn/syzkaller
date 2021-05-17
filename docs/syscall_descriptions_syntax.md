@@ -28,7 +28,7 @@ rest of the type-options are type-specific:
 "intN"/"intptr": an integer without a particular meaning, type-options:
 	optional range of values (e.g. "5:10", or "100:200"),
 	optionally followed by an alignment parameter
-"flags": a set of flags, type-options:
+"flags": a set of values, type-options:
 	reference to flags description (see below), underlying int type (e.g. "int32")
 "array": a variable/fixed-length array, type-options:
 	type of elements, optional size (fixed "5", or ranged "5:10", boundaries inclusive)
@@ -120,9 +120,13 @@ Structs are described as:
 
 ```
 structname "{" "\n"
-	(fieldname type "\n")+
+	(fieldname type ("(" fieldattribute* ")")? "\n")+
 "}" ("[" attribute* "]")?
 ```
+
+Fields can have attributes specified in parentheses after the field, independent
+of their type. The only attribute is direction (`in/out/inout`). For the field for
+which it is specified, the direction attributes on the upper levels are overridden.
 
 Structs can have attributes specified in square brackets after the struct.
 Attributes are:
@@ -137,9 +141,11 @@ Unions are described as:
 
 ```
 unionname "[" "\n"
-	(fieldname type "\n")+
+	(fieldname type ("(" fieldattribute* ")")? "\n")+
 "]" ("[" attribute* "]")?
 ```
+
+Field attributes are as defined for [structs](#structs).
 
 Unions can have attributes specified in square brackets after the union.
 Attributes are:
@@ -149,7 +155,7 @@ Attributes are:
 
 ## Resources
 
-Resources represent values that need to be passed from output of one syscall to input of another syscall. For example, `close` syscall requires an input value (fd) previously returned by `open` or `pipe` syscall. To achieve this, `fd` is declared as a resource. Resources are described as:
+Resources represent values that need to be passed from output of one syscall to input of another syscall. For example, `close` syscall requires an input value (fd) previously returned by `open` or `pipe` syscall. To achieve this, `fd` is declared as a resource. This is a way of modelling dependencies between syscalls, as defining a syscall as the producer of a resource and another syscall as the consumer defines a loose sense of ordering between them. Resources are described as:
 
 ```
 "resource" identifier "[" underlying_type "]" [ ":" const ("," const)* ]
@@ -165,6 +171,36 @@ resource sock_unix[sock]
 socket(...) sock
 accept(fd sock, ...) sock
 listen(fd sock, backlog int32)
+```
+
+Resources don't have to be necessarily returned by a syscall. They can be used as any other data type. For example:
+
+```
+resource my_resource[int32]
+
+request_producer(..., arg ptr[out, my_resource])
+request_consumer(..., arg ptr[inout, test_struct])
+
+test_struct {
+	...
+	attr	my_resource
+}
+```
+
+For more complex producer/consumer scenarios, field attributes can be utilized.
+For example:
+
+```
+resource my_resource_1[int32]
+resource my_resource_2[int32]
+
+request_produce1_consume2(..., arg ptr[inout, test_struct])
+
+test_struct {
+	...
+	field0	my_resource_1	(out)
+	field1	my_resource_2	(in)
+}
 ```
 
 ## Type Aliases
@@ -329,5 +365,13 @@ define MY_PATH_MAX	PATH_MAX + 2
 ## Misc
 
 Description files also contain `include` directives that refer to Linux kernel header files,
-`incdir` directives that refer to custom Linux kernel header directories 
+`incdir` directives that refer to custom Linux kernel header directories
 and `define` directives that define symbolic constant values.
+
+The syzkaller executor defines some [pseudo system calls](./pseudo_syscalls.md)
+that can be used as any other syscall in a description file. These pseudo
+system calls expand to literal C code and can perform user-defined
+custom actions. You can find some examples in
+[executor/common_linux.h](../executor/common_linux.h).
+
+Also see [tips](syscall_descriptions.md#tips) on writing good descriptions.

@@ -18,7 +18,7 @@ import (
 	"golang.org/x/tools/go/types/typeutil"
 )
 
-type ID int32
+type ID int
 
 // A Program is a partial or complete Go program converted to IR form.
 type Program struct {
@@ -50,7 +50,7 @@ type Package struct {
 	Prog      *Program               // the owning program
 	Pkg       *types.Package         // the corresponding go/types.Package
 	Members   map[string]Member      // all package members keyed by name (incl. init and init#%d)
-	Functions []*Function            // all functions, including anonymous ones
+	Functions []*Function            // all functions, excluding anonymous ones
 	values    map[types.Object]Value // package members (incl. types and methods), keyed by object
 	init      *Function              // Func("init"); the package's init function
 	debug     bool                   // include full debug info in this package
@@ -333,10 +333,13 @@ type Function struct {
 	Exit       *BasicBlock   // The function's exit block
 	AnonFuncs  []*Function   // anonymous functions directly beneath this one
 	referrers  []Instruction // referring instructions (iff Parent() != nil)
-	hasDefer   bool
-	WillExit   bool // Calling this function will always terminate the process
-	WillUnwind bool // Calling this function will always unwind (it will call runtime.Goexit or panic)
+	WillExit   bool          // Calling this function will always terminate the process
+	WillUnwind bool          // Calling this function will always unwind (it will call runtime.Goexit or panic)
 
+	*functionBody
+}
+
+type functionBody struct {
 	// The following fields are set transiently during building,
 	// then cleared.
 	currentBlock    *BasicBlock             // where to emit code
@@ -349,6 +352,7 @@ type Function struct {
 	wr              *HTMLWriter
 	fakeExits       BlockSet
 	blocksets       [5]BlockSet
+	hasDefer        bool
 }
 
 func (fn *Function) results() []*Alloc {
@@ -534,9 +538,8 @@ type Builtin struct {
 //
 type Alloc struct {
 	register
-	Comment string
-	Heap    bool
-	index   int // dense numbering; for lifting
+	Heap  bool
+	index int // dense numbering; for lifting
 }
 
 var _ Instruction = (*Sigma)(nil)
@@ -558,9 +561,8 @@ var _ Value = (*Sigma)(nil)
 //
 type Sigma struct {
 	register
-	From    *BasicBlock
-	X       Value
-	Comment string
+	From *BasicBlock
+	X    Value
 
 	live bool // used during lifting
 }
@@ -579,8 +581,7 @@ type Sigma struct {
 //
 type Phi struct {
 	register
-	Comment string  // a hint as to its purpose
-	Edges   []Value // Edges[i] is value for Block().Preds[i]
+	Edges []Value // Edges[i] is value for Block().Preds[i]
 
 	live bool // used during lifting
 }

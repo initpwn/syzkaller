@@ -10,7 +10,6 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/pkg/osutil"
 )
 
@@ -82,6 +81,7 @@ func (ctx openbsd) copyFilesToImage(overlayDir, outputDir string) error {
 	script := fmt.Sprintf(`set -eux
 OVERLAY="%s"
 # Cleanup in case something failed before.
+sync
 doas umount /altroot || true
 doas vnconfig -u vnd0 || true
 
@@ -89,12 +89,10 @@ doas /sbin/vnconfig vnd0 image
 doas mount /dev/vnd0a /altroot
 doas cp kernel /altroot/bsd
 test -d "$OVERLAY" && doas cp -Rf "$OVERLAY"/. /altroot
+sync
 doas umount /altroot
 doas vnconfig -u vnd0
 `, overlayDir)
-	debugOut, err := osutil.RunCmd(10*time.Minute, outputDir, "/bin/sh", "-c", script)
-	if err != nil {
-		log.Logf(0, "Error copying kernel into image %v\n%v\n", outputDir, debugOut)
-	}
+	_, err := osutil.RunCmd(10*time.Minute, outputDir, "/bin/sh", "-c", script)
 	return err
 }

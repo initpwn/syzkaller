@@ -28,6 +28,7 @@ func TestSerializeForExecRandom(t *testing.T) {
 	}
 }
 
+// nolint: funlen
 func TestSerializeForExec(t *testing.T) {
 	target := initTargetTest(t, "test", "64")
 	var (
@@ -40,6 +41,18 @@ func TestSerializeForExec(t *testing.T) {
 			t.Fatalf("unknown syscall %v", name)
 		}
 		return uint64(c.ID)
+	}
+	letoh64 := func(v uint64) uint64 {
+		buf := make([]byte, 8)
+		buf[0] = byte(v >> 0)
+		buf[1] = byte(v >> 8)
+		buf[2] = byte(v >> 16)
+		buf[3] = byte(v >> 24)
+		buf[4] = byte(v >> 32)
+		buf[5] = byte(v >> 40)
+		buf[6] = byte(v >> 48)
+		buf[7] = byte(v >> 56)
+		return HostEndian.Uint64(buf)
 	}
 	tests := []struct {
 		prog       string
@@ -203,7 +216,7 @@ func TestSerializeForExec(t *testing.T) {
 			"test$array1(&(0x7f0000000000)={0x42, \"0102030405\"})",
 			[]uint64{
 				execInstrCopyin, dataOffset + 0, execArgConst, 1, 0x42,
-				execInstrCopyin, dataOffset + 1, execArgData, 5, 0x0504030201,
+				execInstrCopyin, dataOffset + 1, execArgData, 5, letoh64(0x0504030201),
 				callID("test$array1"), ExecNoCopyout, 1, execArgConst, ptrSize, dataOffset,
 				execInstrEOF,
 			},
@@ -213,7 +226,7 @@ func TestSerializeForExec(t *testing.T) {
 			"test$array2(&(0x7f0000000000)={0x42, \"aaaaaaaabbbbbbbbccccccccdddddddd\", 0x43})",
 			[]uint64{
 				execInstrCopyin, dataOffset + 0, execArgConst, 2, 0x42,
-				execInstrCopyin, dataOffset + 2, execArgData, 16, 0xbbbbbbbbaaaaaaaa, 0xddddddddcccccccc,
+				execInstrCopyin, dataOffset + 2, execArgData, 16, letoh64(0xbbbbbbbbaaaaaaaa), letoh64(0xddddddddcccccccc),
 				execInstrCopyin, dataOffset + 18, execArgConst, 2, 0x43,
 				callID("test$array2"), ExecNoCopyout, 1, execArgConst, ptrSize, dataOffset,
 				execInstrEOF,
@@ -435,8 +448,7 @@ func TestSerializeForExec(t *testing.T) {
 				execInstrCopyin, dataOffset + 2, execArgConst, 4 | 1<<8, 0x1,
 				execInstrCopyin, dataOffset + 6, execArgConst, 4 | 1<<8, 0x2,
 				execInstrCopyin, dataOffset + 10, execArgConst, 2, 0x0,
-				execInstrCopyin, dataOffset + 12, execArgData, 1, 0xab,
-
+				execInstrCopyin, dataOffset + 12, execArgData, 1, letoh64(0xab),
 				execInstrCopyin, dataOffset + 10, execArgCsum, 2, ExecArgCsumInet, 5,
 				ExecArgCsumChunkData, dataOffset + 2, 4,
 				ExecArgCsumChunkData, dataOffset + 6, 4,
@@ -465,11 +477,11 @@ func TestSerializeForExec(t *testing.T) {
 				t.Fatalf("failed to serialize: %v", err)
 			}
 			w := new(bytes.Buffer)
-			binary.Write(w, binary.LittleEndian, test.serialized)
+			binary.Write(w, HostEndian, test.serialized)
 			data := buf[:n]
 			if !bytes.Equal(data, w.Bytes()) {
 				got := make([]uint64, len(data)/8)
-				binary.Read(bytes.NewReader(data), binary.LittleEndian, &got)
+				binary.Read(bytes.NewReader(data), HostEndian, &got)
 				t.Logf("want: %v", test.serialized)
 				t.Logf("got:  %v", got)
 				t.Fatalf("mismatch")
@@ -482,6 +494,73 @@ func TestSerializeForExec(t *testing.T) {
 				t.Logf("want: %#v", *test.decoded)
 				t.Logf("got:  %#v", decoded)
 				t.Fatalf("decoded mismatch")
+			}
+		})
+	}
+}
+
+func TestSerializeForExecOverflow(t *testing.T) {
+	target := initTargetTest(t, "test", "64")
+	type Test struct {
+		name     string
+		overflow bool
+		gen      func(w *bytes.Buffer)
+	}
+	tests := []Test{
+		{
+			name:     "few-resources",
+			overflow: false,
+			gen: func(w *bytes.Buffer) {
+				for i := 0; i < execMaxCommands-10; i++ {
+					fmt.Fprintf(w, "r%v = test$res0()\ntest$res1(r%v)\n", i, i)
+				}
+			},
+		},
+		{
+			name:     "overflow-resources",
+			overflow: true,
+			gen: func(w *bytes.Buffer) {
+				for i := 0; i < execMaxCommands+1; i++ {
+					fmt.Fprintf(w, "r%v = test$res0()\ntest$res1(r%v)\n", i, i)
+				}
+			},
+		},
+		{
+			name:     "no-verflow-buffer",
+			overflow: false,
+			gen: func(w *bytes.Buffer) {
+				fmt.Fprintf(w, "r0 = test$res0()\n")
+				for i := 0; i < 58e3; i++ {
+					fmt.Fprintf(w, "test$res1(r0)\n")
+				}
+			},
+		},
+		{
+			name:     "overflow-buffer",
+			overflow: true,
+			gen: func(w *bytes.Buffer) {
+				fmt.Fprintf(w, "r0 = test$res0()\n")
+				for i := 0; i < 59e3; i++ {
+					fmt.Fprintf(w, "test$res1(r0)\n")
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			data := new(bytes.Buffer)
+			test.gen(data)
+			p, err := target.Deserialize(data.Bytes(), Strict)
+			if err != nil {
+				t.Fatal(err)
+			}
+			buf := make([]byte, ExecBufferSize)
+			_, err = p.SerializeForExec(buf)
+			if test.overflow && err != ErrExecBufferTooSmall {
+				t.Fatalf("want overflow but got %v", err)
+			}
+			if !test.overflow && err != nil {
+				t.Fatalf("want no overflow but got %v", err)
 			}
 		})
 	}

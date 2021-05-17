@@ -19,6 +19,7 @@ import (
 	"github.com/google/syzkaller/dashboard/dashapi"
 	"github.com/google/syzkaller/pkg/email"
 	"github.com/google/syzkaller/pkg/hash"
+	"github.com/google/syzkaller/sys/targets"
 	"golang.org/x/net/context"
 	"google.golang.org/appengine"
 	db "google.golang.org/appengine/datastore"
@@ -634,15 +635,6 @@ func managerList(c context.Context, ns string) ([]string, error) {
 	return managers, nil
 }
 
-func stringInList(list []string, str string) bool {
-	for _, s := range list {
-		if s == str {
-			return true
-		}
-	}
-	return false
-}
-
 func apiReportBuildError(c context.Context, ns string, r *http.Request, payload []byte) (interface{}, error) {
 	req := new(dashapi.BuildErrorReq)
 	if err := json.Unmarshal(payload, req); err != nil {
@@ -672,7 +664,10 @@ func apiReportBuildError(c context.Context, ns string, r *http.Request, payload 
 	return nil, nil
 }
 
-const corruptedReportTitle = "corrupted report"
+const (
+	corruptedReportTitle  = "corrupted report"
+	suppressedReportTitle = "suppressed report"
+)
 
 func apiReportCrash(c context.Context, ns string, r *http.Request, payload []byte) (interface{}, error) {
 	req := new(dashapi.Crash)
@@ -697,29 +692,30 @@ func apiReportCrash(c context.Context, ns string, r *http.Request, payload []byt
 }
 
 func reportCrash(c context.Context, build *Build, req *dashapi.Crash) (*Bug, error) {
-	req.Title = limitLength(req.Title, maxTextLen)
-	req.Maintainers = email.MergeEmailLists(req.Maintainers)
-	if req.Corrupted {
-		// The report is corrupted and the title is most likely invalid.
-		// Such reports are usually unactionable and are discarded.
-		// Collect them into a single bin.
-		req.Title = corruptedReportTitle
+	req.Title = canonicalizeCrashTitle(req.Title, req.Corrupted, req.Suppressed)
+	if req.Corrupted || req.Suppressed {
+		req.AltTitles = []string{req.Title}
+	} else {
+		for i, t := range req.AltTitles {
+			req.AltTitles[i] = normalizeCrashTitle(t)
+		}
+		req.AltTitles = mergeStringList([]string{req.Title}, req.AltTitles) // dedup
 	}
+	req.Maintainers = email.MergeEmailLists(req.Maintainers)
 
 	ns := build.Namespace
-	bug, bugKey, err := findBugForCrash(c, ns, req.Title)
+	bug, err := findBugForCrash(c, ns, req.AltTitles)
 	if err != nil {
 		return nil, err
 	}
-	if active, err := isActiveBug(c, bug); err != nil {
-		return nil, err
-	} else if !active {
-		bug, bugKey, err = createBugForCrash(c, ns, req)
+	if bug == nil {
+		bug, err = createBugForCrash(c, ns, req)
 		if err != nil {
 			return nil, err
 		}
 	}
 
+	bugKey := bug.key(c)
 	now := timeNow(c)
 	reproLevel := ReproLevelNone
 	if len(req.ReproC) != 0 {
@@ -730,9 +726,10 @@ func reportCrash(c context.Context, build *Build, req *dashapi.Crash) (*Bug, err
 	save := reproLevel != ReproLevelNone ||
 		bug.NumCrashes < maxCrashes ||
 		now.Sub(bug.LastSavedCrash) > time.Hour ||
-		bug.NumCrashes%20 == 0
+		bug.NumCrashes%20 == 0 ||
+		!stringInList(bug.MergedTitles, req.Title)
 	if save {
-		if err := saveCrash(c, ns, req, bugKey, build); err != nil {
+		if err := saveCrash(c, ns, req, bug, bugKey, build); err != nil {
 			return nil, err
 		}
 	} else {
@@ -759,9 +756,11 @@ func reportCrash(c context.Context, build *Build, req *dashapi.Crash) (*Bug, err
 		if len(req.Report) != 0 {
 			bug.HasReport = true
 		}
-		if !stringInList(bug.HappenedOn, build.Manager) {
-			bug.HappenedOn = append(bug.HappenedOn, build.Manager)
-		}
+		bug.HappenedOn = mergeString(bug.HappenedOn, build.Manager)
+		// Migration of older entities (for new bugs Title is always in MergedTitles).
+		bug.MergedTitles = mergeString(bug.MergedTitles, bug.Title)
+		bug.MergedTitles = mergeString(bug.MergedTitles, req.Title)
+		bug.AltTitles = mergeStringList(bug.AltTitles, req.AltTitles)
 		if _, err = db.Put(c, bugKey, bug); err != nil {
 			return fmt.Errorf("failed to put bug: %v", err)
 		}
@@ -776,7 +775,7 @@ func reportCrash(c context.Context, build *Build, req *dashapi.Crash) (*Bug, err
 	return bug, nil
 }
 
-func saveCrash(c context.Context, ns string, req *dashapi.Crash, bugKey *db.Key, build *Build) error {
+func saveCrash(c context.Context, ns string, req *dashapi.Crash, bug *Bug, bugKey *db.Key, build *Build) error {
 	// Reporting priority of this crash.
 	prio := int64(kernelRepoInfo(build).ReportingPriority) * 1e6
 	if len(req.ReproC) != 0 {
@@ -784,16 +783,22 @@ func saveCrash(c context.Context, ns string, req *dashapi.Crash, bugKey *db.Key,
 	} else if len(req.ReproSyz) != 0 {
 		prio += 2e12
 	}
-	if build.Arch == "amd64" {
+	if req.Title == bug.Title {
+		prio += 1e8 // prefer reporting crash that matches bug title
+	}
+	if build.Arch == targets.AMD64 {
 		prio += 1e3
 	}
 	crash := &Crash{
-		Manager:     build.Manager,
-		BuildID:     req.BuildID,
-		Time:        timeNow(c),
-		Maintainers: req.Maintainers,
-		ReproOpts:   req.ReproOpts,
-		ReportLen:   prio,
+		Title:   req.Title,
+		Manager: build.Manager,
+		BuildID: req.BuildID,
+		Time:    timeNow(c),
+		Maintainers: email.MergeEmailLists(req.Maintainers,
+			GetEmails(req.Recipients, dashapi.To),
+			GetEmails(req.Recipients, dashapi.Cc)),
+		ReproOpts: req.ReproOpts,
+		ReportLen: prio,
 	}
 	var err error
 	if crash.Log, err = putText(c, ns, textCrashLog, req.Log, false); err != nil {
@@ -806,6 +811,9 @@ func saveCrash(c context.Context, ns string, req *dashapi.Crash, bugKey *db.Key,
 		return err
 	}
 	if crash.ReproC, err = putText(c, ns, textReproC, req.ReproC, false); err != nil {
+		return err
+	}
+	if crash.MachineInfo, err = putText(c, ns, textMachineInfo, req.MachineInfo, true); err != nil {
 		return err
 	}
 	crashKey := db.NewIncompleteKey(c, "Crash", bugKey)
@@ -839,6 +847,7 @@ func purgeOldCrashes(c context.Context, bug *Bug, bugKey *db.Key) {
 	})
 	var toDelete []*db.Key
 	latestOnManager := make(map[string]bool)
+	uniqueTitle := make(map[string]bool)
 	deleted, reproCount, noreproCount := 0, 0, 0
 	for _, crash := range crashes {
 		if !crash.Reported.IsZero() {
@@ -848,6 +857,11 @@ func purgeOldCrashes(c context.Context, bug *Bug, bugKey *db.Key) {
 		// Preserve latest crash on each manager.
 		if !latestOnManager[crash.Manager] {
 			latestOnManager[crash.Manager] = true
+			continue
+		}
+		// Preserve at least one crash with each title.
+		if !uniqueTitle[crash.Title] {
+			uniqueTitle[crash.Title] = true
 			continue
 		}
 		// Preserve maxCrashes latest crashes with repro and without repro.
@@ -892,15 +906,16 @@ func apiReportFailedRepro(c context.Context, ns string, r *http.Request, payload
 	if err := json.Unmarshal(payload, req); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal request: %v", err)
 	}
-	req.Title = limitLength(req.Title, maxTextLen)
+	req.Title = canonicalizeCrashTitle(req.Title, req.Corrupted, req.Suppressed)
 
-	bug, bugKey, err := findBugForCrash(c, ns, req.Title)
+	bug, err := findExistingBugForCrash(c, ns, []string{req.Title})
 	if err != nil {
 		return nil, err
 	}
 	if bug == nil {
 		return nil, fmt.Errorf("%v: can't find bug for crash %q", ns, req.Title)
 	}
+	bugKey := bug.key(c)
 	now := timeNow(c)
 	tx := func(c context.Context) error {
 		bug := new(Bug)
@@ -932,19 +947,45 @@ func apiNeedRepro(c context.Context, ns string, r *http.Request, payload []byte)
 		}
 		return resp, nil
 	}
-	req.Title = limitLength(req.Title, maxTextLen)
+	req.Title = canonicalizeCrashTitle(req.Title, req.Corrupted, req.Suppressed)
 
-	bug, _, err := findBugForCrash(c, ns, req.Title)
+	bug, err := findExistingBugForCrash(c, ns, []string{req.Title})
 	if err != nil {
 		return nil, err
 	}
 	if bug == nil {
+		if req.MayBeMissing {
+			// Manager does not send leak reports w/o repro to dashboard, we want to reproduce them.
+			resp := &dashapi.NeedReproResp{
+				NeedRepro: true,
+			}
+			return resp, nil
+		}
 		return nil, fmt.Errorf("%v: can't find bug for crash %q", ns, req.Title)
 	}
 	resp := &dashapi.NeedReproResp{
 		NeedRepro: needRepro(c, bug),
 	}
 	return resp, nil
+}
+
+func canonicalizeCrashTitle(title string, corrupted, suppressed bool) string {
+	if corrupted {
+		// The report is corrupted and the title is most likely invalid.
+		// Such reports are usually unactionable and are discarded.
+		// Collect them into a single bin.
+		return corruptedReportTitle
+	}
+	if suppressed {
+		// Collect all of them into a single bucket so that it's possible to control and assess them,
+		// e.g. if there are some spikes in suppressed reports.
+		return suppressedReportTitle
+	}
+	return normalizeCrashTitle(title)
+}
+
+func normalizeCrashTitle(title string) string {
+	return strings.TrimSpace(limitLength(title, maxTextLen))
 }
 
 func apiManagerStats(c context.Context, ns string, r *http.Request, payload []byte) (interface{}, error) {
@@ -1009,84 +1050,159 @@ func apiLoadBug(c context.Context, ns string, r *http.Request, payload []byte) (
 	if bug.sanitizeAccess(AccessPublic) > AccessPublic {
 		return nil, nil
 	}
-	crash, _, err := findCrashForBug(c, bug)
-	if err != nil {
-		return nil, err
-	}
-	build, err := loadBuild(c, ns, crash.BuildID)
-	if err != nil {
-		return nil, err
-	}
-	reproSyz, _, err := getText(c, textReproSyz, crash.ReproSyz)
-	if err != nil {
-		return nil, err
-	}
-	reproC, _, err := getText(c, textReproC, crash.ReproC)
-	if err != nil {
-		return nil, err
-	}
-	statuses := map[int]string{
-		BugStatusOpen:    "open",
-		BugStatusFixed:   "fixed",
-		BugStatusInvalid: "invalid",
-		BugStatusDup:     "dup",
-	}
-	resp := &dashapi.LoadBugResp{
-		ID:              req.ID,
-		Title:           bug.displayTitle(),
-		Status:          statuses[bug.Status],
-		SyzkallerCommit: build.SyzkallerCommit,
-		ReproOpts:       crash.ReproOpts,
-		ReproSyz:        reproSyz,
-		ReproC:          reproC,
-	}
-	return resp, nil
+	return loadBugReport(c, bug)
 }
 
-func findBugForCrash(c context.Context, ns, title string) (*Bug, *db.Key, error) {
+func loadBugReport(c context.Context, bug *Bug) (*dashapi.BugReport, error) {
+	crash, crashKey, err := findCrashForBug(c, bug)
+	if err != nil {
+		return nil, err
+	}
+	// Create report for the last reporting so that it's stable and ExtID does not change over time.
+	bugReporting := &bug.Reporting[len(bug.Reporting)-1]
+	reporting := config.Namespaces[bug.Namespace].ReportingByName(bugReporting.Name)
+	if reporting == nil {
+		return nil, fmt.Errorf("reporting %v is missing in config", bugReporting.Name)
+	}
+	return createBugReport(c, bug, crash, crashKey, bugReporting, reporting)
+}
+
+func findExistingBugForCrash(c context.Context, ns string, titles []string) (*Bug, error) {
+	// First, try to find an existing bug that we already used to report this crash title.
 	var bugs []*Bug
-	keys, err := db.NewQuery("Bug").
+	_, err := db.NewQuery("Bug").
 		Filter("Namespace=", ns).
-		Filter("Title=", title).
-		Order("-Seq").
-		Limit(1).
+		Filter("MergedTitles=", titles[0]).
 		GetAll(c, &bugs)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to query bugs: %v", err)
+		return nil, fmt.Errorf("failed to query bugs: %v", err)
 	}
-	if len(bugs) == 0 {
-		return nil, nil, nil
+	// We can find bugs with different bug.Title and uncomparable bug.Seq's.
+	// But there should be only one active bug for each crash title,
+	// so if we sort by Seq, the first active bug is our target bug.
+	sort.Slice(bugs, func(i, j int) bool {
+		return bugs[i].Seq > bugs[j].Seq
+	})
+	for _, bug := range bugs {
+		if active, err := isActiveBug(c, bug); err != nil {
+			return nil, err
+		} else if active {
+			return bug, nil
+		}
 	}
-	return bugs[0], keys[0], nil
+	// This is required for incremental migration.
+	// Older bugs don't have MergedTitles, so we need to check Title as well
+	// (reportCrash will set MergedTitles later).
+	for _, title := range titles {
+		_, err = db.NewQuery("Bug").
+			Filter("Namespace=", ns).
+			Filter("Title=", title).
+			Order("-Seq").
+			Limit(1).
+			GetAll(c, &bugs)
+		if err != nil {
+			return nil, fmt.Errorf("failed to query bugs: %v", err)
+		}
+		if len(bugs) != 0 {
+			bug := bugs[0]
+			if active, err := isActiveBug(c, bug); err != nil {
+				return nil, err
+			} else if active {
+				return bug, nil
+			}
+		}
+	}
+	return nil, nil
 }
 
-func createBugForCrash(c context.Context, ns string, req *dashapi.Crash) (*Bug, *db.Key, error) {
+func findBugForCrash(c context.Context, ns string, titles []string) (*Bug, error) {
+	// First, try to find an existing bug that we already used to report this crash title.
+	bug, err := findExistingBugForCrash(c, ns, titles)
+	if bug != nil || err != nil {
+		return bug, err
+	}
+	// If there is no active bug for this crash title, try to find an existing candidate based on AltTitles.
+	var bugs []*Bug
+	for _, title := range titles {
+		var bugs1 []*Bug
+		_, err := db.NewQuery("Bug").
+			Filter("Namespace=", ns).
+			Filter("AltTitles=", title).
+			GetAll(c, &bugs1)
+		if err != nil {
+			return nil, fmt.Errorf("failed to query bugs: %v", err)
+		}
+		bugs = append(bugs, bugs1...)
+	}
+	// Sort to get determinism and skip inactive bugs.
+	sort.Slice(bugs, func(i, j int) bool {
+		if bugs[i].Title != bugs[j].Title {
+			return bugs[i].Title < bugs[j].Title
+		}
+		return bugs[i].Seq > bugs[j].Seq
+	})
+	var best *Bug
+	bestPrio := 0
+	for i, bug := range bugs {
+		if i != 0 && bugs[i-1].Title == bug.Title {
+			continue // skip inactive bugs
+		}
+		if active, err := isActiveBug(c, bug); err != nil {
+			return nil, err
+		} else if !active {
+			continue
+		}
+		// Generally we should have few candidates (one in most cases).
+		// However, it's possible if e.g. we first get a data race between A<->B,
+		// then a race between C<->D and now we handle a race between B<->D,
+		// it can be merged into any of the previous ones.
+		// The priority here is very basic. The only known case we want to handle is bug title renaming
+		// where we have an active bug with title A, but then A is renamed to B and A is attached as alt title.
+		// In such case we want to merge the new crash into the old one. However, it's also unlikely that
+		// in this case we have any other candidates.
+		// Overall selection algorithm can be arbitrary changed because the selection for existing crashes
+		// is fixed with bug.MergedTitles (stable for existing bugs/crashes).
+		prio := 0
+		if stringInList(titles[1:], bug.Title) {
+			prio = 2
+		} else if stringInList(bug.AltTitles[1:], titles[0]) {
+			prio = 1
+		}
+		if best == nil || prio > bestPrio {
+			best, bestPrio = bug, prio
+		}
+	}
+	return best, nil
+}
+
+func createBugForCrash(c context.Context, ns string, req *dashapi.Crash) (*Bug, error) {
 	var bug *Bug
-	var bugKey *db.Key
 	now := timeNow(c)
 	tx := func(c context.Context) error {
 		for seq := int64(0); ; seq++ {
 			bug = new(Bug)
 			bugHash := bugKeyHash(ns, req.Title, seq)
-			bugKey = db.NewKey(c, "Bug", bugHash, 0, nil)
+			bugKey := db.NewKey(c, "Bug", bugHash, 0, nil)
 			if err := db.Get(c, bugKey, bug); err != nil {
 				if err != db.ErrNoSuchEntity {
 					return fmt.Errorf("failed to get bug: %v", err)
 				}
 				bug = &Bug{
-					Namespace:  ns,
-					Seq:        seq,
-					Title:      req.Title,
-					Status:     BugStatusOpen,
-					NumCrashes: 0,
-					NumRepro:   0,
-					ReproLevel: ReproLevelNone,
-					HasReport:  false,
-					FirstTime:  now,
-					LastTime:   now,
+					Namespace:    ns,
+					Seq:          seq,
+					Title:        req.Title,
+					MergedTitles: []string{req.Title},
+					AltTitles:    req.AltTitles,
+					Status:       BugStatusOpen,
+					NumCrashes:   0,
+					NumRepro:     0,
+					ReproLevel:   ReproLevelNone,
+					HasReport:    false,
+					FirstTime:    now,
+					LastTime:     now,
 				}
 				createBugReporting(bug, config.Namespaces[ns])
-				if bugKey, err = db.Put(c, bugKey, bug); err != nil {
+				if _, err = db.Put(c, bugKey, bug); err != nil {
 					return fmt.Errorf("failed to put new bug: %v", err)
 				}
 				return nil
@@ -1105,9 +1221,9 @@ func createBugForCrash(c context.Context, ns string, req *dashapi.Crash) (*Bug, 
 		XG:       true,
 		Attempts: 30,
 	}); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	return bug, bugKey, nil
+	return bug, nil
 }
 
 func createBugReporting(bug *Bug, cfg *Config) {
@@ -1147,6 +1263,7 @@ func needReproForBug(c context.Context, bug *Bug) bool {
 	return bug.ReproLevel < ReproLevelC &&
 		len(bug.Commits) == 0 &&
 		bug.Title != corruptedReportTitle &&
+		bug.Title != suppressedReportTitle &&
 		config.Namespaces[bug.Namespace].NeedRepro(bug) &&
 		(bug.NumRepro < maxReproPerBug ||
 			bug.ReproLevel == ReproLevelNone &&
@@ -1161,7 +1278,9 @@ func putText(c context.Context, ns, tag string, data []byte, dedup bool) (int64,
 		return 0, nil
 	}
 	const (
-		maxTextLen       = 2 << 20
+		// Kernel crash log is capped at ~1MB, but vm.Diagnose can add more.
+		// These text files usually compress very well.
+		maxTextLen       = 10 << 20
 		maxCompressedLen = 1000 << 10 // datastore entity limit is 1MB
 	)
 	if len(data) > maxTextLen {
@@ -1231,4 +1350,15 @@ func limitLength(s string, max int) string {
 		}
 		max--
 	}
+}
+
+func GetEmails(r dashapi.Recipients, filter dashapi.RecipientType) []string {
+	emails := []string{}
+	for _, user := range r {
+		if user.Type == filter {
+			emails = append(emails, user.Address.Address)
+		}
+	}
+	sort.Strings(emails)
+	return emails
 }

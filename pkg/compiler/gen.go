@@ -296,7 +296,7 @@ func (comp *compiler) layoutStructFields(t *prog.StructType, varlen, packed bool
 		f := field.Type
 		fieldAlign := uint64(1)
 		if !packed {
-			fieldAlign = comp.typeAlign(f)
+			fieldAlign = f.Alignment()
 			if structAlign < fieldAlign {
 				structAlign = fieldAlign
 			}
@@ -424,58 +424,6 @@ func setBitfieldUnitOffset(t prog.Type, v uint64) {
 	*p = v
 }
 
-func (comp *compiler) typeAlign(t0 prog.Type) uint64 {
-	switch t0.Format() {
-	case prog.FormatNative, prog.FormatBigEndian:
-	case prog.FormatStrDec, prog.FormatStrHex, prog.FormatStrOct:
-		return 1
-	default:
-		panic("unknown binary format")
-	}
-	if prog.IsPad(t0) {
-		return 1
-	}
-	switch t := t0.(type) {
-	case *prog.ConstType, *prog.IntType, *prog.LenType, *prog.FlagsType, *prog.ProcType,
-		*prog.CsumType, *prog.PtrType, *prog.VmaType, *prog.ResourceType:
-		align := t0.UnitSize()
-		if align == 8 && comp.target.Int64Alignment != 0 {
-			align = comp.target.Int64Alignment
-		}
-		return align
-	case *prog.BufferType:
-		return 1
-	case *prog.ArrayType:
-		return comp.typeAlign(t.Elem)
-	case *prog.StructType:
-		n := comp.structs[t.TypeName]
-		attrs := comp.parseAttrs(structAttrs, n, n.Attrs)
-		if align := attrs[attrAlign]; align != 0 {
-			return align // overrided by user attribute
-		}
-		if attrs[attrPacked] != 0 {
-			return 1
-		}
-		align := uint64(0)
-		for _, f := range t.Fields {
-			if a := comp.typeAlign(f.Type); align < a {
-				align = a
-			}
-		}
-		return align
-	case *prog.UnionType:
-		align := uint64(0)
-		for _, f := range t.Fields {
-			if a := comp.typeAlign(f.Type); align < a {
-				align = a
-			}
-		}
-		return align
-	default:
-		panic(fmt.Sprintf("unknown type: %#v", t))
-	}
-}
-
 func genPad(size uint64) prog.Field {
 	return prog.Field{
 		Type: &prog.ConstType{
@@ -493,10 +441,28 @@ func (comp *compiler) genFieldArray(fields []*ast.Field, argSizes []uint64) []pr
 	return res
 }
 
+func (comp *compiler) genFieldDir(f *ast.Field) (prog.Dir, bool) {
+	attrs := comp.parseAttrs(fieldAttrs, f, f.Attrs)
+	switch {
+	case attrs[attrIn] != 0:
+		return prog.DirIn, true
+	case attrs[attrOut] != 0:
+		return prog.DirOut, true
+	case attrs[attrInOut] != 0:
+		return prog.DirInOut, true
+	default:
+		return prog.DirIn, false
+	}
+}
+
 func (comp *compiler) genField(f *ast.Field, argSize uint64) prog.Field {
+	dir, hasDir := comp.genFieldDir(f)
+
 	return prog.Field{
-		Name: f.Name.Name,
-		Type: comp.genType(f.Type, argSize),
+		Name:         f.Name.Name,
+		Type:         comp.genType(f.Type, argSize),
+		HasDirection: hasDir,
+		Direction:    dir,
 	}
 }
 

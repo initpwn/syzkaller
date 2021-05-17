@@ -12,22 +12,20 @@ import (
 )
 
 type fuchsia struct {
-	vm   string
 	dir  string
 	repo *git
 }
 
-func newFuchsia(vm, dir string) *fuchsia {
+func newFuchsia(dir string, opts []RepoOpt) *fuchsia {
 	return &fuchsia{
-		vm:   vm,
 		dir:  dir,
-		repo: newGit(dir, nil),
+		repo: newGit(dir, nil, opts),
 	}
 }
 
 func (ctx *fuchsia) Poll(repo, branch string) (*Commit, error) {
 	if repo != "https://fuchsia.googlesource.com" || branch != "master" {
-		// fuchsia ecosystem is hard-tailored to the main repo.
+		// Fuchsia ecosystem is hard-wired to the main repo.
 		return nil, fmt.Errorf("fuchsia: can only check out https://fuchsia.googlesource.com/master")
 	}
 	if _, err := runSandboxed(ctx.dir, "./.jiri_root/bin/jiri", "update"); err != nil {
@@ -88,4 +86,12 @@ func (ctx *fuchsia) ListRecentCommits(baseCommit string) ([]string, error) {
 
 func (ctx *fuchsia) ExtractFixTagsFromCommits(baseCommit, email string) ([]*Commit, error) {
 	return ctx.repo.ExtractFixTagsFromCommits(baseCommit, email)
+}
+
+func (ctx *fuchsia) ReleaseTag(commit string) (string, error) {
+	return "", fmt.Errorf("not implemented for fuchsia")
+}
+
+func (ctx *fuchsia) Contains(commit string) (bool, error) {
+	return false, fmt.Errorf("not implemented for fuchsia")
 }

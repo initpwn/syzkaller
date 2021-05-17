@@ -36,24 +36,18 @@ static long syz_kvm_setup_cpu(volatile long a0, volatile long a1, volatile long 
 	const uintptr_t guest_mem_size = 24 * page_size;
 
 	(void)text_count; // fuzzer can spoof count and we need just 1 text, so ignore text_count
-	int text_type = 0;
-	const void* text = 0;
-	int text_size = 0;
-	NONFAILING(text_type = text_array_ptr[0].typ);
-	NONFAILING(text = text_array_ptr[0].text);
-	NONFAILING(text_size = text_array_ptr[0].size);
+	int text_type = text_array_ptr[0].typ;
+	const void* text = text_array_ptr[0].text;
+	int text_size = text_array_ptr[0].size;
 	(void)text_type;
 	(void)opt_array_ptr;
 
 	uint32 features = 0;
 	if (opt_count > 1)
 		opt_count = 1;
-	uintptr_t i;
-	for (i = 0; i < opt_count; i++) {
-		uint64 typ = 0;
-		uint64 val = 0;
-		NONFAILING(typ = opt_array_ptr[i].typ);
-		NONFAILING(val = opt_array_ptr[i].val);
+	for (uintptr_t i = 0; i < opt_count; i++) {
+		uint64 typ = opt_array_ptr[i].typ;
+		uint64 val = opt_array_ptr[i].val;
 		switch (typ) {
 		case 1:
 			features = val;
@@ -61,7 +55,7 @@ static long syz_kvm_setup_cpu(volatile long a0, volatile long a1, volatile long 
 		}
 	}
 
-	for (i = 0; i < guest_mem_size / page_size; i++) {
+	for (uintptr_t i = 0; i < guest_mem_size / page_size; i++) {
 		struct kvm_userspace_memory_region memreg;
 		memreg.slot = i;
 		memreg.flags = 0; // can be KVM_MEM_LOG_DIRTY_PAGES | KVM_MEM_READONLY
@@ -78,7 +72,7 @@ static long syz_kvm_setup_cpu(volatile long a0, volatile long a1, volatile long 
 
 	if (text_size > 1000)
 		text_size = 1000;
-	NONFAILING(memcpy(host_mem, text, text_size));
+	memcpy(host_mem, text, text_size);
 
 	return 0;
 }

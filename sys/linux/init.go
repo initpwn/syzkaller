@@ -24,6 +24,7 @@ func InitTarget(target *prog.Target) {
 		FIFREEZE:                    target.GetConst("FIFREEZE"),
 		FITHAW:                      target.GetConst("FITHAW"),
 		SNAPSHOT_FREEZE:             target.GetConst("SNAPSHOT_FREEZE"),
+		SNAPSHOT_POWER_OFF:          target.GetConst("SNAPSHOT_POWER_OFF"),
 		EXT4_IOC_SHUTDOWN:           target.GetConst("EXT4_IOC_SHUTDOWN"),
 		EXT4_IOC_RESIZE_FS:          target.GetConst("EXT4_IOC_RESIZE_FS"),
 		EXT4_IOC_MIGRATE:            target.GetConst("EXT4_IOC_MIGRATE"),
@@ -39,6 +40,10 @@ func InitTarget(target *prog.Target) {
 		AF_AX25:                     target.GetConst("AF_AX25"),
 		AF_NETROM:                   target.GetConst("AF_NETROM"),
 		AF_ROSE:                     target.GetConst("AF_ROSE"),
+		AF_IEEE802154:               target.GetConst("AF_IEEE802154"),
+		AF_NETLINK:                  target.GetConst("AF_NETLINK"),
+		SOCK_RAW:                    target.GetConst("SOCK_RAW"),
+		NETLINK_GENERIC:             target.GetConst("NETLINK_GENERIC"),
 		USB_MAJOR:                   target.GetConst("USB_MAJOR"),
 		TIOCSSERIAL:                 target.GetConst("TIOCSSERIAL"),
 		TIOCGSERIAL:                 target.GetConst("TIOCGSERIAL"),
@@ -66,15 +71,6 @@ func InitTarget(target *prog.Target) {
 		"usb_device_descriptor_hid": arch.generateUsbHidDeviceDescriptor,
 	}
 
-	// TODO(dvyukov): get rid of this, this must be in descriptions.
-	target.StringDictionary = []string{
-		"user", "keyring", "trusted", "system", "security", "selinux",
-		"posix_acl_access", "mime_type", "md5sum", "nodev", "self",
-		"bdev", "proc", "cgroup", "cpuset",
-		"lo", "eth0", "eth1", "em0", "em1", "wlan0", "wlan1", "ppp0", "ppp1",
-		"vboxnet0", "vboxnet1", "vmnet0", "vmnet1", "GPL",
-	}
-
 	target.AuxResources = map[string]bool{
 		"uid":       true,
 		"pid":       true,
@@ -87,11 +83,17 @@ func InitTarget(target *prog.Target) {
 	}
 
 	switch target.Arch {
-	case "amd64":
+	case targets.AMD64:
 		target.SpecialPointers = []uint64{
 			0xffffffff81000000, // kernel text
+			0xffffffffff600000, // VSYSCALL_ADDR
 		}
-	case "386", "arm64", "arm", "ppc64le", "mips64le":
+	case targets.RiscV64:
+		target.SpecialPointers = []uint64{
+			0xffffffe000000000, // PAGE_OFFSET
+			0xffffff0000000000, // somewhere in VMEMMAP range
+		}
+	case targets.I386, targets.ARM64, targets.ARM, targets.PPC64LE, targets.MIPS64LE, targets.S390x:
 	default:
 		panic("unknown arch")
 	}
@@ -131,6 +133,7 @@ type arch struct {
 	FIFREEZE                    uint64
 	FITHAW                      uint64
 	SNAPSHOT_FREEZE             uint64
+	SNAPSHOT_POWER_OFF          uint64
 	EXT4_IOC_SHUTDOWN           uint64
 	EXT4_IOC_RESIZE_FS          uint64
 	EXT4_IOC_MIGRATE            uint64
@@ -148,6 +151,10 @@ type arch struct {
 	AF_AX25                     uint64
 	AF_NETROM                   uint64
 	AF_ROSE                     uint64
+	AF_IEEE802154               uint64
+	AF_NETLINK                  uint64
+	SOCK_RAW                    uint64
+	NETLINK_GENERIC             uint64
 	USB_MAJOR                   uint64
 	TIOCSSERIAL                 uint64
 	TIOCGSERIAL                 uint64
@@ -207,8 +214,11 @@ func (arch *arch) neutralize(c *prog.Call) {
 		// Don't let it mess with arbitrary sockets in init namespace.
 		family := c.Args[0].(*prog.ConstArg)
 		switch uint64(uint32(family.Val)) {
-		case arch.AF_NFC, arch.AF_LLC, arch.AF_BLUETOOTH,
+		case arch.AF_NFC, arch.AF_LLC, arch.AF_BLUETOOTH, arch.AF_IEEE802154,
 			arch.AF_X25, arch.AF_AX25, arch.AF_NETROM, arch.AF_ROSE:
+		case arch.AF_NETLINK:
+			c.Args[1].(*prog.ConstArg).Val = arch.SOCK_RAW
+			c.Args[2].(*prog.ConstArg).Val = arch.NETLINK_GENERIC
 		default:
 			family.Val = ^uint64(0)
 		}
@@ -251,6 +261,9 @@ func (arch *arch) neutralizeIoctl(c *prog.Call) {
 	case arch.SNAPSHOT_FREEZE:
 		// SNAPSHOT_FREEZE freezes all processes and leaves the machine dead.
 		cmd.Val = arch.FITHAW
+	case arch.SNAPSHOT_POWER_OFF:
+		// SNAPSHOT_POWER_OFF shuts down the machine.
+		cmd.Val = arch.FITHAW
 	case arch.EXT4_IOC_SHUTDOWN:
 		// EXT4_IOC_SHUTDOWN on root fs effectively brings the machine down in weird ways.
 		// Fortunately, the value does not conflict with any other ioctl commands for now.
@@ -284,6 +297,7 @@ func (arch *arch) generateTimespec(g *prog.Gen, typ0 prog.Type, dir prog.Dir, ol
 	// Note: timespec/timeval can be absolute or relative to now.
 	// Note: executor has blocking syscall timeout of 45 ms,
 	// so we generate both 10ms and 60ms.
+	// TODO(dvyukov): this is now all outdated with tunable timeouts.
 	const (
 		timeout1 = uint64(10)
 		timeout2 = uint64(60)
@@ -297,7 +311,7 @@ func (arch *arch) generateTimespec(g *prog.Gen, typ0 prog.Type, dir prog.Dir, ol
 			prog.MakeResultArg(typ.Fields[1].Type, dir, nil, 0),
 		})
 	case g.NOutOf(1, 3):
-		// Few ms ahead for relative, past for absolute
+		// Few ms ahead for relative, past for absolute.
 		nsec := timeout1 * 1e6
 		if g.NOutOf(1, 2) {
 			nsec = timeout2 * 1e6
@@ -310,7 +324,7 @@ func (arch *arch) generateTimespec(g *prog.Gen, typ0 prog.Type, dir prog.Dir, ol
 			prog.MakeResultArg(typ.Fields[1].Type, dir, nil, nsec),
 		})
 	case g.NOutOf(1, 2):
-		// Unreachable fututre for both relative and absolute
+		// Unreachable fututre for both relative and absolute.
 		arg = prog.MakeGroupArg(typ, dir, []prog.Arg{
 			prog.MakeResultArg(typ.Fields[0].Type, dir, nil, 2e9),
 			prog.MakeResultArg(typ.Fields[1].Type, dir, nil, 0),

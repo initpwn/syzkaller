@@ -24,6 +24,7 @@ var (
 	flagCollide    = flag.Bool("collide", false, "create collide program")
 	flagRepeat     = flag.Int("repeat", 1, "repeat program that many times (<=0 - infinitely)")
 	flagProcs      = flag.Int("procs", 1, "number of parallel processes")
+	flagSlowdown   = flag.Int("slowdown", 1, "execution slowdown caused by emulation/instrumentation")
 	flagSandbox    = flag.String("sandbox", "", "sandbox to use (none, setuid, namespace)")
 	flagProg       = flag.String("prog", "", "file with program to convert (required)")
 	flagFaultCall  = flag.Int("fault_call", -1, "inject fault into this call (0-based)")
@@ -31,6 +32,7 @@ var (
 	flagHandleSegv = flag.Bool("segv", false, "catch and ignore SIGSEGV")
 	flagUseTmpDir  = flag.Bool("tmpdir", false, "create a temporary dir and execute inside it")
 	flagTrace      = flag.Bool("trace", false, "trace syscall results")
+	flagRepro      = flag.Bool("repro", false, "add heartbeats used by pkg/repro")
 	flagStrict     = flag.Bool("strict", false, "parse input program in strict mode")
 	flagLeak       = flag.Bool("leak", false, "do leak checking")
 	flagEnable     = flag.String("enable", "none", "enable only listed additional features")
@@ -53,7 +55,7 @@ func main() {
 	}
 	target, err := prog.GetTarget(*flagOS, *flagArch)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "%v", err)
+		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
 	}
 	data, err := ioutil.ReadFile(*flagProg)
@@ -71,29 +73,33 @@ func main() {
 		os.Exit(1)
 	}
 	opts := csource.Options{
-		Threaded:     *flagThreaded,
-		Collide:      *flagCollide,
-		Repeat:       *flagRepeat != 1,
-		RepeatTimes:  *flagRepeat,
-		Procs:        *flagProcs,
-		Sandbox:      *flagSandbox,
-		Fault:        *flagFaultCall >= 0,
-		FaultCall:    *flagFaultCall,
-		FaultNth:     *flagFaultNth,
-		Leak:         *flagLeak,
-		NetInjection: features["tun"].Enabled,
-		NetDevices:   features["net_dev"].Enabled,
-		NetReset:     features["net_reset"].Enabled,
-		Cgroups:      features["cgroups"].Enabled,
-		BinfmtMisc:   features["binfmt_misc"].Enabled,
-		CloseFDs:     features["close_fds"].Enabled,
-		KCSAN:        features["kcsan"].Enabled,
-		DevlinkPCI:   features["devlink_pci"].Enabled,
-		USB:          features["usb"].Enabled,
-		UseTmpDir:    *flagUseTmpDir,
-		HandleSegv:   *flagHandleSegv,
-		Repro:        false,
-		Trace:        *flagTrace,
+		Threaded:      *flagThreaded,
+		Collide:       *flagCollide,
+		Repeat:        *flagRepeat != 1,
+		RepeatTimes:   *flagRepeat,
+		Procs:         *flagProcs,
+		Slowdown:      *flagSlowdown,
+		Sandbox:       *flagSandbox,
+		Fault:         *flagFaultCall >= 0,
+		FaultCall:     *flagFaultCall,
+		FaultNth:      *flagFaultNth,
+		Leak:          *flagLeak,
+		NetInjection:  features["tun"].Enabled,
+		NetDevices:    features["net_dev"].Enabled,
+		NetReset:      features["net_reset"].Enabled,
+		Cgroups:       features["cgroups"].Enabled,
+		BinfmtMisc:    features["binfmt_misc"].Enabled,
+		CloseFDs:      features["close_fds"].Enabled,
+		KCSAN:         features["kcsan"].Enabled,
+		DevlinkPCI:    features["devlink_pci"].Enabled,
+		USB:           features["usb"].Enabled,
+		VhciInjection: features["vhci"].Enabled,
+		Wifi:          features["wifi"].Enabled,
+		IEEE802154:    features["ieee802154"].Enabled,
+		UseTmpDir:     *flagUseTmpDir,
+		HandleSegv:    *flagHandleSegv,
+		Repro:         *flagRepro,
+		Trace:         *flagTrace,
 	}
 	src, err := csource.Write(p, opts)
 	if err != nil {

@@ -26,7 +26,13 @@ static void os_init(int argc, char** argv, void* data, size_t data_size)
 	int prot = PROT_READ | PROT_WRITE | PROT_EXEC;
 #endif
 
-	if (mmap(data, data_size, prot, MAP_ANON | MAP_PRIVATE | MAP_FIXED, -1, 0) != data)
+	int flags = MAP_ANON | MAP_PRIVATE | MAP_FIXED;
+#if GOOS_freebsd
+	// Fail closed if the chosen data offset conflicts with an existing mapping.
+	flags |= MAP_EXCL;
+#endif
+
+	if (mmap(data, data_size, prot, flags, -1, 0) != data)
 		fail("mmap of data segment failed");
 
 	// Makes sure the file descriptor limit is sufficient to map control pipes.
@@ -55,27 +61,44 @@ static void cover_open(cover_t* cov, bool extra)
 	if (fd == -1)
 		fail("open of /dev/kcov failed");
 	if (dup2(fd, cov->fd) < 0)
-		fail("failed to dup2(%d, %d) cover fd", fd, cov->fd);
+		failmsg("failed to dup cover fd", "from=%d, to=%d", fd, cov->fd);
 	close(fd);
 
 #if GOOS_freebsd
 	if (ioctl(cov->fd, KIOSETBUFSIZE, kCoverSize))
 		fail("ioctl init trace write failed");
+	size_t mmap_alloc_size = kCoverSize * KCOV_ENTRY_SIZE;
 #elif GOOS_openbsd
 	unsigned long cover_size = kCoverSize;
 	if (ioctl(cov->fd, KIOSETBUFSIZE, &cover_size))
 		fail("ioctl init trace write failed");
+	if (extra) {
+		struct kio_remote_attach args;
+		args.subsystem = KCOV_REMOTE_COMMON;
+		args.id = 0;
+		if (ioctl(cov->fd, KIOREMOTEATTACH, &args))
+			fail("ioctl remote attach failed");
+	}
+	size_t mmap_alloc_size = kCoverSize * (is_kernel_64_bit ? 8 : 4);
 #elif GOOS_netbsd
-	uint64_t cover_size = kCoverSize;
-	if (ioctl(cov->fd, KCOV_IOC_SETBUFSIZE, &cover_size))
-		fail("ioctl init trace write failed");
+	uint64_t cover_size;
+	if (extra) {
+		// USB coverage, the size is fixed to the maximum
+		cover_size = (256 << 10); // maximum size
+		struct kcov_ioc_remote_attach args;
+		args.subsystem = KCOV_REMOTE_VHCI;
+		args.id = KCOV_REMOTE_VHCI_ID(procid, 1); // first port
+		if (ioctl(cov->fd, KCOV_IOC_REMOTE_ATTACH, &args))
+			fail("ioctl remote attach failed");
+	} else {
+		// Normal coverage
+		cover_size = kCoverSize;
+		if (ioctl(cov->fd, KCOV_IOC_SETBUFSIZE, &cover_size))
+			fail("ioctl init trace write failed");
+	}
+	size_t mmap_alloc_size = cover_size * KCOV_ENTRY_SIZE;
 #endif
 
-#if GOOS_freebsd || GOOS_netbsd
-	size_t mmap_alloc_size = kCoverSize * KCOV_ENTRY_SIZE;
-#else
-	size_t mmap_alloc_size = kCoverSize * (is_kernel_64_bit ? 8 : 4);
-#endif
 	void* mmap_ptr = mmap(NULL, mmap_alloc_size, PROT_READ | PROT_WRITE,
 			      MAP_SHARED, cov->fd, 0);
 	if (mmap_ptr == MAP_FAILED)
@@ -86,7 +109,7 @@ static void cover_open(cover_t* cov, bool extra)
 
 static void cover_protect(cover_t* cov)
 {
-#if GOOS_freebsd || GOOS_netbsd
+#if GOOS_freebsd
 	size_t mmap_alloc_size = kCoverSize * KCOV_ENTRY_SIZE;
 	long page_size = sysconf(_SC_PAGESIZE);
 	if (page_size > 0)
@@ -94,20 +117,18 @@ static void cover_protect(cover_t* cov)
 			 PROT_READ);
 #elif GOOS_openbsd
 	int mib[2], page_size;
-	size_t len;
 	size_t mmap_alloc_size = kCoverSize * sizeof(uintptr_t);
 	mib[0] = CTL_HW;
 	mib[1] = HW_PAGESIZE;
-	len = sizeof(page_size);
+	size_t len = sizeof(page_size);
 	if (sysctl(mib, ARRAY_SIZE(mib), &page_size, &len, NULL, 0) != -1)
-		mprotect(cov->data + page_size, mmap_alloc_size - page_size,
-			 PROT_READ);
+		mprotect(cov->data + page_size, mmap_alloc_size - page_size, PROT_READ);
 #endif
 }
 
 static void cover_unprotect(cover_t* cov)
 {
-#if GOOS_freebsd || GOOS_netbsd
+#if GOOS_freebsd
 	size_t mmap_alloc_size = kCoverSize * KCOV_ENTRY_SIZE;
 	mprotect(cov->data, mmap_alloc_size, PROT_READ | PROT_WRITE);
 #elif GOOS_openbsd
@@ -125,12 +146,15 @@ static void cover_enable(cover_t* cov, bool collect_comps, bool extra)
 		exitf("cover enable write trace failed, mode=%d", kcov_mode);
 #elif GOOS_openbsd
 	// OpenBSD uses an pointer to an int as the third argument.
+	// Whether it is a regular coverage or an extra coverage, the enable
+	// ioctl is the same.
 	if (ioctl(cov->fd, KIOENABLE, &kcov_mode))
 		exitf("cover enable write trace failed, mode=%d", kcov_mode);
 #elif GOOS_netbsd
+	// Whether it is a regular coverage or a USB coverage, the enable
+	// ioctl is the same.
 	if (ioctl(cov->fd, KCOV_IOC_ENABLE, &kcov_mode))
 		exitf("cover enable write trace failed, mode=%d", kcov_mode);
-
 #endif
 }
 
@@ -144,15 +168,22 @@ static void cover_collect(cover_t* cov)
 	cov->size = *(uint64*)cov->data;
 }
 
-static bool cover_check(uint32 pc)
-{
-	return true;
-}
-
-static bool cover_check(uint64 pc)
+static bool use_cover_edges(uint64 pc)
 {
 	return true;
 }
 #else
 #include "nocover.h"
+#endif
+
+#if GOOS_netbsd
+#define SYZ_HAVE_FEATURES 1
+static feature_t features[] = {
+    {"usb", setup_usb},
+    {"fault", setup_fault},
+};
+
+static void setup_sysctl(void)
+{
+}
 #endif

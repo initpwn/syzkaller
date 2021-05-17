@@ -18,6 +18,7 @@ import (
 	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/pkg/vcs"
 	"github.com/google/syzkaller/prog"
+	"github.com/google/syzkaller/sys/targets"
 )
 
 const (
@@ -72,6 +73,7 @@ func NewSyzUpdater(cfg *Config) *SyzUpdater {
 		"tag":             true, // contains syzkaller repo git hash
 		"bin/syz-ci":      true, // these are just copied from syzkaller dir
 		"bin/syz-manager": true,
+		"sys/*/test/*":    true,
 	}
 	targets := make(map[string]bool)
 	for _, mgr := range cfg.Managers {
@@ -80,7 +82,9 @@ func NewSyzUpdater(cfg *Config) *SyzUpdater {
 		targets[os+"/"+vmarch+"/"+arch] = true
 		files[fmt.Sprintf("bin/%v_%v/syz-fuzzer", os, vmarch)] = true
 		files[fmt.Sprintf("bin/%v_%v/syz-execprog", os, vmarch)] = true
-		files[fmt.Sprintf("bin/%v_%v/syz-executor", os, arch)] = true
+		if mgrcfg.SysTarget.ExecutorBin == "" {
+			files[fmt.Sprintf("bin/%v_%v/syz-executor", os, arch)] = true
+		}
 	}
 	syzFiles := make(map[string]bool)
 	for f := range files {
@@ -138,6 +142,11 @@ func (upd *SyzUpdater) UpdateOnStart(autoupdate bool, shutdown chan struct{}) {
 
 	// No syzkaller build or executable is stale.
 	lastCommit := prog.GitRevisionBase
+	if lastCommit != latestTag {
+		// Latest build and syz-ci are inconsistent. Rebuild everything.
+		lastCommit = ""
+		latestTag = ""
+	}
 	for {
 		lastCommit = upd.pollAndBuild(lastCommit)
 		latestTag := upd.checkLatest()
@@ -201,18 +210,24 @@ func (upd *SyzUpdater) pollAndBuild(lastCommit string) string {
 		return lastCommit
 	}
 	log.Logf(0, "syzkaller: poll: %v (%v)", commit.Hash, commit.Title)
-	if lastCommit != commit.Hash {
-		log.Logf(0, "syzkaller: building ...")
-		lastCommit = commit.Hash
-		if err := upd.build(commit); err != nil {
-			log.Logf(0, "syzkaller: %v", err)
-			upd.uploadBuildError(commit, err)
-		}
+	if lastCommit == commit.Hash {
+		return lastCommit
 	}
-	return lastCommit
+	log.Logf(0, "syzkaller: building ...")
+	if err := upd.build(commit); err != nil {
+		log.Logf(0, "syzkaller: %v", err)
+		upd.uploadBuildError(commit, err)
+	}
+	return commit.Hash
 }
 
 func (upd *SyzUpdater) build(commit *vcs.Commit) error {
+	// syzkaller testing may be slowed down by concurrent kernel builds too much
+	// and cause timeout failures, so we serialize it with other builds:
+	// https://groups.google.com/forum/#!msg/syzkaller-openbsd-bugs/o-G3vEsyQp4/f_nFpoNKBQAJ
+	kernelBuildSem <- struct{}{}
+	defer func() { <-kernelBuildSem }()
+
 	if upd.descriptions != "" {
 		files, err := ioutil.ReadDir(upd.descriptions)
 		if err != nil {
@@ -220,7 +235,7 @@ func (upd *SyzUpdater) build(commit *vcs.Commit) error {
 		}
 		for _, f := range files {
 			src := filepath.Join(upd.descriptions, f.Name())
-			dst := filepath.Join(upd.syzkallerDir, "sys", "linux", f.Name())
+			dst := filepath.Join(upd.syzkallerDir, "sys", targets.Linux, f.Name())
 			if err := osutil.CopyFile(src, dst); err != nil {
 				return err
 			}
@@ -298,7 +313,7 @@ func (upd *SyzUpdater) uploadBuildError(commit *vcs.Commit, buildErr error) {
 				Arch:                managercfg.TargetArch,
 				VMArch:              managercfg.TargetVMArch,
 				SyzkallerCommit:     commit.Hash,
-				SyzkallerCommitDate: commit.Date,
+				SyzkallerCommitDate: commit.CommitDate,
 				CompilerID:          upd.compilerID,
 				KernelRepo:          upd.repoAddress,
 				KernelBranch:        upd.branch,

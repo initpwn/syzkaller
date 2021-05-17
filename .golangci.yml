@@ -34,9 +34,32 @@ linters:
     - megacheck
     - stylecheck
     - govet
+    - whitespace
+    - nestif
+    - goprintffuncname
+    - godot
+    - gocognit
+    - funlen
+    - dupl
+    - staticcheck
+    - syz-linter
   disable:
+    - bodyclose
+    - depguard
+    - dogsled
+    - gochecknoglobals
+    - gochecknoinits
+    - godox
+    - goimports
+    - gomnd
+    - gomodguard
+    - gosec
+    - maligned
+    - rowserrcheck
+    - testpackage
     - typecheck
     - ineffassign
+    # errcheck would be good to enable, but we need to fix existing warnings first.
     - errcheck
     - interfacer
     - unparam
@@ -44,17 +67,34 @@ linters:
     - prealloc
     - scopelint
     - gocritic
+    - wsl
 
 linters-settings:
   lll:
     line-length: 120
   gocyclo:
+    # TODO: consider reducing this value.
     min-complexity: 24
   dupl:
     threshold: 60
   goconst:
-    min-len: 7
-    min-occurrences: 4
+    min-len: 3
+    min-occurrences: 3
+  nestif:
+    # TODO: consider reducing this value.
+    min-complexity: 12
+  godot:
+    check-all: true
+  gocognit:
+    # TODO: consider reducing this value.
+    min-complexity: 70
+  funlen:
+    # TODO: consider reducing these value.
+    lines: 140
+    statements: 80
+  custom:
+    syz-linter:
+      path: bin/syz-linter.so
 
 issues:
   exclude-use-default: false
@@ -62,14 +102,23 @@ issues:
   exclude:
     - "exported .* should have comment"
     - "comment on .* should be of the form"
-    - "declaration of \"err\" shadows"
-    - "should not use ALL_CAPS in Go names"
     - "at least one file in a package should have a package comment"
-    - "methods on the same type should have the same receiver name"
-    - "assigning the result of this type assertion to a variable"
+    # This check gives false positives related to the standard log.Fatalf
+    # (which is strange, standard log package should be supported).#
+    - "SA5011: possible nil pointer dereference"
   exclude-rules:
-    - path: (pkg/csource/generated.go|pkg/report/linux.go|pkg/build/linux_generated.go)
+    - path: (pkg/csource/generated.go|pkg/build/linux_generated.go)
       linters:
         - lll
     - path: (sys/.*/init.*|sys/targets/common.go)
-      text: "don't use ALL_CAPS in Go names"
+      text: "don't use ALL_CAPS in Go names|should not use ALL_CAPS in Go names"
+    - path: (prog/.*)
+      text: "methods on the same type should have the same receiver name"
+    - path: (dashboard/app/.*_test\.go)
+      linters:
+        - dupl
+    - path: (prog/.*_test\.go)
+      linters:
+        - goconst
+    - path: (.*_test\.go)
+      text: "Function '.*' is too long"

@@ -16,6 +16,7 @@ import (
 	"github.com/google/syzkaller/dashboard/dashapi"
 	"github.com/google/syzkaller/pkg/bisect"
 	"github.com/google/syzkaller/pkg/build"
+	"github.com/google/syzkaller/pkg/debugtracer"
 	"github.com/google/syzkaller/pkg/instance"
 	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/pkg/mgrconfig"
@@ -23,10 +24,6 @@ import (
 	"github.com/google/syzkaller/pkg/report"
 	"github.com/google/syzkaller/pkg/vcs"
 	"github.com/google/syzkaller/vm"
-)
-
-const (
-	commitPollPeriod = time.Hour
 )
 
 type JobProcessor struct {
@@ -56,9 +53,10 @@ func newJobProcessor(cfg *Config, managers []*Manager, stop, shutdownPending cha
 }
 
 func (jp *JobProcessor) loop() {
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
-	var lastCommitPoll time.Time
+	jobTicker := time.NewTicker(time.Duration(jp.cfg.JobPollPeriod) * time.Second)
+	commitTicker := time.NewTicker(time.Duration(jp.cfg.CommitPollPeriod) * time.Second)
+	defer jobTicker.Stop()
+	defer commitTicker.Stop()
 loop:
 	for {
 		// Check jp.stop separately first, otherwise if stop signal arrives during a job execution,
@@ -69,17 +67,15 @@ loop:
 		default:
 		}
 		select {
-		case <-ticker.C:
+		case <-jobTicker.C:
 			if len(kernelBuildSem) != 0 {
 				// If normal kernel build is in progress (usually on start), don't query jobs.
 				// Otherwise we claim a job, but can't start it for a while.
 				continue loop
 			}
 			jp.pollJobs()
-			if time.Since(lastCommitPoll) > commitPollPeriod {
-				jp.pollCommits()
-				lastCommitPoll = time.Now()
-			}
+		case <-commitTicker.C:
+			jp.pollCommits()
 		case <-jp.stop:
 			break loop
 		}
@@ -192,7 +188,7 @@ func (jp *JobProcessor) getCommitInfo(mgr *Manager, URL, branch string, commits 
 		return nil, err
 	}
 	for _, title := range missing {
-		log.Logf(0, "did not find commit %q", title)
+		log.Logf(0, "did not find commit %q in kernel repo %v/%v", title, URL, branch)
 	}
 	return results, nil
 }
@@ -367,23 +363,56 @@ func (jp *JobProcessor) bisect(job *Job, mgrcfg *mgrconfig.Config) error {
 
 	// Hack: if the manager has only, say, 5 VMs, but bisect wants 10, try to override number of VMs to 10.
 	// OverrideVMCount is opportunistic and should do it only if it's safe.
-	if err := instance.OverrideVMCount(mgrcfg, bisect.NumTests); err != nil {
+	if err := instance.OverrideVMCount(mgrcfg, bisect.MaxNumTests); err != nil {
 		return err
+	}
+
+	var baseline []byte
+	// Read possible baseline for config minimization.
+	if mgr.mgrcfg.KernelBaselineConfig != "" {
+		var err error
+		baseline, err = ioutil.ReadFile(mgr.mgrcfg.KernelBaselineConfig)
+		if err != nil {
+			return fmt.Errorf("failed to read baseline config: %v", err)
+		}
 	}
 	trace := new(bytes.Buffer)
 	cfg := &bisect.Config{
-		Trace:    io.MultiWriter(trace, log.VerboseWriter(3)),
-		DebugDir: osutil.Abs(filepath.Join("jobs", "debug", strings.Replace(req.ID, "|", "_", -1))),
-		Fix:      req.Type == dashapi.JobBisectFix,
-		BinDir:   jp.cfg.BisectBinDir,
+		Trace: &debugtracer.GenericTracer{
+			TraceWriter: io.MultiWriter(trace, log.VerboseWriter(3)),
+			OutDir:      osutil.Abs(filepath.Join("jobs", "debug", strings.Replace(req.ID, "|", "_", -1))),
+		},
+		// Out of 1049 cause bisections that we have now:
+		// -  891 finished under  6h (84.9%)
+		// -  957 finished under  8h (91.2%)
+		// -  980 finished under 10h (93.4%)
+		// -  989 finished under 12h (94.3%)
+		// - 1011 finished under 18h (96.3%)
+		// - 1025 finished under 24h (97.7%)
+		// There is also a significant increase in errors/inconclusive bisections after ~8h.
+		// Out of 4075 fix bisections:
+		// - 4015 finished under  6h (98.5%)
+		// - 4020 finished under  8h (98.7%)
+		// - 4026 finished under 10h (98.8%)
+		// - 4032 finished under 12h (98.9%)
+		// Significant increase in errors starts after ~12h.
+		// The current timeout also take into account that bisection jobs
+		// compete with patch testing jobs (it's bad delaying patch testing).
+		// When/if bisection jobs don't compete with patch testing,
+		// it makes sense to increase this to 12-24h.
+		Timeout: 8 * time.Hour,
+		Fix:     req.Type == dashapi.JobBisectFix,
+		BinDir:  jp.cfg.BisectBinDir,
+		Ccache:  jp.cfg.Ccache,
 		Kernel: bisect.KernelConfig{
-			Repo:      mgr.mgrcfg.Repo,
-			Branch:    mgr.mgrcfg.Branch,
-			Commit:    req.KernelCommit,
-			Cmdline:   mgr.mgrcfg.KernelCmdline,
-			Sysctl:    mgr.mgrcfg.KernelSysctl,
-			Config:    req.KernelConfig,
-			Userspace: mgr.mgrcfg.Userspace,
+			Repo:           mgr.mgrcfg.Repo,
+			Branch:         mgr.mgrcfg.Branch,
+			Commit:         req.KernelCommit,
+			Cmdline:        mgr.mgrcfg.KernelCmdline,
+			Sysctl:         mgr.mgrcfg.KernelSysctl,
+			Config:         req.KernelConfig,
+			BaselineConfig: baseline,
+			Userspace:      mgr.mgrcfg.Userspace,
 		},
 		Syzkaller: bisect.SyzkallerConfig{
 			Repo:   jp.syzkallerRepo,
@@ -394,7 +423,7 @@ func (jp *JobProcessor) bisect(job *Job, mgrcfg *mgrconfig.Config) error {
 			Syz:  req.ReproSyz,
 			C:    req.ReproC,
 		},
-		Manager: *mgrcfg,
+		Manager: mgrcfg,
 	}
 
 	res, err := bisect.Run(cfg)
@@ -408,7 +437,7 @@ func (jp *JobProcessor) bisect(job *Job, mgrcfg *mgrconfig.Config) error {
 			Title:      com.Title,
 			Author:     com.Author,
 			AuthorName: com.AuthorName,
-			CC:         com.CC,
+			Recipients: com.Recipients.ToDash(),
 			Date:       com.Date,
 		})
 	}
@@ -422,18 +451,29 @@ func (jp *JobProcessor) bisect(job *Job, mgrcfg *mgrconfig.Config) error {
 		if res.IsRelease {
 			resp.Flags |= dashapi.BisectResultRelease
 		}
+		ignoredCommits := []string{
+			// Commit "usb: gadget: add raw-gadget interface" adds a kernel interface for
+			// triggering USB bugs, which ends up being the guilty commit during bisection
+			// for USB bugs introduced before it.
+			"f2c2e717642c66f7fe7e5dd69b2e8ff5849f4d10",
+		}
+		for _, commit := range ignoredCommits {
+			if res.Commits[0].Hash == commit {
+				resp.Flags |= dashapi.BisectResultIgnore
+			}
+		}
 	}
 	if res.Report != nil {
 		resp.CrashTitle = res.Report.Title
 		resp.CrashReport = res.Report.Report
 		resp.CrashLog = res.Report.Output
 		if len(resp.Commits) != 0 {
-			resp.Commits[0].CC = append(resp.Commits[0].CC, res.Report.Maintainers...)
+			resp.Commits[0].Recipients = append(resp.Commits[0].Recipients, res.Report.Recipients.ToDash()...)
 		} else {
-			// If there is a report ahd there is no commit, it means a crash
+			// If there is a report and there is no commit, it means a crash
 			// occurred on HEAD(for BisectFix) and oldest tested release(for BisectCause).
 			resp.Build.KernelCommit = res.Commit.Hash
-			resp.Build.KernelCommitDate = res.Commit.Date
+			resp.Build.KernelCommitDate = res.Commit.CommitDate
 			resp.Build.KernelCommitTitle = res.Commit.Title
 		}
 	}
@@ -474,7 +514,7 @@ func (jp *JobProcessor) testPatch(job *Job, mgrcfg *mgrconfig.Config) error {
 	}
 	resp.Build.KernelCommit = kernelCommit.Hash
 	resp.Build.KernelCommitTitle = kernelCommit.Title
-	resp.Build.KernelCommitDate = kernelCommit.Date
+	resp.Build.KernelCommitDate = kernelCommit.CommitDate
 
 	if err := build.Clean(mgrcfg.TargetOS, mgrcfg.TargetVMArch, mgrcfg.Type, mgrcfg.KernelSrc); err != nil {
 		return fmt.Errorf("kernel clean failed: %v", err)
@@ -485,9 +525,20 @@ func (jp *JobProcessor) testPatch(job *Job, mgrcfg *mgrconfig.Config) error {
 		}
 	}
 
+	// Disable CONFIG_DEBUG_INFO_BTF in the config.
+	// DEBUG_INFO_BTF requires a very new pahole binary, which we don't have on syzbot instances.
+	// Currently we don't enable DEBUG_INFO_BTF, but we have some old bugs with DEBUG_INFO_BTF enabled
+	// (at the time requirements for pahole binary were lower, or maybe the config silently disabled itself).
+	// Testing of patches for these bugs fail now because of the config, so we disable it as a work-around.
+	// Ideally we have a new pahole and then we can remove this hack. That's issue #2096.
+	// pkg/vcs/linux.go also disables it for the bisection process.
+	req.KernelConfig = bytes.Replace(req.KernelConfig,
+		[]byte("CONFIG_DEBUG_INFO_BTF=y"),
+		[]byte("# CONFIG_DEBUG_INFO_BTF is not set"), -1)
+
 	log.Logf(0, "job: building kernel...")
-	kernelConfig, _, err := env.BuildKernel(mgr.mgrcfg.Compiler, mgr.mgrcfg.Userspace, mgr.mgrcfg.KernelCmdline,
-		mgr.mgrcfg.KernelSysctl, req.KernelConfig)
+	kernelConfig, _, err := env.BuildKernel(mgr.mgrcfg.Compiler, mgr.mgrcfg.Ccache, mgr.mgrcfg.Userspace,
+		mgr.mgrcfg.KernelCmdline, mgr.mgrcfg.KernelSysctl, req.KernelConfig)
 	if err != nil {
 		return err
 	}

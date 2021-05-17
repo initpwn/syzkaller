@@ -11,6 +11,7 @@ import (
 	"github.com/google/syzkaller/pkg/hash"
 	"github.com/google/syzkaller/pkg/signal"
 	"github.com/google/syzkaller/prog"
+	"github.com/google/syzkaller/sys/targets"
 )
 
 type InputTest struct {
@@ -22,7 +23,7 @@ type InputTest struct {
 func TestChooseProgram(t *testing.T) {
 	rs := rand.NewSource(0)
 	r := rand.New(rs)
-	target := getTarget(t, "test", "64")
+	target := getTarget(t, targets.TestOS, targets.TestArch64)
 	fuzzer := &Fuzzer{corpusHashes: make(map[hash.Sig]struct{})}
 
 	const (
@@ -56,7 +57,7 @@ func TestChooseProgram(t *testing.T) {
 }
 
 func TestAddInputConcurrency(t *testing.T) {
-	target := getTarget(t, "test", "64")
+	target := getTarget(t, targets.TestOS, targets.TestArch64)
 	fuzzer := &Fuzzer{corpusHashes: make(map[hash.Sig]struct{})}
 
 	const (
@@ -78,7 +79,7 @@ func TestAddInputConcurrency(t *testing.T) {
 	}
 }
 
-func generateInput(target *prog.Target, rs rand.Source, ncalls int, sizeSig int) (inp InputTest) {
+func generateInput(target *prog.Target, rs rand.Source, ncalls, sizeSig int) (inp InputTest) {
 	inp.p = target.Generate(rs, ncalls, target.DefaultChoiceTable())
 	var raw []uint32
 	for i := 1; i <= sizeSig; i++ {

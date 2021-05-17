@@ -19,11 +19,6 @@ import (
 )
 
 const (
-	linux   = "linux"
-	freebsd = "freebsd"
-	openbsd = "openbsd"
-	netbsd  = "netbsd"
-
 	sandboxNone      = "none"
 	sandboxSetuid    = "setuid"
 	sandboxNamespace = "namespace"
@@ -42,8 +37,15 @@ func createCommonHeader(p, mmapProg *prog.Prog, replacements map[string]string, 
 	stdout := new(bytes.Buffer)
 	cmd.Stderr = stderr
 	cmd.Stdout = stdout
+	// Note: we ignore error because we pass -nostdinc so there are lots of errors of the form:
+	//	error: no include path in which to search for stdlib.h
+	// This is exactly what we want: we don't want these to be included into the C reproducer.
+	// But the downside is that we can miss some real errors, e.g.:
+	//	error: missing binary operator before token "SYZ_SANDBOX_ANDROID"
+	//	3776 | #if not SYZ_SANDBOX_ANDROID
+	// Potentially we could analyze errors manually and ignore only the expected ones.
 	if err := cmd.Run(); len(stdout.Bytes()) == 0 {
-		return nil, fmt.Errorf("cpp failed: %v\n%v\n%v", err, stdout.String(), stderr.String())
+		return nil, fmt.Errorf("cpp failed: %v %v: %v\n%v\n%v", cmd.Path, cmd.Args, err, stdout.String(), stderr.String())
 	}
 
 	src, err := removeSystemDefines(stdout.Bytes(), defines)
@@ -52,7 +54,7 @@ func createCommonHeader(p, mmapProg *prog.Prog, replacements map[string]string, 
 	}
 
 	for from, to := range replacements {
-		src = bytes.Replace(src, []byte("/*"+from+"*/"), []byte(to), -1)
+		src = bytes.Replace(src, []byte("/*{{{"+from+"}}}*/"), []byte(to), -1)
 	}
 
 	for from, to := range map[string]string{
@@ -113,10 +115,14 @@ func commonDefines(p *prog.Prog, opts Options) map[string]bool {
 		"SYZ_KCSAN":                     opts.KCSAN,
 		"SYZ_DEVLINK_PCI":               opts.DevlinkPCI,
 		"SYZ_USB":                       opts.USB,
+		"SYZ_VHCI_INJECTION":            opts.VhciInjection,
 		"SYZ_USE_TMP_DIR":               opts.UseTmpDir,
 		"SYZ_HANDLE_SEGV":               opts.HandleSegv,
 		"SYZ_REPRO":                     opts.Repro,
 		"SYZ_TRACE":                     opts.Trace,
+		"SYZ_WIFI":                      opts.Wifi,
+		"SYZ_802154":                    opts.IEEE802154,
+		"SYZ_SYSCTL":                    opts.Sysctl,
 		"SYZ_EXECUTOR_USES_SHMEM":       sysTarget.ExecutorUsesShmem,
 		"SYZ_EXECUTOR_USES_FORK_SERVER": sysTarget.ExecutorUsesForkServer,
 	}

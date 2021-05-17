@@ -9,20 +9,33 @@
 #define USB_MAX_EP_NUM 32
 #define USB_MAX_FDS 6
 
+struct usb_endpoint_index {
+	// Copy of the endpoint descriptor:
+	struct usb_endpoint_descriptor desc;
+	// Raw Gadget endpoint handle used for this endpoint (Linux only):
+	int handle;
+};
+
 struct usb_iface_index {
+	// Pointer to where the original interface descriptor is stored:
 	struct usb_interface_descriptor* iface;
+	// Cached copied of some of the interface attributes:
 	uint8 bInterfaceNumber;
 	uint8 bAlternateSetting;
 	uint8 bInterfaceClass;
-	struct usb_endpoint_descriptor eps[USB_MAX_EP_NUM];
+	// Endpoint indexes:
+	struct usb_endpoint_index eps[USB_MAX_EP_NUM];
 	int eps_num;
 };
 
 struct usb_device_index {
+	// Pointer to where the original descriptors are stored:
 	struct usb_device_descriptor* dev;
 	struct usb_config_descriptor* config;
+	// Cached copied of some of the device attributes:
 	uint8 bDeviceClass;
 	uint8 bMaxPower;
+	// Config and interface attributes/indexes:
 	int config_length;
 	struct usb_iface_index ifaces[USB_MAX_IFACE_NUM];
 	int ifaces_num;
@@ -75,7 +88,7 @@ static bool parse_usb_descriptor(const char* buffer, size_t length, struct usb_d
 			struct usb_iface_index* iface = &index->ifaces[index->ifaces_num - 1];
 			debug("parse_usb_descriptor: found endpoint #%u at %p\n", iface->eps_num, buffer + offset);
 			if (iface->eps_num < USB_MAX_EP_NUM) {
-				memcpy(&iface->eps[iface->eps_num], buffer + offset, sizeof(iface->eps[iface->eps_num]));
+				memcpy(&iface->eps[iface->eps_num].desc, buffer + offset, sizeof(iface->eps[iface->eps_num].desc));
 				iface->eps_num++;
 			}
 		}
@@ -94,9 +107,7 @@ static struct usb_device_index* add_usb_index(int fd, const char* dev, size_t de
 	if (i >= USB_MAX_FDS)
 		return NULL;
 
-	int rv = 0;
-	NONFAILING(rv = parse_usb_descriptor(dev, dev_len, &usb_devices[i].index));
-	if (!rv)
+	if (!parse_usb_descriptor(dev, dev_len, &usb_devices[i].index))
 		return NULL;
 
 	__atomic_store_n(&usb_devices[i].fd, fd, __ATOMIC_RELEASE);
@@ -105,8 +116,7 @@ static struct usb_device_index* add_usb_index(int fd, const char* dev, size_t de
 
 static struct usb_device_index* lookup_usb_index(int fd)
 {
-	int i;
-	for (i = 0; i < USB_MAX_FDS; i++) {
+	for (int i = 0; i < USB_MAX_FDS; i++) {
 		if (__atomic_load_n(&usb_devices[i].fd, __ATOMIC_ACQUIRE) == fd) {
 			return &usb_devices[i].index;
 		}
@@ -168,6 +178,8 @@ const char* usb_class_to_string(unsigned value)
 	return "unknown";
 }
 
+// A helper function that allows to see what kind of device is being emulated.
+// Useful for debugging.
 static void analyze_usb_device(struct usb_device_index* index)
 {
 	debug("analyze_usb_device: idVendor = %04x\n", (unsigned)index->dev->idVendor);
@@ -497,6 +509,8 @@ static bool analyze_control_request_vendor(struct usb_device_index* index, struc
 	return true;
 }
 
+// A helper function that prints a request in readable form and returns whether descriptions for this
+// request exist. Needs to be updated manually when new descriptions are added. Useful for debugging.
 static void analyze_control_request(int fd, struct usb_ctrlrequest* ctrl)
 {
 	struct usb_device_index* index = lookup_usb_index(fd);
@@ -560,7 +574,7 @@ static const char default_lang_id[] = {
 // lookup_connect_response_in() is a helper function that returns a response to a USB IN request
 // based on syzkaller-generated arguments provided to syz_usb_connect* pseudo-syscalls. The data
 // and its length to be used as a response are returned in *response_data and *response_length.
-// The return value of this function indicates whether the request is known to syzkaller.
+// The return value of this function lookup_connect_response_inindicates whether the request is known to syzkaller.
 
 static bool lookup_connect_response_in(int fd, const struct vusb_connect_descriptors* descs,
 				       const struct usb_ctrlrequest* ctrl,
@@ -636,7 +650,7 @@ static bool lookup_connect_response_in(int fd, const struct vusb_connect_descrip
 		break;
 	}
 
-	fail("lookup_connect_response_in: unknown request");
+	debug("lookup_connect_response_in: unknown request");
 	return false;
 }
 
@@ -662,12 +676,12 @@ static bool lookup_connect_response_out_generic(int fd, const struct vusb_connec
 		break;
 	}
 
-	fail("lookup_connect_response_out: unknown request");
+	debug("lookup_connect_response_out: unknown request");
 	return false;
 }
 #endif // SYZ_EXECUTOR || __NR_syz_usb_connect
 
-#if SYZ_EXECUTOR || __NR_syz_usb_connect_ath9k
+#if GOOS_linux && (SYZ_EXECUTOR || __NR_syz_usb_connect_ath9k)
 
 // drivers/net/wireless/ath/ath9k/hif_usb.h
 #define ATH9K_FIRMWARE_DOWNLOAD 0x30
@@ -704,7 +718,7 @@ static bool lookup_connect_response_out_ath9k(int fd, const struct vusb_connect_
 
 #endif // SYZ_EXECUTOR || __NR_syz_usb_connect_ath9k
 
-#if SYZ_EXECUTOR || __NR_syz_usb_control_io
+#if GOOS_linux && (SYZ_EXECUTOR || __NR_syz_usb_control_io)
 
 struct vusb_descriptor {
 	uint8 req_type;
@@ -803,9 +817,3 @@ static bool lookup_control_response(const struct vusb_descriptors* descs, const 
 }
 
 #endif // SYZ_EXECUTOR || __NR_syz_usb_control_io
-
-#if GOOS_linux
-#include "common_usb_linux.h"
-#else
-#error "unknown OS"
-#endif // GOOS_linux

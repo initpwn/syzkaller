@@ -1,14 +1,34 @@
 # Coverage
 
+`syzkaller` uses [sanitizer coverage (tracing mode)](https://clang.llvm.org/docs/SanitizerCoverage.html#tracing-pcs)
+and [KCOV](https://www.kernel.org/doc/html/latest/dev-tools/kcov.html) for coverage collection.
+Sanitizer coverage is also supported by `gcc` and `KCOV` is supported by some other OSes.
+Note: `gVisor` coverage is completely different.
+
+Coverage is based on tracing `coverage points` inserted into the object code by the compiler.
+A coverage point generally refers to a [basic block](https://en.wikipedia.org/wiki/Basic_block) of code
+or a [CFG edge](https://en.wikipedia.org/wiki/Control-flow_graph)
+(this depends on the compiler and instrumentation mode used during build,
+e.g. for `Linux` and `clang` the default mode is CFG edges, while for `gcc` the default mode is basic blocks).
+Note that coverage points are inserted by the compiler in the middle-end after a significant number
+of transformation and optimization passes. As the result coverage may poorly relate to the source code.
+For example, you may see a covered line after a non-covered line, or you may not see a coverage point
+where you would expect to see it, or vice versa (this may happen if the compiler splits basic blocks,
+or turns control flow constructs into conditional moves without control flow, etc).
+Assessing coverage is still generally very useful and allows to understand overall fuzzing progress,
+but treat it with a grain of salt.
+
 See [this](linux/coverage.md) for Linux kernel specific coverage information.
 
 ## Web Interface
 
-When clicking on `cover` link you get view showing each directory located in your kernel build directory. It's showing either percentage number or `---`. `---` indicates code in that directory is not instrumented by kcov or there are not yet coverage in that directory.
+When clicking on `cover` link you get view showing each directory located in your kernel build directory. It's showing either percentage number `X% of N` or `---`. `X% of N` means that `X%` of `N` coverage points are covered so far, . `---` indicates there is no coverage in that directory.
 
 Directory can be clicked and you get view on files and possible subdirectories. On each source code file there is again either `---` or coverage percentage.
 
 If you click on any C files you will get source code view. There is certain coloring used in the source code view. Color definitions can be found in [coverTemplate](/pkg/cover/report.go#L504). Coloring is described below.
+
+If you click on percentage number of any listed source file you will get cover percentage for each function in that source file.
 
 ### Covered: black (#000000)
 
@@ -58,4 +78,10 @@ Now this raw cover data can be fed to `syz-cover` to generate coverage report:
 
 ``` bash
 ./bin/syz-cover --kernel_obj <directory where vmlinux is located> rawcover
+```
+
+You can also export CSV file containing function coverage by:
+
+``` bash
+./bin/syz-cover --kernel_obj <directory where vmlinux is located> --csv <filename where to export>  rawcover
 ```

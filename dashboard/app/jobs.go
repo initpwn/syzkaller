@@ -24,9 +24,9 @@ func handleTestRequest(c context.Context, bugID, user, extID, link, patch, repo,
 	jobCC []string) string {
 	log.Infof(c, "test request: bug=%q user=%q extID=%q patch=%v, repo=%q branch=%q",
 		bugID, user, extID, len(patch), repo, branch)
-	for _, blacklisted := range config.EmailBlacklist {
-		if user == blacklisted {
-			log.Errorf(c, "test request from blacklisted user: %v", user)
+	for _, blocked := range config.EmailBlocklist {
+		if user == blocked {
+			log.Errorf(c, "test request from blocked user: %v", user)
 			return ""
 		}
 	}
@@ -208,7 +208,7 @@ func getNextJob(c context.Context, managers map[string]dashapi.ManagerJobs) (*Jo
 		return job, jobKey, err
 	}
 	// We need both C and syz repros, but the crazy datastore query restrictions
-	// do not allow to use ReproLevel>ReproLevelNone in the query.  So we do 2 separate queries.
+	// do not allow to use ReproLevel>ReproLevelNone in the query. So we do 2 separate queries.
 	// C repros tend to be of higher reliability so maybe it's not bad.
 	job, jobKey, err = createBisectJob(c, managers, ReproLevelC)
 	if job != nil || err != nil {
@@ -393,7 +393,7 @@ func createJobResp(c context.Context, job *Job, jobKey *db.Key) (*dashapi.JobPol
 	if err != nil {
 		return nil, false, err
 	}
-	reproSyz, _, err := getText(c, textReproSyz, crash.ReproSyz)
+	reproSyz, err := loadReproSyz(c, crash)
 	if err != nil {
 		return nil, false, err
 	}
@@ -489,12 +489,15 @@ func doneJob(c context.Context, req *dashapi.JobDoneReq) error {
 			return err
 		}
 		for _, com := range req.Commits {
+			cc := email.MergeEmailLists(com.CC,
+				GetEmails(com.Recipients, dashapi.To),
+				GetEmails(com.Recipients, dashapi.Cc))
 			job.Commits = append(job.Commits, Commit{
 				Hash:       com.Hash,
 				Title:      com.Title,
 				Author:     com.Author,
 				AuthorName: com.AuthorName,
-				CC:         strings.Join(sanitizeCC(c, com.CC), "|"),
+				CC:         strings.Join(sanitizeCC(c, cc), "|"),
 				Date:       com.Date,
 			})
 		}
@@ -526,6 +529,12 @@ func updateBugBisection(c context.Context, job *Job, jobKey *db.Key, req *dashap
 	result := BisectYes
 	if len(req.Error) != 0 {
 		result = BisectError
+	} else if len(req.Commits) > 1 {
+		result = BisectInconclusive
+	} else if len(req.Commits) == 0 {
+		result = BisectHorizont
+	} else if job.isUnreliableBisect() {
+		result = BisectUnreliable
 	}
 	if job.Type == JobBisectCause {
 		bug.BisectCause = result
@@ -620,9 +629,6 @@ func createBugReportForJob(c context.Context, job *Job, jobKey *db.Key, config i
 	if err != nil {
 		return nil, err
 	}
-	if len(crashLog) > maxMailLogLen {
-		crashLog = crashLog[len(crashLog)-maxMailLogLen:]
-	}
 	report, _, err := getText(c, textCrashReport, job.CrashReport)
 	if err != nil {
 		return nil, err
@@ -652,37 +658,28 @@ func createBugReportForJob(c context.Context, job *Job, jobKey *db.Key, config i
 	if bugReporting == nil {
 		return nil, fmt.Errorf("job bug has no reporting %q", job.Reporting)
 	}
-	var typ dashapi.ReportType
-	switch job.Type {
-	case JobTestPatch:
-		typ = dashapi.ReportTestPatch
-	case JobBisectCause:
-		typ = dashapi.ReportBisectCause
-	case JobBisectFix:
-		typ = dashapi.ReportBisectFix
-	default:
-		return nil, fmt.Errorf("unknown job type %v", job.Type)
-	}
+	kernelRepo := kernelRepoInfo(build)
 	rep := &dashapi.BugReport{
-		Type:         typ,
-		Config:       reportingConfig,
-		JobID:        extJobID(jobKey),
-		ExtID:        job.ExtID,
-		CC:           job.CC,
-		Log:          crashLog,
-		LogLink:      externalLink(c, textCrashLog, job.CrashLog),
-		Report:       report,
-		ReportLink:   externalLink(c, textCrashReport, job.CrashReport),
-		ReproCLink:   externalLink(c, textReproC, crash.ReproC),
-		ReproSyzLink: externalLink(c, textReproSyz, crash.ReproSyz),
-		CrashTitle:   job.CrashTitle,
-		Error:        jobError,
-		ErrorLink:    externalLink(c, textError, job.Error),
-		PatchLink:    externalLink(c, textPatch, job.Patch),
+		Type:            job.Type.toDashapiReportType(),
+		Config:          reportingConfig,
+		JobID:           extJobID(jobKey),
+		ExtID:           job.ExtID,
+		CC:              append(job.CC, kernelRepo.CC.Always...),
+		Log:             crashLog,
+		LogLink:         externalLink(c, textCrashLog, job.CrashLog),
+		Report:          report,
+		ReportLink:      externalLink(c, textCrashReport, job.CrashReport),
+		ReproCLink:      externalLink(c, textReproC, crash.ReproC),
+		ReproSyzLink:    externalLink(c, textReproSyz, crash.ReproSyz),
+		ReproOpts:       crash.ReproOpts,
+		MachineInfoLink: externalLink(c, textMachineInfo, crash.MachineInfo),
+		CrashTitle:      job.CrashTitle,
+		Error:           jobError,
+		ErrorLink:       externalLink(c, textError, job.Error),
+		PatchLink:       externalLink(c, textPatch, job.Patch),
 	}
 	if job.Type == JobBisectCause || job.Type == JobBisectFix {
-		kernelRepo := kernelRepoInfo(build)
-		rep.Maintainers = append(crash.Maintainers, kernelRepo.CC...)
+		rep.Maintainers = append(crash.Maintainers, kernelRepo.CC.Maintainers...)
 		rep.ExtID = bugReporting.ExtID
 		if bugReporting.CC != "" {
 			rep.CC = strings.Split(bugReporting.CC, "|")
@@ -692,6 +689,12 @@ func createBugReportForJob(c context.Context, job *Job, jobKey *db.Key, config i
 			rep.BisectCause = bisectFromJob(c, rep, job)
 		case JobBisectFix:
 			rep.BisectFix = bisectFromJob(c, rep, job)
+		}
+	}
+	if mgr := bug.managerConfig(); mgr != nil {
+		rep.CC = append(rep.CC, mgr.CC.Always...)
+		if job.Type == JobBisectCause || job.Type == JobBisectFix {
+			rep.Maintainers = append(rep.Maintainers, mgr.CC.Maintainers...)
 		}
 	}
 	// Build error output and failing VM boot log can be way too long to inline.

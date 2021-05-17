@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/google/syzkaller/dashboard/dashapi"
+	"github.com/google/syzkaller/sys/targets"
 	"google.golang.org/appengine/user"
 )
 
@@ -39,8 +40,8 @@ var testConfig = &GlobalConfig{
 	Clients: map[string]string{
 		"reporting": "reportingkeyreportingkeyreportingkey",
 	},
-	EmailBlacklist: []string{
-		"\"Bar\" <BlackListed@Domain.com>",
+	EmailBlocklist: []string{
+		"\"Bar\" <Blocked@Domain.com>",
 	},
 	Obsoleting: ObsoletingConfig{
 		MinPeriod:         80 * 24 * time.Hour,
@@ -62,13 +63,17 @@ var testConfig = &GlobalConfig{
 					URL:    "git://syzkaller.org",
 					Branch: "branch10",
 					Alias:  "repo10alias",
-					CC:     []string{"maintainers@repo10.org", "bugs@repo10.org"},
+					CC: CCConfig{
+						Maintainers: []string{"maintainers@repo10.org", "bugs@repo10.org"},
+					},
 				},
 				{
 					URL:    "git://github.com/google/syzkaller",
 					Branch: "master",
 					Alias:  "repo10alias",
-					CC:     []string{"maintainers@repo10.org", "bugs@repo10.org"},
+					CC: CCConfig{
+						Maintainers: []string{"maintainers@repo10.org", "bugs@repo10.org"},
+					},
 				},
 			},
 			Managers: map[string]ConfigManager{
@@ -107,22 +112,35 @@ var testConfig = &GlobalConfig{
 					URL:    "git://syzkaller.org",
 					Branch: "branch10",
 					Alias:  "repo10alias",
-					CC:     []string{"maintainers@repo10.org", "bugs@repo10.org"},
+					CC: CCConfig{
+						Always:           []string{"always@cc.me"},
+						Maintainers:      []string{"maintainers@repo10.org", "bugs@repo10.org"},
+						BuildMaintainers: []string{"build-maintainers@repo10.org"},
+					},
 				},
 				{
 					URL:    "git://syzkaller.org",
 					Branch: "branch20",
 					Alias:  "repo20",
-					CC:     []string{"maintainers@repo20.org", "bugs@repo20.org"},
+					CC: CCConfig{
+						Maintainers: []string{"maintainers@repo20.org", "bugs@repo20.org"},
+					},
 				},
 			},
 			Managers: map[string]ConfigManager{
-				"restricted-manager": {
+				restrictedManager: {
 					RestrictedTestingRepo:   "git://restricted.git/restricted.git",
 					RestrictedTestingReason: "you should test only on restricted.git",
 				},
-				"no-fix-bisection-manager": {
+				noFixBisectionManager: {
 					FixBisectionDisabled: true,
+				},
+				specialCCManager: {
+					CC: CCConfig{
+						Always:           []string{"always@manager.org"},
+						Maintainers:      []string{"maintainers@manager.org"},
+						BuildMaintainers: []string{"build-maintainers@manager.org"},
+					},
 				},
 			},
 			Reporting: []Reporting{
@@ -142,6 +160,7 @@ var testConfig = &GlobalConfig{
 					Config: &EmailConfig{
 						Email:              "bugs@syzkaller.com",
 						DefaultMaintainers: []string{"default@maintainers.com"},
+						SubjectPrefix:      "[syzbot]",
 						MailMaintainers:    true,
 					},
 				},
@@ -172,12 +191,14 @@ var testConfig = &GlobalConfig{
 			},
 			Reporting: []Reporting{
 				{
-					Name:   "access-admin-reporting1",
-					Config: &TestConfig{Index: 1},
+					Name:       "access-admin-reporting1",
+					DailyLimit: 1000,
+					Config:     &TestConfig{Index: 1},
 				},
 				{
-					Name:   "access-admin-reporting2",
-					Config: &TestConfig{Index: 2},
+					Name:       "access-admin-reporting2",
+					DailyLimit: 1000,
+					Config:     &TestConfig{Index: 2},
 				},
 			},
 		},
@@ -198,11 +219,13 @@ var testConfig = &GlobalConfig{
 				{
 					AccessLevel: AccessAdmin,
 					Name:        "access-admin-reporting1",
+					DailyLimit:  1000,
 					Config:      &TestConfig{Index: 1},
 				},
 				{
-					Name:   "access-user-reporting2",
-					Config: &TestConfig{Index: 2},
+					Name:       "access-user-reporting2",
+					DailyLimit: 1000,
+					Config:     &TestConfig{Index: 2},
 				},
 			},
 		},
@@ -223,11 +246,13 @@ var testConfig = &GlobalConfig{
 				{
 					AccessLevel: AccessUser,
 					Name:        "access-user-reporting1",
+					DailyLimit:  1000,
 					Config:      &TestConfig{Index: 1},
 				},
 				{
-					Name:   "access-public-reporting2",
-					Config: &TestConfig{Index: 2},
+					Name:       "access-public-reporting2",
+					DailyLimit: 1000,
+					Config:     &TestConfig{Index: 2},
 				},
 			},
 		},
@@ -245,6 +270,10 @@ const (
 	keyUser      = "clientuserkeyclientuserkey"
 	clientPublic = "client-public"
 	keyPublic    = "clientpublickeyclientpublickey"
+
+	restrictedManager     = "restricted-manager"
+	noFixBisectionManager = "no-fix-bisection-manager"
+	specialCCManager      = "special-cc-manager"
 )
 
 func skipWithRepro(bug *Bug) FilterResult {
@@ -279,9 +308,9 @@ func testBuild(id int) *dashapi.Build {
 	return &dashapi.Build{
 		Manager:           fmt.Sprintf("manager%v", id),
 		ID:                fmt.Sprintf("build%v", id),
-		OS:                "linux",
-		Arch:              "amd64",
-		VMArch:            "amd64",
+		OS:                targets.Linux,
+		Arch:              targets.AMD64,
+		VMArch:            targets.AMD64,
 		SyzkallerCommit:   fmt.Sprintf("syzkaller_commit%v", id),
 		CompilerID:        fmt.Sprintf("compiler%v", id),
 		KernelRepo:        fmt.Sprintf("repo%v", id),
@@ -297,10 +326,11 @@ var buildCommitDate = time.Date(1, 2, 3, 4, 5, 6, 0, time.UTC)
 
 func testCrash(build *dashapi.Build, id int) *dashapi.Crash {
 	return &dashapi.Crash{
-		BuildID: build.ID,
-		Title:   fmt.Sprintf("title%v", id),
-		Log:     []byte(fmt.Sprintf("log%v", id)),
-		Report:  []byte(fmt.Sprintf("report%v", id)),
+		BuildID:     build.ID,
+		Title:       fmt.Sprintf("title%v", id),
+		Log:         []byte(fmt.Sprintf("log%v", id)),
+		Report:      []byte(fmt.Sprintf("report%v", id)),
+		MachineInfo: []byte(fmt.Sprintf("machine info %v", id)),
 	}
 }
 

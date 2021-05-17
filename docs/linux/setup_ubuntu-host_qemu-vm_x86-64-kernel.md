@@ -2,9 +2,11 @@
 
 These are the instructions on how to fuzz the x86-64 kernel in a QEMU with Ubuntu on the host machine and Debian Stretch in the QEMU instances.
 
+In the instructions below, the `$VAR` notation (e.g. `$GCC`, `$KERNEL`, etc.) is used to denote paths to directories that are either created when executing the instructions (e.g. when unpacking GCC archive, a directory will be created), or that you have to create yourself before running the instructions. Substitute the values for those variables manually.
+
 ## GCC
 
-While you may use GCC that is available from your distro, it's preferable to get the lastest one from [this](/docs/syzbot.md#crash-does-not-reproduce) list. Download and unpack into `$GCC`, and you should have GCC binaries in `$GCC/bin/`
+While you may use GCC that is available from your distro, it's preferable to get the lastest GCC from [this](/docs/syzbot.md#crash-does-not-reproduce) list. Download and unpack into `$GCC`, and you should have GCC binaries in `$GCC/bin/`
 
 ``` bash
 $ ls $GCC/bin/
@@ -19,7 +21,7 @@ gcc-nm  gcov-tool   x86_64-pc-linux-gnu-gcc-nm
 Checkout Linux kernel source:
 
 ``` bash
-git clone https://github.com/torvalds/linux.git $KERNEL
+git clone git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git $KERNEL
 ```
 
 Generate default configs:
@@ -68,7 +70,7 @@ Now you should have `vmlinux` (kernel binary) and `bzImage` (packed kernel image
 ``` bash
 $ ls $KERNEL/vmlinux
 $KERNEL/vmlinux
-$ ls $KERNEL/arch/x86/boot/bzImage 
+$ ls $KERNEL/arch/x86/boot/bzImage
 $KERNEL/arch/x86/boot/bzImage
 ```
 
@@ -126,9 +128,9 @@ qemu-system-x86_64 \
 	-m 2G \
 	-smp 2 \
 	-kernel $KERNEL/arch/x86/boot/bzImage \
-	-append "console=ttyS0 root=/dev/sda earlyprintk=serial"\
-	-drive file=$IMAGE/stretch.img,format=raw
-	-net -net user,host=10.0.2.10,hostfwd=tcp:127.0.0.1:10021-:22 \
+	-append "console=ttyS0 root=/dev/sda earlyprintk=serial net.ifnames=0" \
+	-drive file=$IMAGE/stretch.img,format=raw \
+	-net user,host=10.0.2.10,hostfwd=tcp:127.0.0.1:10021-:22 \
 	-net nic,model=e1000 \
 	-enable-kvm \
 	-nographic \
@@ -164,11 +166,13 @@ ssh -i $IMAGE/stretch.id_rsa -p 10021 -o "StrictHostKeyChecking no" root@localho
 If this fails with "too many tries", ssh may be passing default keys before
 the one explicitly passed with `-i`. Append option `-o "IdentitiesOnly yes"`.
 
-To kill the running QEMU instance:
+To kill the running QEMU instance press `Ctrl+A` and then `X` or run:
 
 ``` bash
 kill $(cat vm.pid)
 ```
+
+If QEMU works, the kernel boots and ssh succeeds, you can shutdown QEMU and try to run syzkaller.
 
 ## syzkaller
 

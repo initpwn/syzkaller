@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/pkg/report"
+	"github.com/google/syzkaller/sys/targets"
 	"github.com/google/syzkaller/vm/vmimpl"
 )
 
@@ -50,7 +51,7 @@ func (inst *testInstance) Run(timeout time.Duration, stop <-chan bool, command s
 	return inst.outc, inst.errc, nil
 }
 
-func (inst *testInstance) Diagnose() ([]byte, bool) {
+func (inst *testInstance) Diagnose(rep *report.Report) ([]byte, bool) {
 	var diag []byte
 	if inst.diagnoseBug {
 		diag = []byte("BUG: DIAGNOSE\n")
@@ -72,7 +73,6 @@ func (inst *testInstance) Close() {
 func init() {
 	beforeContext = maxErrorLength + 100
 	tickerPeriod = 1 * time.Second
-	NoOutputTimeout = 5 * time.Second
 	waitForOutputTimeout = 3 * time.Second
 
 	ctor := func(env *vmimpl.Env) (vmimpl.Pool, error) {
@@ -84,8 +84,8 @@ func init() {
 type Test struct {
 	Name           string
 	Exit           ExitCondition
-	DiagnoseBug    bool // Diagnose produces output that is detected as kernel crash
-	DiagnoseNoWait bool // Diagnose returns output directly rather than to console
+	DiagnoseBug    bool // Diagnose produces output that is detected as kernel crash.
+	DiagnoseNoWait bool // Diagnose returns output directly rather than to console.
 	Body           func(outc chan []byte, errc chan error)
 	Report         *report.Report
 }
@@ -264,7 +264,7 @@ var tests = []*Test{
 		Body: func(outc chan []byte, errc chan error) {
 			for i := 0; i < 5; i++ {
 				time.Sleep(time.Second)
-				outc <- []byte(executingProgramStr1 + "\n")
+				outc <- append(executingProgram1, '\n')
 			}
 			errc <- nil
 		},
@@ -275,7 +275,7 @@ var tests = []*Test{
 		Body: func(outc chan []byte, errc chan error) {
 			for i := 0; i < 5; i++ {
 				time.Sleep(time.Second)
-				outc <- []byte(executingProgramStr2 + "\n")
+				outc <- append(executingProgram2, '\n')
 			}
 			errc <- nil
 		},
@@ -339,11 +339,18 @@ func testMonitorExecution(t *testing.T, test *Test) {
 	}
 	defer os.RemoveAll(dir)
 	cfg := &mgrconfig.Config{
-		Workdir:      dir,
-		TargetOS:     "linux",
-		TargetArch:   "amd64",
-		TargetVMArch: "amd64",
-		Type:         "test",
+		Derived: mgrconfig.Derived{
+			TargetOS:     targets.Linux,
+			TargetArch:   targets.AMD64,
+			TargetVMArch: targets.AMD64,
+			Timeouts: targets.Timeouts{
+				Scale:    1,
+				Slowdown: 1,
+				NoOutput: 5 * time.Second,
+			},
+		},
+		Workdir: dir,
+		Type:    "test",
 	}
 	pool, err := Create(cfg, false)
 	if err != nil {

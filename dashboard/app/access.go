@@ -60,7 +60,7 @@ func accessLevel(c context.Context, r *http.Request) AccessLevel {
 	}
 	u := user.Current(c)
 	if u == nil ||
-		// devappserver is broken
+		// Devappserver does not pass AuthDomain.
 		u.AuthDomain != "gmail.com" && !isBrokenAuthDomainInTest ||
 		!strings.HasSuffix(u.Email, config.AuthDomain) {
 		return AccessPublic
@@ -98,6 +98,11 @@ func checkTextAccess(c context.Context, r *http.Request, tag string, id int64) (
 		return checkCrashTextAccess(c, r, "ReproSyz", id)
 	case textReproC:
 		return checkCrashTextAccess(c, r, "ReproC", id)
+	case textMachineInfo:
+		// MachineInfo is deduplicated, so we can't find the exact crash/bug.
+		// But since machine info is usually the same for all bugs and is not secret,
+		// it's fine to check based on the namespace.
+		return nil, nil, nil
 	}
 }
 

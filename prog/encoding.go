@@ -4,7 +4,6 @@
 package prog
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/hex"
 	"fmt"
@@ -259,7 +258,6 @@ func (p *parser) parseProg() (*Prog, error) {
 			r = name
 			p.Parse('=')
 			name = p.Ident()
-
 		}
 		meta := p.target.SyscallMap[name]
 		if meta == nil {
@@ -459,7 +457,7 @@ func (p *parser) parseArgAddr(typ Type, dir Dir) (Arg, error) {
 		elem, elemDir = t1.Elem, t1.ElemDir
 	case *VmaType:
 	default:
-		p.eatExcessive(true, "wrong addr arg")
+		p.eatExcessive(true, "wrong addr arg %T", typ)
 		return typ.DefaultArg(dir), nil
 	}
 	p.Parse('&')
@@ -585,9 +583,9 @@ func (p *parser) parseArgStruct(typ Type, dir Dir) (Arg, error) {
 		}
 		field := t1.Fields[i]
 		if IsPad(field.Type) {
-			inner = append(inner, MakeConstArg(field.Type, dir, 0))
+			inner = append(inner, MakeConstArg(field.Type, field.Dir(dir), 0))
 		} else {
-			arg, err := p.parseArg(field.Type, dir)
+			arg, err := p.parseArg(field.Type, field.Dir(dir))
 			if err != nil {
 				return nil, err
 			}
@@ -603,7 +601,7 @@ func (p *parser) parseArgStruct(typ Type, dir Dir) (Arg, error) {
 		if !IsPad(field.Type) {
 			p.strictFailf("missing struct %v fields %v/%v", typ.Name(), len(inner), len(t1.Fields))
 		}
-		inner = append(inner, field.Type.DefaultArg(dir))
+		inner = append(inner, field.Type.DefaultArg(field.Dir(dir)))
 	}
 	return MakeGroupArg(typ, dir, inner), nil
 }
@@ -646,11 +644,14 @@ func (p *parser) parseArgUnion(typ Type, dir Dir) (Arg, error) {
 	}
 	p.Parse('@')
 	name := p.Ident()
-	var optType Type
+	var (
+		optType Type
+		optDir  Dir
+	)
 	index := -1
 	for i, field := range t1.Fields {
 		if name == field.Name {
-			optType, index = field.Type, i
+			optType, index, optDir = field.Type, i, field.Dir(dir)
 			break
 		}
 	}
@@ -662,12 +663,12 @@ func (p *parser) parseArgUnion(typ Type, dir Dir) (Arg, error) {
 	if p.Char() == '=' {
 		p.Parse('=')
 		var err error
-		opt, err = p.parseArg(optType, dir)
+		opt, err = p.parseArg(optType, optDir)
 		if err != nil {
 			return nil, err
 		}
 	} else {
-		opt = optType.DefaultArg(dir)
+		opt = optType.DefaultArg(optDir)
 	}
 	return MakeUnionArg(typ, dir, opt, index), nil
 }
@@ -719,7 +720,6 @@ func (p *parser) eatExcessive(stopAtComma bool, what string, args ...interface{}
 
 const (
 	encodingAddrBase = 0x7f0000000000
-	maxLineLen       = 1 << 20
 )
 
 func (target *Target) serializeAddr(arg *PointerArg) string {
@@ -977,11 +977,11 @@ type parser struct {
 	autos   map[Arg]bool
 	comment string
 
-	r *bufio.Scanner
-	s string
-	i int
-	l int
-	e error
+	data []byte
+	s    string
+	i    int
+	l    int
+	e    error
 }
 
 func newParser(target *Target, data []byte, strict bool) *parser {
@@ -989,9 +989,8 @@ func newParser(target *Target, data []byte, strict bool) *parser {
 		target: target,
 		strict: strict,
 		vars:   make(map[string]*ResultArg),
-		r:      bufio.NewScanner(bytes.NewReader(data)),
+		data:   data,
 	}
-	p.r.Buffer(nil, maxLineLen)
 	return p
 }
 
@@ -1018,10 +1017,9 @@ func (p *parser) fixupAutos(prog *Prog) {
 				_ = s
 			case *PtrType:
 				a := arg.(*PointerArg)
-				a.Address = s.ma.alloc(nil, a.Res.Size())
+				a.Address = s.ma.alloc(nil, a.Res.Size(), a.Res.Type().Alignment())
 			default:
 				panic(fmt.Sprintf("unsupported auto type %T", typ))
-
 			}
 		})
 	}
@@ -1031,14 +1029,17 @@ func (p *parser) fixupAutos(prog *Prog) {
 }
 
 func (p *parser) Scan() bool {
-	if p.e != nil {
+	if p.e != nil || len(p.data) == 0 {
 		return false
 	}
-	if !p.r.Scan() {
-		p.e = p.r.Err()
-		return false
+	nextLine := bytes.IndexByte(p.data, '\n')
+	if nextLine != -1 {
+		p.s = string(p.data[:nextLine])
+		p.data = p.data[nextLine+1:]
+	} else {
+		p.s = string(p.data)
+		p.data = nil
 	}
-	p.s = p.r.Text()
 	p.i = 0
 	p.l++
 	return true
@@ -1137,10 +1138,15 @@ func (p *parser) strictFailf(msg string, args ...interface{}) {
 func CallSet(data []byte) (map[string]struct{}, int, error) {
 	calls := make(map[string]struct{})
 	ncalls := 0
-	s := bufio.NewScanner(bytes.NewReader(data))
-	s.Buffer(nil, maxLineLen)
-	for s.Scan() {
-		ln := s.Bytes()
+	for len(data) > 0 {
+		ln := data
+		nextLine := bytes.IndexByte(data, '\n')
+		if nextLine != -1 {
+			ln = data[:nextLine]
+			data = data[nextLine+1:]
+		} else {
+			data = nil
+		}
 		if len(ln) == 0 || ln[0] == '#' {
 			continue
 		}
@@ -1161,9 +1167,6 @@ func CallSet(data []byte) (map[string]struct{}, int, error) {
 		}
 		calls[string(call)] = struct{}{}
 		ncalls++
-	}
-	if err := s.Err(); err != nil {
-		return nil, 0, err
 	}
 	if len(calls) == 0 {
 		return nil, 0, fmt.Errorf("program does not contain any calls")

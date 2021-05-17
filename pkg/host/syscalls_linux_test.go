@@ -6,16 +6,18 @@
 package host
 
 import (
+	"fmt"
 	"runtime"
 	"syscall"
 	"testing"
 
 	"github.com/google/syzkaller/prog"
+	"github.com/google/syzkaller/sys/targets"
 )
 
 func TestSupportedSyscalls(t *testing.T) {
 	t.Parallel()
-	target, err := prog.GetTarget("linux", runtime.GOARCH)
+	target, err := prog.GetTarget(targets.Linux, runtime.GOARCH)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,7 +60,7 @@ func TestKallsymsParse(t *testing.T) {
 		SupportedSyscalls []string
 	}{
 		{
-			"amd64",
+			targets.AMD64,
 			[]byte(`
 ffffffff817cdcc0 T __sys_bind
 ffffffff817cdda0 T __x64_sys_bind
@@ -74,7 +76,7 @@ ffffffff817ce0a0 T __ia32_sys_accept4
 			[]string{"bind", "listen", "accept4"},
 		},
 		{
-			"arm64",
+			targets.ARM64,
 			[]byte(`
 ffff000010a3ddf8 T __sys_bind
 ffff000010a3def8 T __arm64_sys_bind
@@ -87,7 +89,7 @@ ffff000010a3e1f0 T __arm64_sys_accept4
 			[]string{"bind", "listen", "accept4"},
 		},
 		{
-			"ppc64le",
+			targets.PPC64LE,
 			[]byte(`
 c0000000011ec810 T __sys_bind
 c0000000011eca10 T sys_bind
@@ -103,7 +105,7 @@ c0000000011ed050 T __se_sys_accept4
 			[]string{"bind", "listen", "accept4"},
 		},
 		{
-			"arm",
+			targets.ARM,
 			[]byte(`
 c037c67c T __se_sys_setfsuid
 c037c694 T __sys_setfsgid
@@ -116,14 +118,49 @@ c037c7f8 T sys_getppid
 			[]string{"setfsgid", "getpid", "gettid", "getppid"},
 			[]string{"setfsgid", "getpid", "gettid", "getppid"},
 		},
-		// Test kallsymsRenameMap
+		// Test kallsymsRenameMap.
 		{
-			"ppc64le",
+			targets.PPC64LE,
 			[]byte(`
 c00000000037eb00 T sys_newstat
 			`),
 			[]string{"newstat"},
 			[]string{"stat"},
+		},
+		{
+			targets.S390x,
+			[]byte(`
+0000000000e4f760 T __sys_bind
+0000000000e4f8e8 T __s390_sys_bind
+0000000000e4f938 T __s390x_sys_bind
+0000000000e4f938 T __se_sys_bind
+0000000000e4f988 T __sys_listen
+0000000000e4fab0 T __s390_sys_listen
+0000000000e4faf8 T __s390x_sys_listen
+0000000000e4faf8 T __se_sys_listen
+0000000000e4fb40 T __sys_accept4
+0000000000e4fe58 T __s390_sys_accept4
+0000000000e4feb0 T __s390x_sys_accept4
+0000000000e4feb0 T __se_sys_accept4
+			`),
+			[]string{"bind", "listen", "accept4"},
+			[]string{"bind", "listen", "accept4"},
+		},
+		{
+			targets.RiscV64,
+			[]byte(`
+ffffffe0005c9b02 T __sys_bind
+ffffffe0005c9ba0 T sys_bind
+ffffffe0005c9ba0 T __se_sys_bind
+ffffffe0005c9e72 T __sys_accept4
+ffffffe0005c9f00 T sys_accept4
+ffffffe0005c9f00 T __se_sys_accept4
+ffffffe0005c9bd8 T __sys_listen
+ffffffe0005c9c76 T sys_listen
+ffffffe0005c9c76 T __se_sys_listen
+			`),
+			[]string{"bind", "listen", "accept4"},
+			[]string{"bind", "listen", "accept4"},
 		},
 	}
 
@@ -147,5 +184,122 @@ c00000000037eb00 T sys_newstat
 				t.Fatalf("syscall %v not found in supported syscall list", syscall)
 			}
 		}
+	}
+}
+
+func TestMatchKernelVersion(t *testing.T) {
+	tests := []struct {
+		version string
+		major   int
+		minor   int
+		res     bool
+		bad     bool
+	}{
+		{
+			version: "5.9.0-rc5-next-20200918",
+			major:   5,
+			minor:   8,
+			res:     true,
+		},
+		{
+			version: "5.9.0-rc5-next-20200918",
+			major:   4,
+			minor:   10,
+			res:     true,
+		},
+		{
+			version: "5.9.0-rc5-next-20200918",
+			major:   5,
+			minor:   9,
+			res:     true,
+		},
+		{
+			version: "5.9.0-rc5-next-20200918",
+			major:   5,
+			minor:   10,
+			res:     false,
+		},
+		{
+			version: "5.9.0-rc5-next-20200918",
+			major:   6,
+			minor:   0,
+			res:     false,
+		},
+		{
+			version: "4.4.246-19567-g2c01e3dada31",
+			major:   4,
+			minor:   3,
+			res:     true,
+		},
+		{
+			version: "4.4.246-19567-g2c01e3dada31",
+			major:   4,
+			minor:   4,
+			res:     true,
+		},
+		{
+			version: "5.17.17-1debian-amd64",
+			major:   5,
+			minor:   16,
+			res:     true,
+		},
+		{
+			version: "5.17.17-1debian-amd64",
+			major:   5,
+			minor:   17,
+			res:     true,
+		},
+		{
+			version: "3.5",
+			major:   3,
+			minor:   4,
+			res:     true,
+		},
+		{
+			version: "3.5",
+			major:   3,
+			minor:   5,
+			res:     true,
+		},
+		{
+			version: "3.5",
+			major:   3,
+			minor:   6,
+			res:     false,
+		},
+		{
+			version: "",
+			bad:     true,
+		},
+		{
+			version: "something unparsable",
+			bad:     true,
+		},
+		{
+			version: "mykernel 4.17-5",
+			bad:     true,
+		},
+		{
+			version: "999999.999999",
+			bad:     true,
+		},
+		{
+			version: "4.abc.def",
+			bad:     true,
+		},
+	}
+	for i, test := range tests {
+		t.Run(fmt.Sprint(i), func(t *testing.T) {
+			ok, bad := matchKernelVersion(test.version, test.major, test.minor)
+			if test.bad && !bad {
+				t.Fatal("want error, but got no error")
+			}
+			if !test.bad && bad {
+				t.Fatalf("want no error, but got error")
+			}
+			if test.res != ok {
+				t.Fatalf("want match %v, but got %v", test.res, ok)
+			}
+		})
 	}
 }

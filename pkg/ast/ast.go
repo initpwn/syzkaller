@@ -19,7 +19,7 @@ type Description struct {
 
 // Node is AST node interface.
 type Node interface {
-	Info() (pos Pos, typ string, name string)
+	Info() (pos Pos, typ, name string)
 	// Clone makes a deep copy of the node.
 	Clone() Node
 	// walk calls callback cb for all child nodes of this node.
@@ -27,7 +27,7 @@ type Node interface {
 	walk(cb func(Node))
 }
 
-// Top-level AST nodes:
+// Top-level AST nodes.
 
 type NewLine struct {
 	Pos Pos
@@ -150,7 +150,7 @@ func (n *TypeDef) Info() (Pos, string, string) {
 	return n.Pos, "type", n.Name.Name
 }
 
-// Not top-level AST nodes:
+// Not top-level AST nodes.
 
 type Ident struct {
 	Pos  Pos
@@ -216,13 +216,14 @@ type Type struct {
 }
 
 func (n *Type) Info() (Pos, string, string) {
-	return n.Pos, "type", n.Ident
+	return n.Pos, "type-opt", n.Ident
 }
 
 type Field struct {
 	Pos      Pos
 	Name     *Ident
 	Type     *Type
+	Attrs    []*Type
 	NewBlock bool // separated from previous fields by a new line
 	Comments []*Comment
 }

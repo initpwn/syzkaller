@@ -12,6 +12,7 @@ import (
 	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
@@ -41,8 +42,14 @@ type Ctx struct {
 	client2    *apiClient
 }
 
+var skipDevAppserverTests = func() bool {
+	_, err := exec.LookPath("dev_appserver.py")
+	// Don't silently skip tests on CI, we should have gcloud sdk installed there.
+	return err != nil && os.Getenv("SYZ_BIG_ENV") == ""
+}()
+
 func NewCtx(t *testing.T) *Ctx {
-	if _, err := exec.LookPath("dev_appserver.py"); err != nil {
+	if skipDevAppserverTests {
 		t.Skip("skipping test (no dev_appserver.py)")
 	}
 	t.Parallel()
@@ -73,44 +80,50 @@ func NewCtx(t *testing.T) *Ctx {
 
 func (c *Ctx) expectOK(err error) {
 	if err != nil {
-		c.t.Fatalf("\n%v: %v", caller(0), err)
+		c.t.Helper()
+		c.t.Fatal(err)
 	}
 }
 
 func (c *Ctx) expectFail(msg string, err error) {
+	c.t.Helper()
 	if err == nil {
-		c.t.Fatalf("\n%v: expected to fail, but it does not", caller(0))
+		c.t.Fatalf("expected to fail, but it does not")
 	}
 	if !strings.Contains(err.Error(), msg) {
-		c.t.Fatalf("\n%v: expected to fail with %q, but failed with %q", caller(0), msg, err)
+		c.t.Fatalf("expected to fail with %q, but failed with %q", msg, err)
 	}
 }
 
 func (c *Ctx) expectForbidden(err error) {
+	c.t.Helper()
 	if err == nil {
-		c.t.Fatalf("\n%v: expected to fail as 403, but it does not", caller(0))
+		c.t.Fatalf("expected to fail as 403, but it does not")
 	}
 	httpErr, ok := err.(HTTPError)
 	if !ok || httpErr.Code != http.StatusForbidden {
-		c.t.Fatalf("\n%v: expected to fail as 403, but it failed as %v", caller(0), err)
+		c.t.Fatalf("expected to fail as 403, but it failed as %v", err)
 	}
 }
 
 func (c *Ctx) expectEQ(got, want interface{}) {
 	if diff := cmp.Diff(got, want); diff != "" {
-		c.t.Fatalf("\n%v: %v", caller(0), diff)
+		c.t.Helper()
+		c.t.Fatal(diff)
 	}
 }
 
 func (c *Ctx) expectNE(got, want interface{}) {
 	if reflect.DeepEqual(got, want) {
-		c.t.Fatalf("\n%v: equal: %#v", caller(0), got)
+		c.t.Helper()
+		c.t.Fatalf("equal: %#v", got)
 	}
 }
 
 func (c *Ctx) expectTrue(v bool) {
 	if !v {
-		c.t.Fatalf("\n%v: failed", caller(0))
+		c.t.Helper()
+		c.t.Fatal("failed")
 	}
 }
 
@@ -138,6 +151,8 @@ func caller(skip int) string {
 
 func (c *Ctx) Close() {
 	if !c.t.Failed() {
+		// To avoid per-day reporting limits for left-over emails.
+		c.advanceTime(25 * time.Hour)
 		// Ensure that we can render main page and all bugs in the final test state.
 		c.expectOK(c.GET("/test1"))
 		c.expectOK(c.GET("/test2"))
@@ -280,19 +295,21 @@ func (c *Ctx) loadManager(ns, name string) (*Manager, *Build) {
 }
 
 func (c *Ctx) checkURLContents(url string, want []byte) {
+	c.t.Helper()
 	got, err := c.AuthGET(AccessAdmin, url)
 	if err != nil {
-		c.t.Fatalf("\n%v: %v request failed: %v", caller(0), url, err)
+		c.t.Fatalf("%v request failed: %v", url, err)
 	}
 	if !bytes.Equal(got, want) {
-		c.t.Fatalf("\n%v: url %v: got:\n%s\nwant:\n%s\n", caller(0), url, got, want)
+		c.t.Fatalf("url %v: got:\n%s\nwant:\n%s\n", url, got, want)
 	}
 }
 
 func (c *Ctx) pollEmailBug() *aemail.Message {
 	c.expectOK(c.GET("/email_poll"))
 	if len(c.emailSink) == 0 {
-		c.t.Fatalf("\n%v: got no emails", caller(0))
+		c.t.Helper()
+		c.t.Fatal("got no emails")
 	}
 	return <-c.emailSink
 }
@@ -301,7 +318,8 @@ func (c *Ctx) expectNoEmail() {
 	c.expectOK(c.GET("/email_poll"))
 	if len(c.emailSink) != 0 {
 		msg := <-c.emailSink
-		c.t.Fatalf("\n%v: got unexpected email: %v\n%s", caller(0), msg.Subject, msg.Body)
+		c.t.Helper()
+		c.t.Fatalf("got unexpected email: %v\n%s", msg.Subject, msg.Body)
 	}
 }
 
@@ -344,7 +362,8 @@ func (c *Ctx) makeClient(client, key string, failOnErrors bool) *apiClient {
 func (client *apiClient) pollBugs(expect int) []*dashapi.BugReport {
 	resp, _ := client.ReportingPollBugs("test")
 	if len(resp.Reports) != expect {
-		client.t.Fatalf("\n%v: want %v reports, got %v", caller(0), expect, len(resp.Reports))
+		client.t.Helper()
+		client.t.Fatalf("want %v reports, got %v", expect, len(resp.Reports))
 	}
 	for _, rep := range resp.Reports {
 		reproLevel := dashapi.ReproLevelNone
@@ -373,7 +392,8 @@ func (client *apiClient) pollBug() *dashapi.BugReport {
 func (client *apiClient) pollNotifs(expect int) []*dashapi.BugNotification {
 	resp, _ := client.ReportingPollNotifications("test")
 	if len(resp.Notifications) != expect {
-		client.t.Fatalf("\n%v: want %v notifs, got %v", caller(0), expect, len(resp.Notifications))
+		client.t.Helper()
+		client.t.Fatalf("want %v notifs, got %v", expect, len(resp.Notifications))
 	}
 	return resp.Notifications
 }
@@ -415,18 +435,22 @@ func (client *apiClient) pollAndFailBisectJob(manager string) {
 
 type (
 	EmailOptMessageID int
+	EmailOptSubject   string
 	EmailOptFrom      string
 	EmailOptCC        []string
 )
 
 func (c *Ctx) incomingEmail(to, body string, opts ...interface{}) {
 	id := 0
+	subject := "crash1"
 	from := "default@sender.com"
 	cc := []string{"test@syzkaller.com", "bugs@syzkaller.com", "bugs2@syzkaller.com"}
 	for _, o := range opts {
 		switch opt := o.(type) {
 		case EmailOptMessageID:
 			id = int(opt)
+		case EmailOptSubject:
+			subject = string(opt)
 		case EmailOptFrom:
 			from = string(opt)
 		case EmailOptCC:
@@ -436,14 +460,14 @@ func (c *Ctx) incomingEmail(to, body string, opts ...interface{}) {
 	email := fmt.Sprintf(`Sender: %v
 Date: Tue, 15 Aug 2017 14:59:00 -0700
 Message-ID: <%v>
-Subject: crash1
+Subject: %v
 From: %v
 Cc: %v
 To: %v
 Content-Type: text/plain
 
 %v
-`, from, id, from, strings.Join(cc, ","), to, body)
+`, from, id, subject, from, strings.Join(cc, ","), to, body)
 	c.expectOK(c.POST("/_ah/mail/", email))
 }
 

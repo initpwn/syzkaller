@@ -19,10 +19,11 @@
 #include <unistd.h>
 #include <utime.h>
 #include <zircon/process.h>
+#include <zircon/status.h>
 #include <zircon/syscalls.h>
 
 #if SYZ_EXECUTOR || __NR_get_root_resource
-#include <ddk/driver.h>
+#include <lib/ddk/driver.h>
 #endif
 
 #if SYZ_EXECUTOR || SYZ_HANDLE_SEGV
@@ -50,7 +51,7 @@ static zx_status_t update_exception_thread_regs(zx_handle_t exception)
 	zx_handle_t thread;
 	zx_status_t status = zx_exception_get_thread(exception, &thread);
 	if (status != ZX_OK) {
-		debug("zx_exception_get_thread failed: %d\n", status);
+		debug("zx_exception_get_thread failed: %s (%d)\n", zx_status_get_string(status), status);
 		return status;
 	}
 
@@ -58,8 +59,8 @@ static zx_status_t update_exception_thread_regs(zx_handle_t exception)
 	status = zx_thread_read_state(thread, ZX_THREAD_STATE_GENERAL_REGS,
 				      &regs, sizeof(regs));
 	if (status != ZX_OK) {
-		debug("zx_thread_read_state failed: %d (%d)\n",
-		      (int)sizeof(regs), status);
+		debug("zx_thread_read_state failed: %d %s (%d)\n",
+		      (int)sizeof(regs), zx_status_get_string(status), status);
 	} else {
 #if GOARCH_amd64
 		regs.rip = (uint64)(void*)&segv_handler;
@@ -70,7 +71,7 @@ static zx_status_t update_exception_thread_regs(zx_handle_t exception)
 #endif
 		status = zx_thread_write_state(thread, ZX_THREAD_STATE_GENERAL_REGS, &regs, sizeof(regs));
 		if (status != ZX_OK) {
-			debug("zx_thread_write_state failed: %d\n", status);
+			debug("zx_thread_write_state failed: %s (%d)\n", zx_status_get_string(status), status);
 		}
 	}
 
@@ -84,7 +85,7 @@ static void* ex_handler(void* arg)
 	for (int i = 0; i < 10000; i++) {
 		zx_status_t status = zx_object_wait_one(exception_channel, ZX_CHANNEL_READABLE, ZX_TIME_INFINITE, NULL);
 		if (status != ZX_OK) {
-			debug("zx_object_wait_one failed: %d\n", status);
+			debug("zx_object_wait_one failed: %s (%d)\n", zx_status_get_string(status), status);
 			continue;
 		}
 
@@ -92,20 +93,20 @@ static void* ex_handler(void* arg)
 		zx_handle_t exception;
 		status = zx_channel_read(exception_channel, 0, &info, &exception, sizeof(info), 1, NULL, NULL);
 		if (status != ZX_OK) {
-			debug("zx_channel_read failed: %d\n", status);
+			debug("zx_channel_read failed: %s (%d)\n", zx_status_get_string(status), status);
 			continue;
 		}
 
 		debug("got exception: type=%d tid=%llu\n", info.type, (unsigned long long)(info.tid));
 		status = update_exception_thread_regs(exception);
 		if (status != ZX_OK) {
-			debug("failed to update exception thread registers: %d\n", status);
+			debug("failed to update exception thread registers: %s (%d)\n", zx_status_get_string(status), status);
 		}
 
 		uint32 state = ZX_EXCEPTION_STATE_HANDLED;
 		status = zx_object_set_property(exception, ZX_PROP_EXCEPTION_STATE, &state, sizeof(state));
 		if (status != ZX_OK) {
-			debug("zx_object_set_property(ZX_PROP_EXCEPTION_STATE) failed: %d\n", status);
+			debug("zx_object_set_property(ZX_PROP_EXCEPTION_STATE) failed: %s (%d)\n", zx_status_get_string(status), status);
 		}
 		zx_handle_close(exception);
 	}
@@ -118,20 +119,24 @@ static void install_segv_handler(void)
 	zx_status_t status;
 	zx_handle_t exception_channel;
 	if ((status = zx_task_create_exception_channel(zx_process_self(), 0, &exception_channel)) != ZX_OK)
-		fail("zx_task_create_exception_channel failed: %d", status);
+		failmsg("zx_task_create_exception_channel failed",
+			"status=%s (%d)", zx_status_get_string(status), status);
 	pthread_t th;
 	if (pthread_create(&th, 0, ex_handler, (void*)(long)exception_channel))
 		fail("pthread_create failed");
 }
 
 #define NONFAILING(...)                                              \
-	{                                                            \
+	({                                                           \
+		int ok = 1;                                          \
 		__atomic_fetch_add(&skip_segv, 1, __ATOMIC_SEQ_CST); \
 		if (sigsetjmp(segv_env, 0) == 0) {                   \
 			__VA_ARGS__;                                 \
-		}                                                    \
+		} else                                               \
+			ok = 0;                                      \
 		__atomic_fetch_sub(&skip_segv, 1, __ATOMIC_SEQ_CST); \
-	}
+		ok;                                                  \
+	})
 #endif
 
 #if SYZ_EXECUTOR || SYZ_THREADED
@@ -190,30 +195,24 @@ long syz_mmap(size_t addr, size_t size)
 	zx_info_vmar_t info;
 	zx_status_t status = zx_object_get_info(root, ZX_INFO_VMAR, &info, sizeof(info), 0, 0);
 	if (status != ZX_OK) {
-		debug("zx_object_get_info(ZX_INFO_VMAR) failed: %d", status);
+		debug("zx_object_get_info(ZX_INFO_VMAR) failed: %s (%d)", zx_status_get_string(status), status);
 		return status;
 	}
 	zx_handle_t vmo;
 	status = zx_vmo_create(size, 0, &vmo);
 	if (status != ZX_OK) {
-		debug("zx_vmo_create failed with: %d\n", status);
+		debug("zx_vmo_create failed: %s (%d)\n", zx_status_get_string(status), status);
 		return status;
 	}
-	status = zx_vmo_replace_as_executable(vmo, ZX_HANDLE_INVALID, &vmo);
-	if (status != ZX_OK) {
-		debug("zx_vmo_replace_as_executable failed with: %d\n", status);
-		// Don't need to zx_handle_close(vmo) because
-		// zx_vmo_replace_as_executable already invalidates it.
-		return status;
-	}
+
 	uintptr_t mapped_addr;
-	status = zx_vmar_map(root, ZX_VM_FLAG_SPECIFIC_OVERWRITE | ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_WRITE | ZX_VM_FLAG_PERM_EXECUTE,
+	status = zx_vmar_map(root, ZX_VM_FLAG_SPECIFIC_OVERWRITE | ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_WRITE,
 			     addr - info.base, vmo, 0, size,
 			     &mapped_addr);
 
 	zx_status_t close_vmo_status = zx_handle_close(vmo);
 	if (close_vmo_status != ZX_OK) {
-		debug("zx_handle_close(vmo) failed with: %d\n", close_vmo_status);
+		debug("zx_handle_close(vmo) failed with: %s (%d)\n", zx_status_get_string(close_vmo_status), close_vmo_status);
 	}
 	return status;
 }
@@ -250,8 +249,7 @@ static long syz_job_default(void)
 #if SYZ_EXECUTOR || __NR_syz_future_time
 static long syz_future_time(volatile long when)
 {
-	zx_time_t delta_ms;
-	zx_time_t now;
+	zx_time_t delta_ms = 10000;
 	switch (when) {
 	case 0:
 		delta_ms = 5;
@@ -259,10 +257,8 @@ static long syz_future_time(volatile long when)
 	case 1:
 		delta_ms = 30;
 		break;
-	default:
-		delta_ms = 10000;
-		break;
 	}
+	zx_time_t now = 0;
 	zx_clock_get(ZX_CLOCK_MONOTONIC, &now);
 	return now + delta_ms * 1000 * 1000;
 }

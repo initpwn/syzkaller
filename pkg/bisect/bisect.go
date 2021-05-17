@@ -5,11 +5,11 @@ package bisect
 
 import (
 	"fmt"
-	"io"
-	"path/filepath"
 	"time"
 
 	"github.com/google/syzkaller/pkg/build"
+	"github.com/google/syzkaller/pkg/debugtracer"
+	"github.com/google/syzkaller/pkg/hash"
 	"github.com/google/syzkaller/pkg/instance"
 	"github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/pkg/osutil"
@@ -18,24 +18,32 @@ import (
 )
 
 type Config struct {
-	Trace     io.Writer
+	Trace     debugtracer.DebugTracer
 	Fix       bool
 	BinDir    string
-	DebugDir  string
+	Ccache    string
+	Timeout   time.Duration
 	Kernel    KernelConfig
 	Syzkaller SyzkallerConfig
 	Repro     ReproConfig
-	Manager   mgrconfig.Config
+	Manager   *mgrconfig.Config
 }
 
 type KernelConfig struct {
-	Repo      string
-	Branch    string
-	Commit    string
-	Cmdline   string
-	Sysctl    string
-	Config    []byte
-	Userspace string
+	Repo    string
+	Branch  string
+	Commit  string
+	Cmdline string
+	Sysctl  string
+	Config  []byte
+	// Baseline configuration is used in commit bisection. If the crash doesn't reproduce
+	// with baseline configuratopm config bisection is run. When triggering configuration
+	// option is found provided baseline configuration is modified according the bisection
+	// results. This new configuration is tested once more with current head. If crash
+	// reproduces with the generated configuration original configuation is replaced with
+	// this minimized one.
+	BaselineConfig []byte
+	Userspace      string
 }
 
 type SyzkallerConfig struct {
@@ -51,18 +59,22 @@ type ReproConfig struct {
 }
 
 type env struct {
-	cfg       *Config
-	repo      vcs.Repo
-	bisecter  vcs.Bisecter
-	commit    *vcs.Commit
-	head      *vcs.Commit
-	inst      instance.Env
-	numTests  int
-	buildTime time.Duration
-	testTime  time.Duration
+	cfg          *Config
+	repo         vcs.Repo
+	bisecter     vcs.Bisecter
+	minimizer    vcs.ConfigMinimizer
+	commit       *vcs.Commit
+	head         *vcs.Commit
+	kernelConfig []byte
+	inst         instance.Env
+	numTests     int
+	startTime    time.Time
+	buildTime    time.Duration
+	testTime     time.Duration
+	flaky        bool
 }
 
-const NumTests = 10 // number of tests we do per commit
+const MaxNumTests = 20 // number of tests we do per commit
 
 // Result describes bisection result:
 //  - if bisection is conclusive, the single cause/fix commit in Commits
@@ -79,10 +91,12 @@ const NumTests = 10 // number of tests we do per commit
 //    - no commits in Commits
 //    - the crash report on the oldest release/HEAD;
 //    - Commit points to the oldest/latest commit where crash happens.
+//  - Config contains kernel config used for bisection
 type Result struct {
 	Commits    []*vcs.Commit
 	Report     *report.Report
 	Commit     *vcs.Commit
+	Config     []byte
 	NoopChange bool
 	IsRelease  bool
 }
@@ -98,26 +112,32 @@ func Run(cfg *Config) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	bisecter, ok := repo.(vcs.Bisecter)
-	if !ok {
-		return nil, fmt.Errorf("bisection is not implemented for %v", cfg.Manager.TargetOS)
-	}
-	inst, err := instance.NewEnv(&cfg.Manager)
+	inst, err := instance.NewEnv(cfg.Manager)
 	if err != nil {
 		return nil, err
 	}
 	if _, err = repo.CheckoutBranch(cfg.Kernel.Repo, cfg.Kernel.Branch); err != nil {
 		return nil, err
 	}
-	return runImpl(cfg, repo, bisecter, inst)
+	return runImpl(cfg, repo, inst)
 }
 
-func runImpl(cfg *Config, repo vcs.Repo, bisecter vcs.Bisecter, inst instance.Env) (*Result, error) {
+func runImpl(cfg *Config, repo vcs.Repo, inst instance.Env) (*Result, error) {
+	bisecter, ok := repo.(vcs.Bisecter)
+	if !ok {
+		return nil, fmt.Errorf("bisection is not implemented for %v", cfg.Manager.TargetOS)
+	}
+	minimizer, ok := repo.(vcs.ConfigMinimizer)
+	if !ok && len(cfg.Kernel.BaselineConfig) != 0 {
+		return nil, fmt.Errorf("config minimization is not implemented for %v", cfg.Manager.TargetOS)
+	}
 	env := &env{
-		cfg:      cfg,
-		repo:     repo,
-		bisecter: bisecter,
-		inst:     inst,
+		cfg:       cfg,
+		repo:      repo,
+		bisecter:  bisecter,
+		minimizer: minimizer,
+		inst:      inst,
+		startTime: time.Now(),
 	}
 	head, err := repo.HeadCommit()
 	if err != nil {
@@ -131,6 +151,9 @@ func runImpl(cfg *Config, repo vcs.Repo, bisecter vcs.Bisecter, inst instance.En
 	}
 	start := time.Now()
 	res, err := env.bisect()
+	if env.flaky {
+		env.log("Reproducer flagged being flaky")
+	}
 	env.log("revisions tested: %v, total time: %v (build: %v, test: %v)",
 		env.numTests, time.Since(start), env.buildTime, env.testTime)
 	if err != nil {
@@ -160,7 +183,8 @@ func runImpl(cfg *Config, repo vcs.Repo, bisecter vcs.Bisecter, inst instance.En
 	}
 	com := res.Commits[0]
 	env.log("first %v commit: %v %v", what, com.Hash, com.Title)
-	env.log("cc: %q", com.CC)
+	env.log("recipients (to): %q", com.Recipients.GetEmails(vcs.To))
+	env.log("recipients (cc): %q", com.Recipients.GetEmails(vcs.Cc))
 	if res.Report != nil {
 		env.log("crash: %v\n%s", res.Report.Title, res.Report.Report)
 	}
@@ -169,7 +193,6 @@ func runImpl(cfg *Config, repo vcs.Repo, bisecter vcs.Bisecter, inst instance.En
 
 func (env *env) bisect() (*Result, error) {
 	cfg := env.cfg
-	var err error
 	if err := build.Clean(cfg.Manager.TargetOS, cfg.Manager.TargetVMArch,
 		cfg.Manager.Type, cfg.Manager.KernelSrc); err != nil {
 		return nil, fmt.Errorf("kernel clean failed: %v", err)
@@ -182,19 +205,39 @@ func (env *env) bisect() (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	env.commit = com
+	env.kernelConfig = cfg.Kernel.Config
 	testRes, err := env.test()
 	if err != nil {
 		return nil, err
 	} else if testRes.verdict != vcs.BisectBad {
 		return nil, fmt.Errorf("the crash wasn't reproduced on the original commit")
 	}
+
+	if len(cfg.Kernel.BaselineConfig) != 0 {
+		testRes1, err := env.minimizeConfig()
+		if err != nil {
+			return nil, err
+		}
+		if testRes1 != nil {
+			testRes = testRes1
+		}
+	}
+
 	bad, good, rep1, results1, err := env.commitRange()
 	if err != nil {
 		return nil, err
 	}
 	if rep1 != nil {
-		return &Result{Report: rep1, Commit: bad}, nil // still not fixed/happens on the oldest release
+		return &Result{Report: rep1, Commit: bad, Config: env.kernelConfig},
+			nil // still not fixed/happens on the oldest release
+	}
+	if good == nil {
+		// Special case: all previous releases are build broken.
+		// It's unclear what's the best way to report this.
+		// We return 2 commits which means "inconclusive".
+		return &Result{Commits: []*vcs.Commit{com, bad}, Config: env.kernelConfig}, nil
 	}
 	results := map[string]*testResult{cfg.Kernel.Commit: testRes}
 	for _, res := range results1 {
@@ -221,6 +264,7 @@ func (env *env) bisect() (*Result, error) {
 	}
 	res := &Result{
 		Commits: commits,
+		Config:  env.kernelConfig,
 	}
 	if len(commits) == 1 {
 		com := commits[0]
@@ -241,6 +285,27 @@ func (env *env) bisect() (*Result, error) {
 		res.NoopChange = noopChange
 	}
 	return res, nil
+}
+
+func (env *env) minimizeConfig() (*testResult, error) {
+	// Find minimal configuration based on baseline to reproduce the crash.
+	testResults := make(map[hash.Sig]*testResult)
+	predMinimize := func(test []byte) (vcs.BisectResult, error) {
+		env.kernelConfig = test
+		testRes, err := env.test()
+		if err != nil {
+			return 0, err
+		}
+		testResults[hash.Hash(test)] = testRes
+		return testRes.verdict, err
+	}
+	minConfig, err := env.minimizer.Minimize(env.cfg.Manager.SysTarget, env.cfg.Kernel.Config,
+		env.cfg.Kernel.BaselineConfig, env.cfg.Trace, predMinimize)
+	if err != nil {
+		return nil, err
+	}
+	env.kernelConfig = minConfig
+	return testResults[hash.Hash(minConfig)], nil
 }
 
 func (env *env) detectNoopChange(results map[string]*testResult, com *vcs.Commit) (bool, error) {
@@ -340,7 +405,8 @@ func (env *env) build() (*vcs.Commit, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
-	bisectEnv, err := env.bisecter.EnvForCommit(env.cfg.BinDir, current.Hash, env.cfg.Kernel.Config)
+
+	bisectEnv, err := env.bisecter.EnvForCommit(env.cfg.BinDir, current.Hash, env.kernelConfig)
 	if err != nil {
 		return nil, "", err
 	}
@@ -350,12 +416,12 @@ func (env *env) build() (*vcs.Commit, string, error) {
 	}
 	env.log("testing commit %v with %v", current.Hash, compilerID)
 	buildStart := time.Now()
-	mgr := &env.cfg.Manager
+	mgr := env.cfg.Manager
 	if err := build.Clean(mgr.TargetOS, mgr.TargetVMArch, mgr.Type, mgr.KernelSrc); err != nil {
 		return nil, "", fmt.Errorf("kernel clean failed: %v", err)
 	}
 	kern := &env.cfg.Kernel
-	_, kernelSign, err := env.inst.BuildKernel(bisectEnv.Compiler, kern.Userspace,
+	_, kernelSign, err := env.inst.BuildKernel(bisectEnv.Compiler, env.cfg.Ccache, kern.Userspace,
 		kern.Cmdline, kern.Sysctl, bisectEnv.KernelConfig)
 	if kernelSign != "" {
 		env.log("kernel signature: %v", kernelSign)
@@ -366,11 +432,10 @@ func (env *env) build() (*vcs.Commit, string, error) {
 
 func (env *env) test() (*testResult, error) {
 	cfg := env.cfg
-	env.numTests++
-	current, kernelSign, err := env.build()
-	if err != nil {
-		return nil, err
+	if cfg.Timeout != 0 && time.Since(env.startTime) > cfg.Timeout {
+		return nil, fmt.Errorf("bisection is taking too long (>%v), aborting", cfg.Timeout)
 	}
+	current, kernelSign, err := env.build()
 	res := &testResult{
 		verdict:    vcs.BisectSkip,
 		com:        current,
@@ -380,16 +445,26 @@ func (env *env) test() (*testResult, error) {
 		if verr, ok := err.(*osutil.VerboseError); ok {
 			env.log("%v", verr.Title)
 			env.saveDebugFile(current.Hash, 0, verr.Output)
-		} else if verr, ok := err.(build.KernelBuildError); ok {
-			env.log("%v", verr.Title)
+		} else if verr, ok := err.(*build.KernelError); ok {
+			env.log("%s", verr.Report)
 			env.saveDebugFile(current.Hash, 0, verr.Output)
 		} else {
 			env.log("%v", err)
 		}
 		return res, nil
 	}
+
+	numTests := MaxNumTests / 2
+	if env.flaky || env.numTests == 0 {
+		// Use twice as many instances if the bug is flaky and during initial testing
+		// (as we don't know yet if it's flaky or not).
+		numTests *= 2
+	}
+	env.numTests++
+
 	testStart := time.Now()
-	results, err := env.inst.Test(NumTests, cfg.Repro.Syz, cfg.Repro.Opts, cfg.Repro.C)
+
+	results, err := env.inst.Test(numTests, cfg.Repro.Syz, cfg.Repro.Opts, cfg.Repro.C)
 	env.testTime += time.Since(testStart)
 	if err != nil {
 		env.log("failed: %v", err)
@@ -400,7 +475,11 @@ func (env *env) test() (*testResult, error) {
 	res.verdict = vcs.BisectSkip
 	if bad != 0 {
 		res.verdict = vcs.BisectBad
-	} else if NumTests-good-bad > NumTests/3*2 {
+		if !env.flaky && bad < good {
+			env.log("reproducer seems to be flaky")
+			env.flaky = true
+		}
+	} else if len(results)-good-bad > len(results)/3*2 {
 		// More than 2/3 of instances failed with infrastructure error,
 		// can't reliably tell that the commit is good.
 		res.verdict = vcs.BisectSkip
@@ -458,11 +537,7 @@ func (env *env) processResults(current *vcs.Commit, results []error) (bad, good 
 }
 
 func (env *env) saveDebugFile(hash string, idx int, data []byte) {
-	if env.cfg.DebugDir == "" || len(data) == 0 {
-		return
-	}
-	osutil.MkdirAll(env.cfg.DebugDir)
-	osutil.WriteFile(filepath.Join(env.cfg.DebugDir, fmt.Sprintf("%v.%v", hash, idx)), data)
+	env.cfg.Trace.SaveFile(fmt.Sprintf("%v.%v", hash, idx), data)
 }
 
 func checkConfig(cfg *Config) error {
@@ -482,5 +557,5 @@ func checkConfig(cfg *Config) error {
 }
 
 func (env *env) log(msg string, args ...interface{}) {
-	fmt.Fprintf(env.cfg.Trace, msg+"\n", args...)
+	env.cfg.Trace.Log(msg, args...)
 }

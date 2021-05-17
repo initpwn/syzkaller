@@ -15,6 +15,7 @@ import (
 	"github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/pkg/report"
+	"github.com/google/syzkaller/pkg/vcs"
 )
 
 var (
@@ -32,12 +33,14 @@ func main() {
 		flag.PrintDefaults()
 		os.Exit(1)
 	}
-	cfg := &mgrconfig.Config{
-		TargetOS:     *flagOS,
-		TargetArch:   *flagArch,
-		TargetVMArch: *flagArch,
-		KernelObj:    *flagKernelObj,
-		KernelSrc:    *flagKernelSrc,
+	cfg, err := mgrconfig.LoadPartialData([]byte(`{
+		"kernel_obj": "` + *flagKernelObj + `",
+		"kernel_src": "` + *flagKernelSrc + `",
+		"target": "` + *flagOS + "/" + *flagArch + `"
+	}`))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
 	}
 	cfg.CompleteKernelDirs()
 	reporter, err := report.NewReporter(cfg)
@@ -50,21 +53,31 @@ func main() {
 		fmt.Fprintf(os.Stderr, "failed to open input file: %v\n", err)
 		os.Exit(1)
 	}
-	rep := reporter.Parse(text)
-	if rep == nil {
-		rep = &report.Report{Report: text}
-	} else if *flagOutDir != "" {
-		saveCrash(rep, *flagOutDir)
+	reps := report.ParseAll(reporter, text)
+	if len(reps) == 0 {
+		rep := &report.Report{Report: text}
+		if err := reporter.Symbolize(rep); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to symbolize report: %v\n", err)
+			os.Exit(1)
+		}
+		os.Stdout.Write(rep.Report)
+		return
 	}
-	if err := reporter.Symbolize(rep); err != nil {
-		fmt.Fprintf(os.Stderr, "failed to symbolize report: %v\n", err)
-		os.Exit(1)
+	for _, rep := range reps {
+		if *flagOutDir != "" {
+			saveCrash(rep, *flagOutDir)
+		}
+		if err := reporter.Symbolize(rep); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to symbolize report: %v\n", err)
+		}
+		fmt.Printf("TITLE: %v\n", rep.Title)
+		fmt.Printf("CORRUPTED: %v (%v)\n", rep.Corrupted, rep.CorruptedReason)
+		fmt.Printf("MAINTAINERS (TO): %v\n", rep.Recipients.GetEmails(vcs.To))
+		fmt.Printf("MAINTAINERS (CC): %v\n", rep.Recipients.GetEmails(vcs.Cc))
+		fmt.Printf("\n")
+		os.Stdout.Write(rep.Report)
+		fmt.Printf("\n\n")
 	}
-	fmt.Printf("TITLE: %v\n", rep.Title)
-	fmt.Printf("CORRUPTED: %v (%v)\n", rep.Corrupted, rep.CorruptedReason)
-	fmt.Printf("MAINTAINERS: %v\n", rep.Maintainers)
-	fmt.Printf("\n")
-	os.Stdout.Write(rep.Report)
 }
 
 func saveCrash(rep *report.Report, path string) {
@@ -73,18 +86,18 @@ func saveCrash(rep *report.Report, path string) {
 	dir := filepath.Join(path, id)
 	osutil.MkdirAll(dir)
 	if err := osutil.WriteFile(filepath.Join(dir, "description"), []byte(rep.Title+"\n")); err != nil {
-		fmt.Fprintf(os.Stderr, "failed to write description: %v", err)
+		fmt.Fprintf(os.Stderr, "failed to write description: %v\n", err)
 		os.Exit(1)
 	}
 
 	if err := osutil.WriteFile(filepath.Join(dir, "log"), rep.Output); err != nil {
-		fmt.Fprintf(os.Stderr, "failed to write log: %v", err)
+		fmt.Fprintf(os.Stderr, "failed to write log: %v\n", err)
 		os.Exit(1)
 	}
 
 	if len(rep.Report) > 0 {
 		if err := osutil.WriteFile(filepath.Join(dir, "report"), rep.Report); err != nil {
-			fmt.Fprintf(os.Stderr, "failed to write report: %v", err)
+			fmt.Fprintf(os.Stderr, "failed to write report: %v\n", err)
 			os.Exit(1)
 		}
 	}

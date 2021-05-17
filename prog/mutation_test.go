@@ -6,7 +6,6 @@ package prog
 import (
 	"bytes"
 	"fmt"
-	"math"
 	"math/rand"
 	"testing"
 )
@@ -82,6 +81,9 @@ mutate_integer(0x0, 0x1, 0x1, 0x1, 0x0, 0x1, 0x0, 0x0, 0x1)`,
 }
 
 func TestMutateArgument(t *testing.T) {
+	if raceEnabled {
+		t.Skip("skipping in race mode, too slow")
+	}
 	tests := [][2]string{
 		// Mutate an integer with a higher priority than the boolean arguments.
 		{
@@ -103,17 +105,17 @@ func TestMutateArgument(t *testing.T) {
 			`mutate_integer2(0x00, 0x00, 0x20, 0x00, 0x01)`,
 			`mutate_integer2(0x00, 0x00, 0x20, 0x00, 0x07)`,
 		},
-		// Mutate an array of structs
+		// Mutate an array of structs.
 		{
 			`mutate_array2(&(0x7f0000000000)=[{0x0}, {0x0}, {0x0}, {0x0}, {0x0}])`,
 			`mutate_array2(&(0x7f0000000000)=[{0x0}, {0x0}, {0x3}, {0x0}, {0x0}])`,
 		},
-		// Mutate a non-special union that have more than 1 option
+		// Mutate a non-special union that have more than 1 option.
 		{
 			`mutate_union(&(0x7f0000000000)=@f1=[0x0, 0x1, 0x2, 0x3, 0x0, 0x1, 0x2, 0x3, 0x0, 0x0])`,
 			`mutate_union(&(0x7f0000000000)=@f0=0x2)`,
 		},
-		// Mutate the value of the current option in union
+		// Mutate the value of the current option in union.
 		{
 			`mutate_union(&(0x7f0000000000)=@f1=[0x0, 0x1, 0x2, 0x3, 0x0, 0x1, 0x2, 0x3, 0x0, 0x0])`,
 			`mutate_union(&(0x7f0000000000)=@f1=[0x0, 0x1, 0xff, 0x3, 0x0, 0x1, 0x2, 0x3, 0x0, 0x0])`,
@@ -155,9 +157,9 @@ func TestSizeMutateArg(t *testing.T) {
 	target, rs, iters := initRandomTargetTest(t, "test", "64")
 	r := newRand(target, rs)
 	ct := target.DefaultChoiceTable()
-	for i := 0; i < 100; i++ {
+	for i := 0; i < iters; i++ {
 		p := target.Generate(rs, 10, ct)
-		for it := 0; it < iters; it++ {
+		for it := 0; it < 10; it++ {
 			p1 := p.Clone()
 			ctx := &mutator{
 				p:      p1,
@@ -179,38 +181,6 @@ func TestSizeMutateArg(t *testing.T) {
 				}
 			})
 		}
-	}
-}
-
-func TestRandomChoice(t *testing.T) {
-	t.Parallel()
-	target, err := GetTarget("test", "64")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	r := newRand(target, randSource(t))
-	priorities := []float64{1, 1, 1, 1, 1, 1, 1, 1, 2}
-
-	const (
-		maxIters    = 100000
-		searchedIdx = 8
-		prob        = 0.2
-		eps         = 0.01
-	)
-
-	var index, count int
-	for i := 0; i < maxIters; i++ {
-		index = randomChoice(priorities, r)
-
-		if index == searchedIdx {
-			count++
-		}
-	}
-
-	diff := math.Abs(prob*maxIters - float64(count))
-	if diff > eps*maxIters {
-		t.Fatalf("The difference (%f) is higher than %f%%", diff, eps*100)
 	}
 }
 
@@ -313,16 +283,6 @@ mutate4(&(0x7f0000000000)="11223344", 0x4)
 `, `
 mutate4(&(0x7f0000000000)="113344", 0x3)
 `},
-		// Mutate data (insert byte and update size).
-		// TODO: this is not working, because Mutate constantly tends
-		// update addresses and insert mmap's.
-		/*
-					{`
-			mutate4(&(0x7f0000000000)="1122", 0x2)
-			`, `
-			mutate4(&(0x7f0000000000)="112200", 0x3)
-			`},
-		*/
 		// Mutate data (change byte).
 		{`
 mutate4(&(0x7f0000000000)="1122", 0x2)
@@ -361,19 +321,19 @@ mutate8(0x2)
 `, `
 mutate8(0xffffffffffffffff)
 `},
-		// Increase buffer length
+		// Increase buffer length.
 		{`
 mutate_buffer(&(0x7f0000000000)=""/100)
 `, `
 mutate_buffer(&(0x7f0000000000)=""/200)
 `},
-		// Decrease buffer length
+		// Decrease buffer length.
 		{`
 mutate_buffer(&(0x7f0000000000)=""/800)
 `, `
 mutate_buffer(&(0x7f0000000000)=""/4)
 `},
-		// Mutate a ranged buffer
+		// Mutate a ranged buffer.
 		{`
 mutate_rangedbuffer(&(0x7f00000000c0)=""/10)
 `, `
@@ -386,7 +346,7 @@ mutate_rangedbuffer(&(0x7f00000000c0)=""/7)
 
 func TestNegativeMutations(t *testing.T) {
 	tests := [][2]string{
-		// Mutate buffer size outside the range limits
+		// Mutate buffer size outside the range limits.
 		{`
 mutate_rangedbuffer(&(0x7f00000000c0)=""/7)
 `, `
@@ -431,6 +391,9 @@ func BenchmarkGenerate(b *testing.B) {
 }
 
 func runMutationTests(t *testing.T, tests [][2]string, valid bool) {
+	if raceEnabled {
+		t.Skip("skipping in race mode, too slow")
+	}
 	target := initTargetTest(t, "test", "64")
 	for ti, test := range tests {
 		test := test
@@ -441,9 +404,9 @@ func runMutationTests(t *testing.T, tests [][2]string, valid bool) {
 				t.Fatalf("failed to deserialize the program: %v", err)
 			}
 			want := goal.Serialize()
-			iters := int(1e6)
-			if !valid {
-				iters /= 10
+			iters := iterCount()
+			if valid {
+				iters = 1e6 // it will stop after reaching the goal
 			}
 			for i := 0; i < iters; i++ {
 				p1 := p.Clone()

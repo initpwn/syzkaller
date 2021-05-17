@@ -1,5 +1,5 @@
 // Package staticcheck contains a linter for Go source code.
-package staticcheck
+package staticcheck // import "honnef.co/go/tools/staticcheck"
 
 import (
 	"fmt"
@@ -528,8 +528,26 @@ func checkPrintfCallImpl(carg *Argument, f ir.Value, args []ir.Value) {
 			return true
 		}
 
-		if flags&isString != 0 && (code.IsType(T, "[]byte") || isStringer(T, ms) || isError(T, ms)) {
-			return true
+		if flags&isString != 0 {
+			isStringyElem := func(typ types.Type) bool {
+				if typ, ok := typ.Underlying().(*types.Basic); ok {
+					return typ.Kind() == types.Byte
+				}
+				return false
+			}
+			switch T := T.(type) {
+			case *types.Slice:
+				if isStringyElem(T.Elem()) {
+					return true
+				}
+			case *types.Array:
+				if isStringyElem(T.Elem()) {
+					return true
+				}
+			}
+			if isStringer(T, ms) || isError(T, ms) {
+				return true
+			}
 		}
 
 		if flags&isPointer != 0 && code.IsPointerLike(T) {
@@ -1086,6 +1104,12 @@ func CheckDubiousDeferInChannelRangeLoop(pass *analysis.Pass) (interface{}, erro
 }
 
 func CheckTestMainExit(pass *analysis.Pass) (interface{}, error) {
+	if code.IsGoVersion(pass, 15) {
+		// Beginning with Go 1.15, the test framework will call
+		// os.Exit for us.
+		return nil, nil
+	}
+
 	var (
 		fnmain    ast.Node
 		callsExit bool
@@ -1639,7 +1663,12 @@ func CheckUnreadVariableValues(pass *analysis.Pass) (interface{}, error) {
 			return true
 		})
 
-		hasUse := func(v ir.Value) bool {
+		// OPT(dh): don't use a map, possibly use a bitset
+		var hasUse func(v ir.Value, seen map[ir.Value]struct{}) bool
+		hasUse = func(v ir.Value, seen map[ir.Value]struct{}) bool {
+			if _, ok := seen[v]; ok {
+				return false
+			}
 			if _, ok := switchTags[v]; ok {
 				return true
 			}
@@ -1648,7 +1677,30 @@ func CheckUnreadVariableValues(pass *analysis.Pass) (interface{}, error) {
 				// TODO investigate why refs can be nil
 				return true
 			}
-			return len(code.FilterDebug(*refs)) > 0
+			for _, ref := range *refs {
+				switch ref := ref.(type) {
+				case *ir.DebugRef:
+				case *ir.Sigma:
+					if seen == nil {
+						seen = map[ir.Value]struct{}{}
+					}
+					seen[v] = struct{}{}
+					if hasUse(ref, seen) {
+						return true
+					}
+				case *ir.Phi:
+					if seen == nil {
+						seen = map[ir.Value]struct{}{}
+					}
+					seen[v] = struct{}{}
+					if hasUse(ref, seen) {
+						return true
+					}
+				default:
+					return true
+				}
+			}
+			return false
 		}
 
 		ast.Inspect(node, func(node ast.Node) bool {
@@ -1673,7 +1725,7 @@ func CheckUnreadVariableValues(pass *analysis.Pass) (interface{}, error) {
 					if !ok {
 						continue
 					}
-					if !hasUse(ex) {
+					if !hasUse(ex, nil) {
 						lhs := assign.Lhs[ex.Index]
 						if ident, ok := lhs.(*ast.Ident); !ok || ok && ident.Name == "_" {
 							continue
@@ -1693,7 +1745,11 @@ func CheckUnreadVariableValues(pass *analysis.Pass) (interface{}, error) {
 					continue
 				}
 
-				if !hasUse(val) {
+				if _, ok := val.(*ir.Const); ok {
+					// a zero-valued constant, for example in 'foo := []string(nil)'
+					continue
+				}
+				if !hasUse(val, nil) {
 					report.Report(pass, assign, fmt.Sprintf("this value of %s is never used", lhs))
 				}
 			}
@@ -2679,6 +2735,10 @@ func CheckSillyBitwiseOps(pass *analysis.Pass) (interface{}, error) {
 			if !ok {
 				return
 			}
+			if obj.Pkg() != pass.Pkg {
+				// identifier was dot-imported
+				return
+			}
 			if v, _ := constant.Int64Val(obj.Val()); v != 0 {
 				return
 			}
@@ -2899,6 +2959,12 @@ func CheckDeprecated(pass *analysis.Pass) (interface{}, error) {
 		p := spec.Path.Value
 		path := p[1 : len(p)-1]
 		if depr, ok := deprs.Packages[imp]; ok {
+			if path == "github.com/golang/protobuf/proto" {
+				gen, ok := code.Generator(pass, spec.Path.Pos())
+				if ok && gen == facts.ProtocGenGo {
+					return
+				}
+			}
 			report.Report(pass, spec, fmt.Sprintf("package %s is deprecated: %s", path, depr.Msg))
 		}
 	}

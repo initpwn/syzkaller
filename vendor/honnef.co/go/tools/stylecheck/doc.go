@@ -154,7 +154,28 @@ bug, we prefer the more idiomatic 'if x == 42'.`,
 
 	"ST1019": {
 		Title: `Importing the same package multiple times`,
-		Since: "Unreleased",
+		Text: `Go allows importing the same package multiple times, as long as
+different import aliases are being used. That is, the following
+bit of code is valid:
+
+import (
+    "fmt"
+    fumpt "fmt"
+    format "fmt"
+    _ "fmt"
+)
+
+However, this is very rarely done on purpose. Usually, it is a
+sign of code that got refactored, accidentally adding duplicate
+import statements. It is also a rarely known feature, which may
+contribute to confusion.
+
+Do note that sometimes, this feature may be used
+intentionally (see for example
+https://github.com/golang/go/commit/3409ce39bfd7584523b7a8c150a310cea92d879d)
+– if you want to allow this pattern in your code base, you're
+advised to disable this check.`,
+		Since: "2020.1",
 	},
 
 	"ST1020": {
@@ -170,7 +191,7 @@ through grep.
 
 See https://golang.org/doc/effective_go.html#commentary for more
 information on how to write good documentation.`,
-		Since:      "Unreleased",
+		Since:      "2020.1",
 		NonDefault: true,
 	},
 
@@ -187,7 +208,7 @@ through grep.
 
 See https://golang.org/doc/effective_go.html#commentary for more
 information on how to write good documentation.`,
-		Since:      "Unreleased",
+		Since:      "2020.1",
 		NonDefault: true,
 	},
 
@@ -204,7 +225,7 @@ through grep.
 
 See https://golang.org/doc/effective_go.html#commentary for more
 information on how to write good documentation.`,
-		Since:      "Unreleased",
+		Since:      "2020.1",
 		NonDefault: true,
 	},
 }

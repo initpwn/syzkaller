@@ -4,7 +4,10 @@
 package vcs
 
 import (
+	"net/mail"
 	"testing"
+
+	"github.com/google/go-cmp/cmp"
 )
 
 func TestCanonicalizeCommit(t *testing.T) {
@@ -30,18 +33,21 @@ func TestCheckRepoAddress(t *testing.T) {
 		"git://git.cmpxchg.org/linux-mmots.git":                                 true,
 		"https://anonscm.debian.org/git/kernel/linux.git":                       true,
 		"git://kernel.ubuntu.com/ubuntu/ubuntu-zesty.git":                       true,
+		"git://git.armlinux.org.uk/~rmk/linux-arm.git":                          true,
 		"http://host.xz:123/path/to/repo.git/":                                  true,
 		"https://chromium.googlesource.com/chromiumos/third_party/kernel":       true,
 		"https://fuchsia.googlesource.com":                                      true,
 		"git@my-github.com:my/fd.git":                                           true,
+		"file:///repo/linux.git":                                                true,
+		"git://kernel/ubuntu.git":                                               true,
+		"git@my-github/fd.git":                                                  true,
+		"sso://server/repo":                                                     true,
 		"git@my-github.com:/fd.git":                                             false,
 		"gitgit@my-github:/fd.git":                                              false,
-		"git@my-github/fd.git":                                                  false,
 		"":                                                                      false,
 		"foobar":                                                                false,
 		"linux-next":                                                            false,
 		"foo://kernel.ubuntu.com/ubuntu/ubuntu-zesty.git":                       false,
-		"git://kernel/ubuntu.git":                                               false,
 		"gitgit://kernel.ubuntu.com/ubuntu/ubuntu-zesty.git":                    false,
 	})
 }
@@ -102,6 +108,11 @@ func TestCommitLink(t *testing.T) {
 			"https://github.com/google/syzkaller/commit/76dd003f1b102b791d8b342a1f92a6486ff56a1e",
 		},
 		{
+			"https://github.com/google/syzkaller",
+			"master",
+			"https://github.com/google/syzkaller/commit/master",
+		},
+		{
 			"https://github.com/google/syzkaller.git",
 			"76dd003f1b",
 			"https://github.com/google/syzkaller/commit/76dd003f1b",
@@ -147,11 +158,70 @@ func TestCommitLink(t *testing.T) {
 			"",
 			"",
 		},
+		{
+			"https://linux.googlesource.com/linux/kernel/git/torvalds/linux",
+			"a40f7c63275979a11b7c146a83aa08d91c7d3ae8",
+			"https://linux.googlesource.com/linux/kernel/git/torvalds/linux/+/a40f7c63275979a11b7c146a83aa08d91c7d3ae8^!",
+		},
+		{
+			"https://linux.googlesource.com/linux/kernel/git/torvalds/linux",
+			"refs/changes/36/8736/3",
+			"https://linux.googlesource.com/linux/kernel/git/torvalds/linux/+/refs/changes/36/8736/3^!",
+		},
+		{
+			"git://git.kernel.dk/linux-block",
+			"c9387501192c24c14e5a97f97bc1f60cdd071a29",
+			"https://git.kernel.dk/cgit/linux-block/commit/?id=c9387501192c24c14e5a97f97bc1f60cdd071a29",
+		},
+		{
+			"git://git.kernel.dk/linux-block",
+			"syzbot-test",
+			"https://git.kernel.dk/cgit/linux-block/commit/?id=syzbot-test",
+		},
+		{
+			"git://git.breakpoint.cc/fw/net-next.git",
+			"06690d5c6466b604f674477b522a809673c17eff",
+			"https://git.breakpoint.cc/cgit/fw/net-next.git/commit/?id=06690d5c6466b604f674477b522a809673c17eff",
+		},
 	}
 	for _, test := range tests {
 		link := CommitLink(test.URL, test.Hash)
 		if link != test.CommitLink {
 			t.Errorf("URL: %v\nhash: %v\nwant: %v\ngot:  %v", test.URL, test.Hash, test.CommitLink, link)
 		}
+	}
+}
+
+func TestParse(t *testing.T) {
+	// nolint: lll
+	test1 := []byte(`Foo (Maintainer) Bar <a@email.com> (maintainer:KERNEL)
+	Foo Bar(Reviewer) <b@email.com> (reviewer:KERNEL)
+	<somelist@list.com> (open list:FOO)
+	"Supporter Foo" <c@email.com> (supporter:KERNEL)
+	linux-kernel@vger.kernel.org (open list)`)
+	// nolint: lll
+	test2 := []byte(`Foo (Maintainer) Bar <a@email.com> (maintainer:KERNEL)
+	Foo Bar(Reviewer) <b@email.com> (reviewer:KERNEL)
+	"Supporter Foo" <c@email.com> (supporter:KERNEL)
+	linux-kernel@vger.kernel.org (open list)`)
+
+	maintainers1 := Recipients{{mail.Address{Name: "Foo (Maintainer) Bar", Address: "a@email.com"}, To},
+		{mail.Address{Name: "Foo Bar(Reviewer)", Address: "b@email.com"}, Cc},
+		{mail.Address{Name: "Supporter Foo", Address: "c@email.com"}, To},
+		{mail.Address{Name: "", Address: "linux-kernel@vger.kernel.org"}, Cc},
+		{mail.Address{Name: "", Address: "somelist@list.com"}, To}}
+	maintainers2 := Recipients{{mail.Address{Name: "Foo (Maintainer) Bar", Address: "a@email.com"}, To},
+		{mail.Address{Name: "Foo Bar(Reviewer)", Address: "b@email.com"}, Cc},
+		{mail.Address{Name: "Supporter Foo", Address: "c@email.com"}, To},
+		{mail.Address{Name: "", Address: "linux-kernel@vger.kernel.org"}, To}}
+
+	if diff := cmp.Diff(ParseMaintainersLinux(test1), maintainers1); diff != "" {
+		t.Fatal(diff)
+	}
+	if diff := cmp.Diff(ParseMaintainersLinux(test2), maintainers2); diff != "" {
+		t.Fatal(diff)
+	}
+	if diff := cmp.Diff(ParseMaintainersLinux([]byte("")), Recipients(nil)); diff != "" {
+		t.Fatal(diff)
 	}
 }

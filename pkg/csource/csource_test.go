@@ -5,10 +5,8 @@ package csource
 
 import (
 	"fmt"
-	"io/ioutil"
 	"math/rand"
 	"os"
-	"path/filepath"
 	"regexp"
 	"runtime"
 	"strings"
@@ -16,7 +14,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/prog"
 	_ "github.com/google/syzkaller/sys"
 	"github.com/google/syzkaller/sys/targets"
@@ -32,27 +29,18 @@ func TestGenerate(t *testing.T) {
 			continue
 		}
 		t.Run(target.OS+"/"+target.Arch, func(t *testing.T) {
-			if err := sysTarget.BrokenCrossCompiler; err != "" {
+			full := !checked[target.OS]
+			if !full && testing.Short() {
+				return
+			}
+			if err := sysTarget.BrokenCompiler; err != "" {
 				t.Skipf("target compiler is broken: %v", err)
 			}
-			full := !checked[target.OS]
 			checked[target.OS] = true
 			t.Parallel()
 			testTarget(t, target, full)
 		})
-
 	}
-}
-
-// This is the main configuration used by executor, so we want to test it as well.
-var executorOpts = Options{
-	Threaded:  true,
-	Collide:   true,
-	Repeat:    true,
-	Procs:     2,
-	Sandbox:   "none",
-	Repro:     true,
-	UseTmpDir: true,
 }
 
 func testTarget(t *testing.T, target *prog.Target, full bool) {
@@ -74,7 +62,7 @@ func testTarget(t *testing.T, target *prog.Target, full bool) {
 	if !full || testing.Short() {
 		p.Calls = append(p.Calls, syzProg.Calls...)
 		opts = allOptionsSingle(target.OS)
-		opts = append(opts, executorOpts)
+		opts = append(opts, ExecutorOpts)
 	} else {
 		minimized, _ := prog.Minimize(syzProg, -1, false, func(p *prog.Prog, call int) bool {
 			return len(p.Calls) == len(syzProg.Calls)
@@ -123,49 +111,9 @@ func testOne(t *testing.T, p *prog.Prog, opts Options) {
 	defer os.Remove(bin)
 }
 
-func TestSysTests(t *testing.T) {
-	t.Parallel()
-	for _, target := range prog.AllTargets() {
-		target := target
-		sysTarget := targets.Get(target.OS, target.Arch)
-		if runtime.GOOS != sysTarget.BuildOS {
-			continue // we need at least preprocessor binary to generate sources
-		}
-		t.Run(target.OS+"/"+target.Arch, func(t *testing.T) {
-			t.Parallel()
-			dir := filepath.Join("..", "..", "sys", target.OS, "test")
-			if !osutil.IsExist(dir) {
-				return
-			}
-			files, err := ioutil.ReadDir(dir)
-			if err != nil {
-				t.Fatalf("failed to read %v: %v", dir, err)
-			}
-			for _, finfo := range files {
-				file := filepath.Join(dir, finfo.Name())
-				if strings.HasSuffix(file, "~") || strings.HasSuffix(file, ".swp") {
-					continue
-				}
-				data, err := ioutil.ReadFile(file)
-				if err != nil {
-					t.Fatalf("failed to read %v: %v", file, err)
-				}
-				p, err := target.Deserialize(data, prog.Strict)
-				if err != nil {
-					t.Fatalf("failed to parse program %v: %v", file, err)
-				}
-				_, err = Write(p, executorOpts)
-				if err != nil {
-					t.Fatalf("failed to generate C source for %v: %v", file, err)
-				}
-			}
-		})
-	}
-}
-
 func TestExecutorMacros(t *testing.T) {
 	// Ensure that executor does not mis-spell any of the SYZ_* macros.
-	target, _ := prog.GetTarget("test", "64")
+	target, _ := prog.GetTarget(targets.TestOS, targets.TestArch64)
 	p := target.Generate(rand.NewSource(0), 1, target.DefaultChoiceTable())
 	expected := commonDefines(p, Options{})
 	expected["SYZ_EXECUTOR"] = true
@@ -183,37 +131,69 @@ func TestExecutorMacros(t *testing.T) {
 	}
 }
 
-func TestExecutorMistakes(t *testing.T) {
-	mistakes := map[string][]string{
-		// We strip debug() calls from the resulting C source,
-		// this breaks the following pattern. Use {} around debug() to fix.
-		"\\)\n\\t*(debug|debug_dump_data)\\(": {
-			`
-if (foo)
-	debug("foo failed");
-`, `
-	if (x + y)
-		debug_dump_data(data, len);
+func TestSource(t *testing.T) {
+	t.Parallel()
+	target, err := prog.GetTarget(targets.TestOS, targets.TestArch64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type Test struct {
+		input  string
+		output string
+	}
+	tests := []Test{
+		{
+			input: `
+r0 = csource0(0x1)
+csource1(r0)
+`,
+			output: `
+res = syscall(SYS_csource0, 1);
+if (res != -1)
+	r[0] = res;
+syscall(SYS_csource1, r[0]);
+`,
+		},
+		{
+			input: `
+csource2(&AUTO="12345678")
+csource3(&AUTO)
+csource4(&AUTO)
+csource5(&AUTO)
+csource6(&AUTO)
+`,
+			output: `
+NONFAILING(memcpy((void*)0x20000040, "\x12\x34\x56\x78", 4));
+syscall(SYS_csource2, 0x20000040ul);
+NONFAILING(memset((void*)0x20000080, 0, 10));
+syscall(SYS_csource3, 0x20000080ul);
+NONFAILING(memset((void*)0x200000c0, 48, 10));
+syscall(SYS_csource4, 0x200000c0ul);
+NONFAILING(memcpy((void*)0x20000100, "0101010101", 10));
+syscall(SYS_csource5, 0x20000100ul);
+NONFAILING(memcpy((void*)0x20000140, "101010101010", 12));
+syscall(SYS_csource6, 0x20000140ul);
 `,
 		},
 	}
-	for pattern, tests := range mistakes {
-		re := regexp.MustCompile(pattern)
-		for _, test := range tests {
-			if !re.MatchString(test) {
-				t.Errorf("patter %q does not match test %q", pattern, test)
+	for i, test := range tests {
+		t.Run(fmt.Sprint(i), func(t *testing.T) {
+			p, err := target.Deserialize([]byte(test.input), prog.Strict)
+			if err != nil {
+				t.Fatal(err)
 			}
-		}
-		for _, match := range re.FindAllStringIndex(commonHeader, -1) {
-			start, end := match[0], match[1]
-			for start != 0 && commonHeader[start] != '\n' {
-				start--
+			ctx := &context{
+				target:    target,
+				sysTarget: targets.Get(target.OS, target.Arch),
 			}
-			for end != len(commonHeader) && commonHeader[end] != '\n' {
-				end++
+			calls, _, err := ctx.generateProgCalls(p, false)
+			if err != nil {
+				t.Fatal(err)
 			}
-			t.Errorf("pattern %q matches executor source:\n%v",
-				pattern, commonHeader[start:end])
-		}
+			got := regexp.MustCompile(`(\n|^)\t`).ReplaceAllString(strings.Join(calls, ""), "\n")
+			if test.output != got {
+				t.Fatalf("input:\n%v\nwant:\n%v\ngot:\n%v", test.input, test.output, got)
+			}
+		})
 	}
 }

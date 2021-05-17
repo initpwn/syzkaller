@@ -17,6 +17,7 @@ import (
 	"github.com/google/syzkaller/pkg/ast"
 	"github.com/google/syzkaller/pkg/compiler"
 	"github.com/google/syzkaller/pkg/osutil"
+	"github.com/google/syzkaller/pkg/tool"
 	"github.com/google/syzkaller/sys/targets"
 )
 
@@ -51,78 +52,60 @@ type File struct {
 }
 
 type Extractor interface {
-	prepare(sourcedir string, build bool, arches []string) error
+	prepare(sourcedir string, build bool, arches []*Arch) error
 	prepareArch(arch *Arch) error
 	processFile(arch *Arch, info *compiler.ConstInfo) (map[string]uint64, map[string]bool, error)
 }
 
 var extractors = map[string]Extractor{
-	"akaros":  new(akaros),
-	"linux":   new(linux),
-	"freebsd": new(freebsd),
-	"netbsd":  new(netbsd),
-	"openbsd": new(openbsd),
-	"android": new(linux),
-	"fuchsia": new(fuchsia),
-	"windows": new(windows),
-	"trusty":  new(trusty),
+	targets.Akaros:  new(akaros),
+	targets.Linux:   new(linux),
+	targets.FreeBSD: new(freebsd),
+	targets.NetBSD:  new(netbsd),
+	targets.OpenBSD: new(openbsd),
+	"android":       new(linux),
+	targets.Fuchsia: new(fuchsia),
+	targets.Windows: new(windows),
+	targets.Trusty:  new(trusty),
 }
 
 func main() {
-	failf := func(msg string, args ...interface{}) {
-		fmt.Fprintf(os.Stderr, msg+"\n", args...)
-		os.Exit(1)
-	}
 	flag.Parse()
 	if *flagBuild && *flagBuildDir != "" {
-		failf("-build and -builddir is an invalid combination")
+		tool.Failf("-build and -builddir is an invalid combination")
 	}
 
 	OS, archArray, files, err := archFileList(*flagOS, *flagArch, flag.Args())
 	if err != nil {
-		failf("%v", err)
+		tool.Fail(err)
 	}
 
 	extractor := extractors[OS]
 	if extractor == nil {
-		failf("unknown os: %v", OS)
+		tool.Failf("unknown os: %v", OS)
 	}
-	if err := extractor.prepare(*flagSourceDir, *flagBuild, archArray); err != nil {
-		failf("%v", err)
-	}
-
 	arches, err := createArches(OS, archArray, files)
 	if err != nil {
-		failf("%v", err)
+		tool.Fail(err)
 	}
+	if err := extractor.prepare(*flagSourceDir, *flagBuild, arches); err != nil {
+		tool.Fail(err)
+	}
+
 	jobC := make(chan interface{}, len(archArray)*len(files))
 	for _, arch := range arches {
 		jobC <- arch
 	}
 
 	for p := 0; p < runtime.GOMAXPROCS(0); p++ {
-		go func() {
-			for job := range jobC {
-				switch j := job.(type) {
-				case *Arch:
-					infos, err := processArch(extractor, j)
-					j.err = err
-					close(j.done)
-					if j.err == nil {
-						for _, f := range j.files {
-							f.info = infos[f.name]
-							jobC <- f
-						}
-					}
-				case *File:
-					j.consts, j.undeclared, j.err = processFile(extractor, j.arch, j)
-					close(j.done)
-				}
-			}
-		}()
+		go worker(extractor, jobC)
 	}
 
 	failed := false
+	constFiles := make(map[string]*compiler.ConstFile)
+	for _, file := range files {
+		constFiles[file] = compiler.NewConstFile()
+	}
 	for _, arch := range arches {
 		fmt.Printf("generating %v/%v...\n", arch.target.OS, arch.target.Arch)
 		<-arch.done
@@ -138,10 +121,22 @@ func main() {
 				fmt.Printf("%v: %v\n", f.name, f.err)
 				continue
 			}
+			constFiles[f.name].AddArch(f.arch.target.Arch, f.consts, f.undeclared)
+		}
+	}
+	for file, cf := range constFiles {
+		outname := filepath.Join("sys", OS, file+".const")
+		data := cf.Serialize()
+		if len(data) == 0 {
+			os.Remove(outname)
+			continue
+		}
+		if err := osutil.WriteFile(outname, data); err != nil {
+			tool.Failf("failed to write output file: %v", err)
 		}
 	}
 
-	if !failed {
+	if !failed && *flagArch == "" {
 		failed = checkUnsupportedCalls(arches)
 	}
 	for _, arch := range arches {
@@ -151,6 +146,26 @@ func main() {
 	}
 	if failed {
 		os.Exit(1)
+	}
+}
+
+func worker(extractor Extractor, jobC chan interface{}) {
+	for job := range jobC {
+		switch j := job.(type) {
+		case *Arch:
+			infos, err := processArch(extractor, j)
+			j.err = err
+			close(j.done)
+			if j.err == nil {
+				for _, f := range j.files {
+					f.info = infos[filepath.Join("sys", j.target.OS, f.name)]
+					jobC <- f
+				}
+			}
+		case *File:
+			j.consts, j.undeclared, j.err = processFile(extractor, j.arch, j)
+			close(j.done)
+		}
 	}
 }
 
@@ -225,7 +240,7 @@ func archFileList(os, arch string, files []string) (string, []string, []string, 
 	android := false
 	if os == "android" {
 		android = true
-		os = "linux"
+		os = targets.Linux
 	}
 	var arches []string
 	if arch != "" {
@@ -235,7 +250,7 @@ func archFileList(os, arch string, files []string) (string, []string, []string, 
 			arches = append(arches, arch)
 		}
 		if android {
-			arches = []string{"386", "amd64", "arm", "arm64"}
+			arches = []string{targets.I386, targets.AMD64, targets.ARM, targets.ARM64}
 		}
 		sort.Strings(arches)
 	}
@@ -246,21 +261,30 @@ func archFileList(os, arch string, files []string) (string, []string, []string, 
 		}
 		manualFiles := map[string]bool{
 			// Not upstream, generated on https://github.com/multipath-tcp/mptcp_net-next
-			"mptcp.txt": true,
-			// Not upstream, generated on unknown tree.
-			"futex.txt": true,
+			"vnet_mptcp.txt": true,
 			// Was in linux-next, but then was removed, fate is unknown.
-			"watch_queue.txt": true,
+			"dev_watch_queue.txt": true,
+			// Not upstream, generated on:
+			// https://chromium.googlesource.com/chromiumos/third_party/kernel d2a8a1eb8b86
+			"dev_bifrost.txt": true,
+			// ION support was removed from kernel.
+			// We plan to leave the descriptions for some time as is and later remove them.
+			"dev_ion.txt": true,
+			// Not upstream, generated on unknown tree.
+			"dev_img_rogue.txt": true,
 		}
 		androidFiles := map[string]bool{
 			"dev_tlk_device.txt": true,
 			// This was generated on:
 			// https://source.codeaurora.org/quic/la/kernel/msm-4.9 msm-4.9
 			"dev_video4linux.txt": true,
+			// This was generated on:
+			// https://chromium.googlesource.com/chromiumos/third_party/kernel 3a36438201f3
+			"fs_incfs.txt": true,
 		}
 		for _, f := range matches {
 			f = filepath.Base(f)
-			if manualFiles[f] || os == "linux" && android != androidFiles[f] {
+			if manualFiles[f] || os == targets.Linux && android != androidFiles[f] {
 				continue
 			}
 			files = append(files, f)
@@ -291,21 +315,11 @@ func processArch(extractor Extractor, arch *Arch) (map[string]*compiler.ConstInf
 
 func processFile(extractor Extractor, arch *Arch, file *File) (map[string]uint64, map[string]bool, error) {
 	inname := filepath.Join("sys", arch.target.OS, file.name)
-	outname := strings.TrimSuffix(inname, ".txt") + "_" + arch.target.Arch + ".const"
 	if file.info == nil {
-		return nil, nil, fmt.Errorf("input file %v is missing", inname)
+		return nil, nil, fmt.Errorf("const info for input file %v is missing", inname)
 	}
 	if len(file.info.Consts) == 0 {
-		os.Remove(outname)
 		return nil, nil, nil
 	}
-	consts, undeclared, err := extractor.processFile(arch, file.info)
-	if err != nil {
-		return nil, nil, err
-	}
-	data := compiler.SerializeConsts(consts, undeclared)
-	if err := osutil.WriteFile(outname, data); err != nil {
-		return nil, nil, fmt.Errorf("failed to write output file: %v", err)
-	}
-	return consts, undeclared, nil
+	return extractor.processFile(arch, file.info)
 }

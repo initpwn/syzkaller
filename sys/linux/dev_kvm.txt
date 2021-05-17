@@ -145,7 +145,6 @@ kvm_vcpu_target = KVM_ARM_TARGET_CORTEX_A53, KVM_ARM_TARGET_AEM_V8, KVM_ARM_TARG
 kvm_vcpu_features_arm64 = KVM_ARM_VCPU_POWER_OFF, KVM_ARM_VCPU_EL1_32BIT, KVM_ARM_VCPU_PSCI_0_2, KVM_ARM_VCPU_PMU_V3
 
 kvm_mem_slots = 0, 1, 2, 3, 4, 5, 509, 510, 511, 10000, 65536, 65537, 65538, 65539, 65540, 66047, 66048, 66049
-kvm_guest_addrs = 0, 1, 2, 4, 0x1000, 0x2000, 0x3000, 0x4000, 0x5000, 0x6000, 0xd000, 0xf000, 0x100000, 0x10000
 kvm_guest_addr_size = 0x1000, 0x2000, 0x4000, 0x8000, 0x10000, 0x100000
 kvm_x86_tss_addr = 0xd000
 kvm_x86_cr0 = 1, 2, 4, 8, 16, 32, 65536, 262144, 536870912, 1073741824, 2147483648
@@ -158,6 +157,7 @@ kvm_x86_rflags = 1, 2, 4, 16, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 
 # The interface is designed for extensibility so that addition of new options does not invalidate all existing programs.
 syz_kvm_setup_cpu$x86(fd fd_kvmvm, cpufd fd_kvmcpu, usermem vma[24], text ptr[in, array[kvm_text_x86, 1]], ntext len[text], flags flags[kvm_setup_flags], opts ptr[in, array[kvm_setup_opt_x86, 0:2]], nopt len[opts])
 syz_kvm_setup_cpu$arm64(fd fd_kvmvm, cpufd fd_kvmcpu, usermem vma[24], text ptr[in, array[kvm_text_arm64, 1]], ntext len[text], flags const[0], opts ptr[in, array[kvm_setup_opt_arm64, 1]], nopt len[opts])
+syz_kvm_setup_cpu$ppc64(fd fd_kvmvm, cpufd fd_kvmcpu, usermem vma[24], text ptr[in, array[kvm_text_ppc64, 1]], ntext len[text], flags const[0], opts ptr[in, array[kvm_setup_opt_ppc64, 1]], nopt len[opts])
 
 kvm_text_x86 [
 	textreal	kvm_text_x86_real
@@ -193,6 +193,12 @@ kvm_text_x86_64 {
 kvm_text_arm64 {
 	typ	const[0, intptr]
 	text	ptr[in, text[arm64]]
+	size	len[text, intptr]
+}
+
+kvm_text_ppc64 {
+	typ	const[0, intptr]
+	text	ptr[in, text[ppc64]]
 	size	len[text, intptr]
 }
 
@@ -272,6 +278,17 @@ kvm_setup_opt_feature {
 	val	flags[kvm_vcpu_features_arm64, int64]
 }
 
+kvm_setup_opt_ppc64 [
+# unions need at least 2 fields, but we have only 1 now, but we want to have it as union for future extention
+	featur1	kvm_setup_opt_ppc64_feature
+	featur2	kvm_setup_opt_ppc64_feature
+]
+
+kvm_setup_opt_ppc64_feature {
+	typ	const[1, int64]
+	val	int64
+}
+
 kvm_setup_flags = KVM_SETUP_PAGING, KVM_SETUP_PAE, KVM_SETUP_PROTECTED, KVM_SETUP_CPL3, KVM_SETUP_VIRT86, KVM_SETUP_SMM, KVM_SETUP_VM
 
 define KVM_SETUP_PAGING	(1<<0)
@@ -306,9 +323,9 @@ kvm_device_attr {
 }
 
 kvm_create_device {
-	type	flags[kvm_device_type, int32]
-	fd	fd_kvmdev[opt]
-	flags	flags[kvm_device_flags, int32]
+	type	flags[kvm_device_type, int32]	(in)
+	fd	fd_kvmdev	(out)
+	flags	flags[kvm_device_flags, int32]	(in)
 }
 
 kvm_s390_interrupt {
@@ -394,6 +411,7 @@ kvm_assigned_msix_entry {
 	devid	int32
 	gsi	int32
 	entry	int16
+	padding	array[const[0, int16], 3]
 }
 
 kvm_assigned_msix_nr {
@@ -448,10 +466,11 @@ kvm_irq_routing_hv_sint {
 }
 
 kvm_assigned_irq {
-	devid	int32
-	hirq	int32
-	girq	int32
-	flags	flags[kvm_assigned_irq_flags, int32]
+	assigned_dev_id	int32
+	host_irq	const[0, int32]
+	guest_irq	int32
+	flags		flags[kvm_assigned_irq_flags, int32]
+	reserved	array[const[0, int32], 12]
 }
 
 kvm_assigned_pci_dev {

@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-package irutil
+package irutil // import "honnef.co/go/tools/ir/irutil"
 
 import "honnef.co/go/tools/ir"
 

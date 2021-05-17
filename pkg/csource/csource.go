@@ -2,6 +2,25 @@
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
 // Package csource generates [almost] equivalent C programs from syzkaller programs.
+//
+// Outline of the process:
+// - inputs to the generation are the program and options
+// - options control multiple aspects of the resulting C program,
+//   like if we want a multi-threaded program or a single-threaded,
+//   what type of sandbox we want to use, if we want to setup net devices or not, etc
+// - we use actual executor sources as the base
+// - gen.go takes all executor/common*.h headers and bundles them into generated.go
+// - during generation we tear executor headers apart and take only the bits
+//   we need for the current program/options, this is done by running C preprocessor
+//   with particular set of defines so that the preprocessor removes unneeded
+//   #ifdef SYZ_FOO sections
+// - then we generate actual syscall calls with the given arguments
+//   based on the binary "encodingexec" representation of the program
+//   (the same representation executor uses for interpretation)
+// - then we glue it all together
+// - as the last step we run some text post-processing on the resulting source code:
+//   remove debug calls, replace exitf/fail with exit, hoist/sort/dedup includes,
+//   remove duplicate empty lines, etc
 package csource
 
 import (
@@ -10,11 +29,13 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/google/syzkaller/prog"
 	"github.com/google/syzkaller/sys/targets"
 )
 
+// Write generates C source for program p based on the provided options opt.
 func Write(p *prog.Prog, opts Options) ([]byte, error) {
 	if err := opts.Check(p.Target.OS); err != nil {
 		return nil, fmt.Errorf("csource: invalid opts: %v", err)
@@ -73,13 +94,15 @@ func Write(p *prog.Prog, opts Options) ([]byte, error) {
 		replacements["SANDBOX_FUNC"] = replacements["SYSCALLS"]
 		replacements["SYSCALLS"] = "unused"
 	}
-	timeoutExpr := "45"
+	timeouts := ctx.sysTarget.Timeouts(opts.Slowdown)
+	replacements["PROGRAM_TIMEOUT_MS"] = fmt.Sprint(int(timeouts.Program / time.Millisecond))
+	timeoutExpr := fmt.Sprint(int(timeouts.Syscall / time.Millisecond))
 	for i, call := range p.Calls {
 		if timeout := call.Meta.Attrs.Timeout; timeout != 0 {
-			timeoutExpr += fmt.Sprintf(" + (call == %d ? %d : 0)", i, timeout)
+			timeoutExpr += fmt.Sprintf(" + (call == %v ? %v : 0)", i, timeout*uint64(timeouts.Scale))
 		}
 	}
-	replacements["CALL_TIMEOUT"] = timeoutExpr
+	replacements["CALL_TIMEOUT_MS"] = timeoutExpr
 	result, err := createCommonHeader(p, mmapProg, replacements, opts)
 	if err != nil {
 		return nil, err
@@ -146,7 +169,7 @@ func (ctx *context) generateSyscallDefines() string {
 		fmt.Fprintf(buf, "#define %v%v %v\n", prefix, name, ctx.calls[name])
 		fmt.Fprintf(buf, "#endif\n")
 	}
-	if ctx.target.OS == "linux" && ctx.target.PtrSize == 4 {
+	if ctx.target.OS == targets.Linux && ctx.target.PtrSize == 4 {
 		// This is a dirty hack.
 		// On 32-bit linux mmap translated to old_mmap syscall which has a different signature.
 		// mmap2 has the right signature. syz-extract translates mmap to mmap2, do the same here.
@@ -187,9 +210,10 @@ func (ctx *context) generateCalls(p prog.ExecProg, trace bool) ([]string, []uint
 		callName := call.Meta.CallName
 		resCopyout := call.Index != prog.ExecNoCopyout
 		argCopyout := len(call.Copyout) != 0
-		emitCall := ctx.opts.NetInjection ||
+		emitCall := (ctx.opts.NetInjection ||
 			callName != "syz_emit_ethernet" &&
-				callName != "syz_extract_tcp_res"
+				callName != "syz_extract_tcp_res") &&
+			(ctx.opts.VhciInjection || callName != "syz_emit_vhci")
 		// TODO: if we don't emit the call we must also not emit copyin, copyout and fault injection.
 		// However, simply skipping whole iteration breaks tests due to unused static functions.
 		if emitCall {
@@ -209,12 +233,61 @@ func (ctx *context) generateCalls(p prog.ExecProg, trace bool) ([]string, []uint
 
 func (ctx *context) emitCall(w *bytes.Buffer, call prog.ExecCall, ci int, haveCopyout, trace bool) {
 	callName := call.Meta.CallName
-	native := ctx.sysTarget.SyscallNumbers && !strings.HasPrefix(callName, "syz_")
+	_, trampoline := ctx.sysTarget.SyscallTrampolines[callName]
+	native := ctx.sysTarget.SyscallNumbers && !strings.HasPrefix(callName, "syz_") && !trampoline
 	fmt.Fprintf(w, "\t")
+	if !native {
+		// This mimics the same as executor does for execute_syscall,
+		// but only for non-native syscalls to reduce clutter (native syscalls are assumed to not crash).
+		// Arrange for res = -1 in case of syscall abort, we care about errno only if we are tracing for pkg/runtest.
+		if haveCopyout || trace {
+			fmt.Fprintf(w, "res = -1;\n\t")
+		}
+		if trace {
+			fmt.Fprintf(w, "errno = EFAULT;\n\t")
+		}
+		fmt.Fprintf(w, "NONFAILING(")
+	}
 	if haveCopyout || trace {
 		fmt.Fprintf(w, "res = ")
 	}
-	ctx.emitCallName(w, call, native)
+	ctx.emitCallBody(w, call, native)
+	if !native {
+		fmt.Fprintf(w, ")") // close NONFAILING macro
+	}
+	fmt.Fprintf(w, ");")
+	comment := ctx.target.AnnotateCall(call)
+	if comment != "" {
+		fmt.Fprintf(w, " /* %s */", comment)
+	}
+	fmt.Fprintf(w, "\n")
+	if trace {
+		cast := ""
+		if !native && !strings.HasPrefix(callName, "syz_") {
+			// Potentially we casted a function returning int to a function returning intptr_t.
+			// So instead of intptr_t -1 we can get 0x00000000ffffffff. Sign extend it to intptr_t.
+			cast = "(intptr_t)(int)"
+		}
+		fmt.Fprintf(w, "\tfprintf(stderr, \"### call=%v errno=%%u\\n\", %vres == -1 ? errno : 0);\n", ci, cast)
+	}
+}
+
+func (ctx *context) emitCallBody(w *bytes.Buffer, call prog.ExecCall, native bool) {
+	callName, ok := ctx.sysTarget.SyscallTrampolines[call.Meta.CallName]
+	if !ok {
+		callName = call.Meta.CallName
+	}
+	if native {
+		fmt.Fprintf(w, "syscall(%v%v", ctx.sysTarget.SyscallPrefix, callName)
+	} else if strings.HasPrefix(callName, "syz_") {
+		fmt.Fprintf(w, "%v(", callName)
+	} else {
+		args := strings.Repeat(",intptr_t", len(call.Args))
+		if args != "" {
+			args = args[1:]
+		}
+		fmt.Fprintf(w, "((intptr_t(*)(%v))CAST(%v))(", args, callName)
+	}
 	for ai, arg := range call.Args {
 		if native || ai > 0 {
 			fmt.Fprintf(w, ", ")
@@ -245,36 +318,6 @@ func (ctx *context) emitCall(w *bytes.Buffer, call prog.ExecCall, ci int, haveCo
 			fmt.Fprintf(w, ", ")
 		}
 		fmt.Fprintf(w, "0")
-	}
-	fmt.Fprintf(w, ");")
-	comment := ctx.target.AnnotateCall(call)
-	if len(comment) != 0 {
-		fmt.Fprintf(w, " /* %s */", comment)
-	}
-	fmt.Fprintf(w, "\n")
-	if trace {
-		cast := ""
-		if !native && !strings.HasPrefix(callName, "syz_") {
-			// Potentially we casted a function returning int to a function returning intptr_t.
-			// So instead of intptr_t -1 we can get 0x00000000ffffffff. Sign extend it to intptr_t.
-			cast = "(intptr_t)(int)"
-		}
-		fmt.Fprintf(w, "\tfprintf(stderr, \"### call=%v errno=%%u\\n\", %vres == -1 ? errno : 0);\n", ci, cast)
-	}
-}
-
-func (ctx *context) emitCallName(w *bytes.Buffer, call prog.ExecCall, native bool) {
-	callName := call.Meta.CallName
-	if native {
-		fmt.Fprintf(w, "syscall(%v%v", ctx.sysTarget.SyscallPrefix, callName)
-	} else if strings.HasPrefix(callName, "syz_") {
-		fmt.Fprintf(w, "%v(", callName)
-	} else {
-		args := strings.Repeat(",intptr_t", len(call.Args))
-		if args != "" {
-			args = args[1:]
-		}
-		fmt.Fprintf(w, "((intptr_t(*)(%v))CAST(%v))(", args, callName)
 	}
 }
 
@@ -309,18 +352,27 @@ func (ctx *context) copyin(w *bytes.Buffer, csumSeq *int, copyin prog.ExecCopyin
 				panic("bitfield+string format")
 			}
 			htobe := ""
-			if arg.Format == prog.FormatBigEndian {
+			if ctx.target.LittleEndian && arg.Format == prog.FormatBigEndian {
 				htobe = fmt.Sprintf("htobe%v", arg.Size*8)
+			}
+			bitfieldOffset := arg.BitfieldOffset
+			if !ctx.target.LittleEndian {
+				bitfieldOffset = arg.Size*8 - arg.BitfieldOffset - arg.BitfieldLength
 			}
 			fmt.Fprintf(w, "\tNONFAILING(STORE_BY_BITMASK(uint%v, %v, 0x%x, %v, %v, %v));\n",
 				arg.Size*8, htobe, copyin.Addr, ctx.constArgToStr(arg, false, false),
-				arg.BitfieldOffset, arg.BitfieldLength)
+				bitfieldOffset, arg.BitfieldLength)
 		}
 	case prog.ExecArgResult:
 		ctx.copyinVal(w, copyin.Addr, arg.Size, ctx.resultArgToStr(arg), arg.Format)
 	case prog.ExecArgData:
-		fmt.Fprintf(w, "\tNONFAILING(memcpy((void*)0x%x, \"%s\", %v));\n",
-			copyin.Addr, toCString(arg.Data, arg.Readable), len(arg.Data))
+		if bytes.Equal(arg.Data, bytes.Repeat(arg.Data[:1], len(arg.Data))) {
+			fmt.Fprintf(w, "\tNONFAILING(memset((void*)0x%x, %v, %v));\n",
+				copyin.Addr, arg.Data[0], len(arg.Data))
+		} else {
+			fmt.Fprintf(w, "\tNONFAILING(memcpy((void*)0x%x, \"%s\", %v));\n",
+				copyin.Addr, toCString(arg.Data, arg.Readable), len(arg.Data))
+		}
 	case prog.ExecArgCsum:
 		switch arg.Kind {
 		case prog.ExecArgCsumInet:
@@ -359,7 +411,7 @@ func (ctx *context) copyinVal(w *bytes.Buffer, addr, size uint64, val string, bf
 }
 
 func (ctx *context) copyout(w *bytes.Buffer, call prog.ExecCall, resCopyout bool) {
-	if ctx.sysTarget.OS == "fuchsia" {
+	if ctx.sysTarget.OS == targets.Fuchsia {
 		// On fuchsia we have real system calls that return ZX_OK on success,
 		// and libc calls that are casted to function returning intptr_t,
 		// as the result int -1 is returned as 0x00000000ffffffff rather than full -1.
@@ -399,18 +451,18 @@ func (ctx *context) constArgToStr(arg prog.ExecArgConst, handleBigEndian, native
 	}
 	if native && arg.Size == 8 {
 		// syscall() is variadic, so constant arguments must be explicitly
-		// promoted.  Otherwise the compiler is free to leave garbage in the
-		// upper 32 bits of the argument value.  In practice this can happen
+		// promoted. Otherwise the compiler is free to leave garbage in the
+		// upper 32 bits of the argument value. In practice this can happen
 		// on amd64 with arguments that are passed on the stack, i.e.,
-		// arguments beyond the first six.  For example, on freebsd/amd64,
+		// arguments beyond the first six. For example, on freebsd/amd64,
 		// syscall(SYS_mmap, ..., 0) causes clang to emit a 32-bit store of
 		// 0 to the stack, but the kernel expects a 64-bit value.
 		//
 		// syzkaller's argument type representations do not always match
-		// the OS ABI.  For instance, "flags" is always 64 bits wide on 64-bit
+		// the OS ABI. For instance, "flags" is always 64 bits wide on 64-bit
 		// platforms, but is a 32-bit value ("unsigned int" or so) in many
-		// cases.  Thus, we assume here that passing a 64-bit argument where
-		// a 32-bit argument is expected won't break anything.  On amd64
+		// cases. Thus, we assume here that passing a 64-bit argument where
+		// a 32-bit argument is expected won't break anything. On amd64
 		// this should be fine: arguments are passed in 64-bit registers or
 		// at 64 bit-aligned addresses on the stack.
 		if ctx.target.PtrSize == 4 {
@@ -453,7 +505,7 @@ func (ctx *context) postProcess(result []byte) []byte {
 	result = regexp.MustCompile(`\t*debug\((.*\n)*?.*\);\n`).ReplaceAll(result, nil)
 	result = regexp.MustCompile(`\t*debug_dump_data\((.*\n)*?.*\);\n`).ReplaceAll(result, nil)
 	result = regexp.MustCompile(`\t*exitf\((.*\n)*?.*\);\n`).ReplaceAll(result, []byte("\texit(1);\n"))
-	result = regexp.MustCompile(`\t*fail\((.*\n)*?.*\);\n`).ReplaceAll(result, []byte("\texit(1);\n"))
+	result = regexp.MustCompile(`\t*fail(msg)?\((.*\n)*?.*\);\n`).ReplaceAll(result, []byte("\texit(1);\n"))
 
 	result = ctx.hoistIncludes(result)
 	result = ctx.removeEmptyLines(result)
@@ -479,7 +531,7 @@ func (ctx *context) hoistIncludes(result []byte) []byte {
 			sortedBottom = append(sortedBottom, include)
 		} else if strings.Contains(include, "<netinet/if_ether.h>") {
 			sortedBottom = append(sortedBottom, include)
-		} else if ctx.target.OS == freebsd && strings.Contains(include, "<sys/types.h>") {
+		} else if ctx.target.OS == targets.FreeBSD && strings.Contains(include, "<sys/types.h>") {
 			sortedTop = append(sortedTop, include)
 		} else {
 			sorted = append(sorted, include)

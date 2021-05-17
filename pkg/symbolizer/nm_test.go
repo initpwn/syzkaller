@@ -8,7 +8,8 @@ import (
 )
 
 func TestSymbols(t *testing.T) {
-	symbols, err := ReadTextSymbols("testdata/nm.test.out")
+	symb := NewSymbolizer(nil)
+	symbols, err := symb.ReadTextSymbols("testdata/nm.test.out")
 	if err != nil {
 		t.Fatalf("failed to read symbols: %v", err)
 	}
@@ -51,7 +52,7 @@ func TestSymbols(t *testing.T) {
 	}
 }
 
-func symcmp(want Symbol, got Symbol) bool {
+func symcmp(want, got Symbol) bool {
 	if want.Addr != got.Addr {
 		return false
 	}

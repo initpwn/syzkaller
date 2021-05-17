@@ -15,7 +15,6 @@ import (
 	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/pkg/report"
 	"github.com/google/syzkaller/pkg/repro"
-	"github.com/google/syzkaller/prog"
 	"github.com/google/syzkaller/vm"
 )
 
@@ -40,9 +39,6 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to open log file %v: %v", logFile, err)
 	}
-	if _, err := prog.GetTarget(cfg.TargetOS, cfg.TargetArch); err != nil {
-		log.Fatalf("%v", err)
-	}
 	vmPool, err := vm.Create(cfg, *flagDebug)
 	if err != nil {
 		log.Fatalf("%v", err)
@@ -64,16 +60,16 @@ func main() {
 	}
 	osutil.HandleInterrupts(vm.Shutdown)
 
-	res, stats, err := repro.Run(data, cfg, reporter, vmPool, vmIndexes)
+	res, stats, err := repro.Run(data, cfg, nil, reporter, vmPool, vmIndexes)
 	if err != nil {
 		log.Logf(0, "reproduction failed: %v", err)
 	}
 	if stats != nil {
-		fmt.Printf("Extracting prog: %v\n", stats.ExtractProgTime)
-		fmt.Printf("Minimizing prog: %v\n", stats.MinimizeProgTime)
-		fmt.Printf("Simplifying prog options: %v\n", stats.SimplifyProgTime)
-		fmt.Printf("Extracting C: %v\n", stats.ExtractCTime)
-		fmt.Printf("Simplifying C: %v\n", stats.SimplifyCTime)
+		fmt.Printf("extracting prog: %v\n", stats.ExtractProgTime)
+		fmt.Printf("minimizing prog: %v\n", stats.MinimizeProgTime)
+		fmt.Printf("simplifying prog options: %v\n", stats.SimplifyProgTime)
+		fmt.Printf("extracting C: %v\n", stats.ExtractCTime)
+		fmt.Printf("simplifying C: %v\n", stats.SimplifyCTime)
 	}
 	if res == nil {
 		return

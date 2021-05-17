@@ -11,6 +11,84 @@
 #include <string.h>
 #include <sys/syscall.h>
 
+#if GOOS_netbsd
+
+#if SYZ_EXECUTOR || __NR_syz_usb_connect
+#include "common_usb_netbsd.h"
+#endif
+#if SYZ_EXECUTOR || SYZ_USB
+#include <dirent.h>
+static void setup_usb(void)
+{
+	DIR* dir = opendir("/dev");
+	if (dir == NULL)
+		fail("failed to open /dev");
+
+	struct dirent* ent = NULL;
+	while ((ent = readdir(dir)) != NULL) {
+		if (ent->d_type != DT_CHR)
+			continue;
+		if (strncmp(ent->d_name, "vhci", 4))
+			continue;
+		char path[1024];
+		snprintf(path, sizeof(path), "/dev/%s", ent->d_name);
+		if (chmod(path, 0666))
+			failmsg("failed to chmod vhci", "path=%s", path);
+	}
+
+	closedir(dir);
+}
+#endif
+
+#if SYZ_EXECUTOR || SYZ_FAULT
+#include <fcntl.h>
+#include <sys/fault.h>
+static void setup_fault(void)
+{
+	if (chmod("/dev/fault", 0666))
+		fail("failed to chmod /dev/fault");
+}
+static int inject_fault(int nth)
+{
+	struct fault_ioc_enable en;
+	int fd;
+
+	fd = open("/dev/fault", O_RDWR);
+	if (fd == -1)
+		fail("failed to open /dev/fault");
+
+	en.scope = FAULT_SCOPE_LWP;
+	en.mode = 0; // FAULT_MODE_NTH_ONESHOT
+	en.nth = nth + 2; // FAULT_NTH_MIN
+	if (ioctl(fd, FAULT_IOC_ENABLE, &en) != 0)
+		failmsg("FAULT_IOC_ENABLE failed", "nth=%d", nth);
+
+	return fd;
+}
+#endif
+#if SYZ_EXECUTOR
+static int fault_injected(int fd)
+{
+	struct fault_ioc_getinfo info;
+	struct fault_ioc_disable dis;
+	int res;
+
+	if (ioctl(fd, FAULT_IOC_GETINFO, &info) != 0)
+		fail("FAULT_IOC_GETINFO failed");
+	res = (info.nfaults > 0);
+
+	dis.scope = FAULT_SCOPE_LWP;
+	if (ioctl(fd, FAULT_IOC_DISABLE, &dis) != 0)
+		fail("FAULT_IOC_DISABLE failed");
+
+	close(fd);
+
+	return res;
+}
+#endif
+
+#endif
+
 #if GOOS_openbsd
 
 #define __syscall syscall
@@ -67,13 +145,11 @@ static int tunfd = -1;
 
 static void vsnprintf_check(char* str, size_t size, const char* format, va_list args)
 {
-	int rv;
-
-	rv = vsnprintf(str, size, format, args);
+	int rv = vsnprintf(str, size, format, args);
 	if (rv < 0)
 		fail("vsnprintf failed");
 	if ((size_t)rv >= size)
-		fail("vsnprintf: string '%s...' doesn't fit into buffer", str);
+		failmsg("vsnprintf: string doesn't fit into buffer", "string='%s'", str);
 }
 
 static void snprintf_check(char* str, size_t size, const char* format, ...)
@@ -92,20 +168,18 @@ static void snprintf_check(char* str, size_t size, const char* format, ...)
 static void execute_command(bool panic, const char* format, ...)
 {
 	va_list args;
-	char command[PATH_PREFIX_LEN + COMMAND_MAX_LEN];
-	int rv;
-
 	va_start(args, format);
 	// Executor process does not have any env, including PATH.
 	// On some distributions, system/shell adds a minimal PATH, on some it does not.
 	// Set own standard PATH to make it work across distributions.
+	char command[PATH_PREFIX_LEN + COMMAND_MAX_LEN];
 	memcpy(command, PATH_PREFIX, PATH_PREFIX_LEN);
 	vsnprintf_check(command + PATH_PREFIX_LEN, COMMAND_MAX_LEN, format, args);
 	va_end(args);
-	rv = system(command);
+	int rv = system(command);
 	if (rv) {
 		if (panic)
-			fail("command '%s' failed: %d", &command[0], rv);
+			failmsg("command failed", "command=%s: %d", &command[0], rv);
 		debug("command '%s': %d\n", &command[0], rv);
 	}
 }
@@ -117,9 +191,8 @@ static void initialize_tun(int tun_id)
 		return;
 #endif // SYZ_EXECUTOR
 
-	if (tun_id < 0 || tun_id >= MAX_TUN) {
-		fail("tun_id out of range %d\n", tun_id);
-	}
+	if (tun_id < 0 || tun_id >= MAX_TUN)
+		failmsg("tun_id out of range", "tun_id=%d", tun_id);
 
 	char tun_device[sizeof(TUN_DEVICE)];
 	snprintf_check(tun_device, sizeof(tun_device), TUN_DEVICE, tun_id);
@@ -145,7 +218,7 @@ static void initialize_tun(int tun_id)
 #endif
 	if (tunfd == -1) {
 #if SYZ_EXECUTOR
-		fail("tun: can't open %s\n", tun_device);
+		failmsg("tun: can't open device", "device=%s", tun_device);
 #else
 		printf("tun: can't open %s: errno=%d\n", tun_device, errno);
 		return;
@@ -226,7 +299,7 @@ static int read_tun(char* data, int size)
 	if (rv < 0) {
 		if (errno == EAGAIN)
 			return -1;
-		fail("tun: read failed with %d", rv);
+		fail("tun: read failed");
 	}
 	return rv;
 }
@@ -271,12 +344,11 @@ static long syz_extract_tcp_res(volatile long a0, volatile long a1, volatile lon
 	size_t length = rv;
 	debug_dump_data(data, length);
 
-	struct tcphdr* tcphdr;
-
 	if (length < sizeof(struct ether_header))
 		return (uintptr_t)-1;
 	struct ether_header* ethhdr = (struct ether_header*)&data[0];
 
+	struct tcphdr* tcphdr = 0;
 	if (ethhdr->ether_type == htons(ETHERTYPE_IP)) {
 		if (length < sizeof(struct ether_header) + sizeof(struct ip))
 			return (uintptr_t)-1;
@@ -299,8 +371,8 @@ static long syz_extract_tcp_res(volatile long a0, volatile long a1, volatile lon
 	}
 
 	struct tcp_resources* res = (struct tcp_resources*)a0;
-	NONFAILING(res->seq = htonl((ntohl(tcphdr->th_seq) + (uint32)a1)));
-	NONFAILING(res->ack = htonl((ntohl(tcphdr->th_ack) + (uint32)a2)));
+	res->seq = htonl(ntohl(tcphdr->th_seq) + (uint32)a1);
+	res->ack = htonl(ntohl(tcphdr->th_ack) + (uint32)a2);
 
 	debug("extracted seq: %08x\n", res->seq);
 	debug("extracted ack: %08x\n", res->ack);
@@ -316,8 +388,13 @@ static long syz_extract_tcp_res(volatile long a0, volatile long a1, volatile lon
 
 static void sandbox_common()
 {
-	if (setsid() == -1)
-		fail("setsid failed");
+#if !SYZ_THREADED
+#if SYZ_EXECUTOR
+	if (!flag_threaded)
+#endif
+		if (setsid() == -1)
+			fail("setsid failed");
+#endif
 
 	// Some minimal sandboxing.
 	struct rlimit rlim;

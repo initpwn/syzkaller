@@ -41,7 +41,10 @@ include <linux/ip.h>
 include <linux/tcp.h>
 include <linux/udp.h>
 include <linux/kcmp.h>
+include <linux/nfs.h>
 include <linux/syslog.h>
+include <linux/exportfs.h>
+include <fs/overlayfs/overlayfs.h>
 include <uapi/linux/memfd.h>
 include <uapi/linux/module.h>
 include <linux/ioprio.h>
@@ -50,8 +53,8 @@ include <uapi/linux/kcov.h>
 include <uapi/linux/membarrier.h>
 include <uapi/linux/capability.h>
 include <uapi/linux/seccomp.h>
-include <uapi/linux/suspend_ioctls.h>
 include <kernel/sched/sched.h>
+include <uapi/linux/close_range.h>
 
 resource fd[int32]: -1
 resource fd_dir[fd]: AT_FDCWD
@@ -80,17 +83,25 @@ open(file ptr[in, filename], flags flags[open_flags], mode flags[open_mode]) fd
 open$dir(file ptr[in, filename], flags flags[open_flags], mode flags[open_mode]) fd_dir
 openat$dir(fd const[AT_FDCWD], file ptr[in, filename], flags flags[open_flags], mode flags[open_mode]) fd_dir
 openat(fd fd_dir[opt], file ptr[in, filename], flags flags[open_flags], mode flags[open_mode]) fd
+openat2$dir(fd const[AT_FDCWD], file ptr[in, filename], how ptr[in, open_how], size bytesize[how]) fd_dir
+openat2(fd fd_dir[opt], file ptr[in, filename], how ptr[in, open_how], size bytesize[how]) fd
 creat(file ptr[in, filename], mode flags[open_mode]) fd
 close(fd fd)
 read(fd fd, buf buffer[out], count len[buf])
 pread64(fd fd, buf buffer[out], count len[buf], pos fileoff)
 readv(fd fd, vec ptr[in, array[iovec_out]], vlen len[vec])
-preadv(fd fd, vec ptr[in, array[iovec_out]], vlen len[vec], off fileoff)
+preadv(fd fd, vec ptr[in, array[iovec_out]], vlen len[vec], off_low int32, off_high int32)
+preadv2(fd fd, vec ptr[in, array[iovec_out]], vlen len[vec], off_low int32, off_high int32, flags flags[rwf_flags])
 write(fd fd, buf buffer[in], count len[buf])
 pwrite64(fd fd, buf buffer[in], count len[buf], pos fileoff)
 writev(fd fd, vec ptr[in, array[iovec_in]], vlen len[vec])
-pwritev(fd fd, vec ptr[in, array[iovec_in]], vlen len[vec], off fileoff)
+pwritev(fd fd, vec ptr[in, array[iovec_in]], vlen len[vec], off_low int32, off_high int32)
+pwritev2(fd fd, vec ptr[in, array[iovec_in]], vlen len[vec], off_low int32, off_high int32, flags flags[rwf_flags])
 lseek(fd fd, offset fileoff, whence flags[seek_whence])
+copy_file_range(fd_in fd, off_in ptr[inout, fileoff[int64], opt], fd_out fd, off_out ptr[inout, fileoff[int64], opt], len intptr, flags flags[copy_file_range_flags])
+
+rwf_flags = RWF_DSYNC, RWF_HIPRI, RWF_SYNC, RWF_NOWAIT, RWF_APPEND
+copy_file_range_flags = 0
 
 dup(oldfd fd) fd
 dup2(oldfd fd, newfd fd) fd
@@ -129,10 +140,9 @@ epoll_ctl$EPOLL_CTL_DEL(epfd fd_epoll, op const[EPOLL_CTL_DEL], fd fd)
 epoll_wait(epfd fd_epoll, events ptr[out, array[epoll_event]], maxevents len[events], timeout int32)
 epoll_pwait(epfd fd_epoll, events ptr[out, array[epoll_event]], maxevents len[events], timeout int32, sigmask ptr[in, sigset_t], size len[sigmask])
 
-resource fd_signal[fd]
 resource fd_timer[fd]
-signalfd(fd fd, mask ptr[in, sigset_t], size len[mask]) fd_signal
-signalfd4(fd fd, mask ptr[in, sigset_t], size len[mask], flags flags[signalfd_flags]) fd_signal
+signalfd(fd fd, mask ptr[in, sigset_t], size len[mask]) fd
+signalfd4(fd fd, mask ptr[in, sigset_t], size len[mask], flags flags[signalfd_flags]) fd
 timerfd_create(clockid flags[clock_type], flags flags[timerfd_create_flags]) fd_timer
 timerfd_settime(fd fd_timer, flags flags[timerfd_settime_flags], new ptr[in, itimerspec], old ptr[out, itimerspec])
 timerfd_gettime(fd fd_timer, cur ptr[out, itimerspec])
@@ -150,6 +160,7 @@ remap_file_pages(addr vma, size len[addr], prot flags[mmap_prot], pgoff intptr, 
 mprotect(addr vma, len len[addr], prot flags[mmap_prot])
 msync(addr vma, len len[addr], f flags[msync_flags])
 madvise(addr vma, len len[addr], advice flags[madvise_flags])
+process_madvise(pidfd fd_pidfd, vec ptr[in, array[iovec_in]], vlen len[vec], advice flags[madvise_flags], flags const[0])
 fadvise64(fd fd, offset fileoff, len intptr, advice flags[fadvise_flags])
 readahead(fd fd, off intptr, count intptr)
 mbind(addr vma, len len[addr], mode flags[mbind_mode], nodemask ptr[in, int64], maxnode intptr, flags flags[mbind_flags])
@@ -256,6 +267,8 @@ mq_unlink(name ptr[in, string])
 
 mknod(file ptr[in, filename], mode flags[mknod_mode], dev int32)
 mknod$loop(file ptr[in, filename], mode flags[mknod_mode], dev proc[1792, 2])
+mknodat$loop(dirfd fd_dir, file ptr[in, filename], mode flags[mknod_mode], dev proc[1792, 2])
+mknodat$null(dirfd fd_dir, file ptr[in, filename], mode flags[mknod_mode], dev const[0x103])
 mknodat(dirfd fd_dir, file ptr[in, filename], mode flags[mknod_mode], dev int32)
 chmod(file ptr[in, filename], mode flags[open_mode])
 fchmod(fd fd, mode flags[open_mode])
@@ -265,17 +278,19 @@ lchown(file ptr[in, filename], uid uid, gid gid)
 fchown(fd fd, uid uid, gid gid)
 fchownat(dirfd fd_dir, file ptr[in, filename], uid uid, gid gid, flags flags[at_flags])
 fallocate(fd fd, mode flags[fallocate_mode], off intptr, len intptr)
-faccessat(dirfd fd_dir, pathname ptr[in, filename], mode flags[open_mode], flags flags[faccessat_flags])
+faccessat(dirfd fd_dir, pathname ptr[in, filename], mode flags[open_mode])
+faccessat2(dirfd fd_dir, pathname ptr[in, filename], mode flags[open_mode], flags flags[faccessat_flags])
 utime(filename ptr[in, filename], times ptr[in, utimbuf])
 utimes(filename ptr[in, filename], times ptr[in, itimerval])
 futimesat(dir fd_dir, pathname ptr[in, filename], times ptr[in, itimerval])
 utimensat(dir fd_dir, pathname ptr[in, filename], times ptr[in, itimerval], flags flags[utimensat_flags])
 
+fork() pid (breaks_returns)
 clone(flags flags[clone_flags], sp buffer[in], parentid ptr[out, int32], childtid ptr[out, int32], tls buffer[in]) (breaks_returns)
 clone3(args ptr[in, clone_args], size bytesize[args]) pid (breaks_returns)
 
 clone_args {
-	flags		flags[clone_flags, int64]
+	flags		flags[clone3_flags, int64]
 	pidfd		ptr64[out, fd_pidfd]
 	child_tid	ptr64[out, pid]
 	parent_tid	ptr64[out, pid]
@@ -285,6 +300,7 @@ clone_args {
 	tls		ptr64[out, array[int8]]
 	set_tid		ptr64[in, array[pid]]
 	set_tid_size	len[set_tid, int64]
+	cgroup		align64[fd_cgroup]
 }
 
 resource pid[int32]: 0, -1
@@ -379,8 +395,32 @@ iopl(level int8)
 ioperm(from intptr, num intptr, on intptr)
 ioprio_get$pid(which flags[ioprio_which_pid], who pid)
 ioprio_get$uid(which flags[ioprio_which_uid], who uid)
-ioprio_set$pid(which flags[ioprio_which_pid], who pid, prio intptr)
-ioprio_set$uid(which flags[ioprio_which_uid], who uid, prio intptr)
+ioprio_set$pid(which flags[ioprio_which_pid], who pid, ioprio flags[ioprio_priorities])
+ioprio_set$uid(which flags[ioprio_which_uid], who uid, ioprio flags[ioprio_priorities])
+
+# NEED: we can express the construction of integers using structs with flags
+# and bitfields, which are normally obtained using a combination of bitwise
+# operations with the help of macros. However, structs can't be directly passed
+# as a syscall argument; therefore, such constructions can't be directly passed either.
+# One example is ioprio argument for ioprio_set, where we could have expressed the
+# construction less messy. For now, some subset of valid values are enumerated as
+# in ioprio_priorities.
+
+# ioprio priority values are obtained using IOPRIO_PRIO_VALUE(class, data) macro.
+# the behaviour of the macro is mimicked below and some priority values are enumerated.
+ioprio_priorities = IOPRIO_CLASS_NONE_PRIO, IOPRIO_CLASS_IDLE_PRIO, IOPRIO_CLASS_RT_HIGH_PRIO, IOPRIO_CLASS_BE_HIGH_PRIO, IOPRIO_CLASS_RT_MID_PRIO, IOPRIO_CLASS_BE_MID_PRIO, IOPRIO_CLASS_RT_LOW_PRIO, IOPRIO_CLASS_BE_LOW_PRIO
+
+# The classes RT and BE take data values from the range [0:7]. Use a subset of the available
+# values (0, 4, 7) to ease collisions, and to avoid redundancy. The classes NONE and IDLE
+# have only one valid priority value each with data set to 0.
+define IOPRIO_CLASS_NONE_PRIO	(IOPRIO_CLASS_NONE << IOPRIO_CLASS_SHIFT)
+define IOPRIO_CLASS_IDLE_PRIO	(IOPRIO_CLASS_IDLE << IOPRIO_CLASS_SHIFT)
+define IOPRIO_CLASS_RT_HIGH_PRIO	(IOPRIO_CLASS_RT << IOPRIO_CLASS_SHIFT)
+define IOPRIO_CLASS_BE_HIGH_PRIO	(IOPRIO_CLASS_BE << IOPRIO_CLASS_SHIFT)
+define IOPRIO_CLASS_RT_MID_PRIO	((IOPRIO_CLASS_RT << IOPRIO_CLASS_SHIFT) + 4)
+define IOPRIO_CLASS_BE_MID_PRIO	((IOPRIO_CLASS_BE << IOPRIO_CLASS_SHIFT) + 4)
+define IOPRIO_CLASS_RT_LOW_PRIO	((IOPRIO_CLASS_RT << IOPRIO_CLASS_SHIFT) + 7)
+define IOPRIO_CLASS_BE_LOW_PRIO	((IOPRIO_CLASS_BE << IOPRIO_CLASS_SHIFT) + 7)
 
 resource timerid[int32]
 timer_create(id flags[clock_id], ev ptr[in, sigevent], timerid ptr[out, timerid])
@@ -466,16 +506,68 @@ rseq_cs {
 
 rseq_cs_flags = RSEQ_CS_FLAG_NO_RESTART_ON_PREEMPT, RSEQ_CS_FLAG_NO_RESTART_ON_SIGNAL, RSEQ_CS_FLAG_NO_RESTART_ON_MIGRATE
 
+# start/end are unused for now, no definition of SYS_RISCV_FLUSH_ICACHE_LOCAL in uapi headers.
+riscv_flush_icache(start const[0], end const[0], flags bool32)
+
 syz_open_procfs(pid pid, file ptr[in, string[procfs_proc_file]]) fd
 
 # TODO: some of net files are only available in the init namespace (e.g. bluetooth bnep and hci).
 # We could find some way to open these files in the init namespace
 # esp. taking into account that we create bluetooth sockets in init namespace.
-procfs_proc_file = "auxv", "cmdline", "environ", "autogroup", "cgroup", "clear_refs", "comm", "coredump_filter", "cpuset", "gid_map", "io", "limits", "loginuid", "maps", "mountinfo", "mounts", "mountstats", "numa_maps", "oom_adj", "oom_score", "oom_score_adj", "pagemap", "personality", "projid_map", "sched", "schedstat", "sessionid", "setgroups", "smaps", "smaps_rollup", "stack", "stat", "statm", "status", "syscall", "timers", "uid_map", "wchan", "map_files", "attr", "attr/current", "attr/exec", "attr/fscreate", "attr/keycreate", "attr/prev", "attr/sockcreate", "ns", "children", "task", "fd", "fd/3", "fd/4", "fdinfo", "fdinfo/3", "fdinfo/4", "net", "net/anycast6", "net/arp", "net/bnep", "net/connector", "net/dev", "net/dev_mcast", "net/dev_snmp6", "net/fib_trie", "net/fib_triestat", "net/hci", "net/icmp", "net/icmp6", "net/if_inet6", "net/igmp", "net/igmp6", "net/ip6_flowlabel", "net/ip6_mr_cache", "net/ip6_mr_vif", "net/ip6_tables_matches", "net/ip6_tables_names", "net/ip6_tables_targets", "net/ip_mr_cache", "net/ip_mr_vif", "net/ip_tables_matches", "net/ip_tables_names", "net/ip_tables_targets", "net/ipv6_route", "net/ipx", "net/l2cap", "net/llc/core", "net/llc/socket", "net/mcfilter", "net/mcfilter6", "net/netfilter", "net/netlink", "net/netstat", "net/nfsfs", "net/packet", "net/protocols", "net/psched", "net/ptype", "net/raw", "net/raw6", "net/rfcomm", "net/route", "net/rpc", "net/rt6_stats", "net/rt_acct", "net/rt_cache", "net/sco", "net/sctp", "net/snmp", "net/snmp6", "net/sockstat", "net/sockstat6", "net/softnet_stat", "net/stat", "net/tcp", "net/tcp6", "net/udp", "net/udp6", "net/udplite", "net/udplite6", "net/unix", "net/wireless", "net/xfrm_stat", "net/ip_vs", "net/ip_vs_stats", "net/ip_vs_stats_percpu", "net/nf_conntrack", "net/nf_conntrack_expect", "net/vlan/config", "net/vlan/vlan0", "net/vlan/vlan1", "net/kcm", "net/psched", "timerslack_ns"
+procfs_proc_file = "auxv", "cmdline", "environ", "autogroup", "cgroup", "clear_refs", "comm", "coredump_filter", "cpuset", "gid_map", "io", "limits", "loginuid", "maps", "mountinfo", "mounts", "mountstats", "numa_maps", "oom_adj", "oom_score", "oom_score_adj", "pagemap", "personality", "projid_map", "sched", "schedstat", "sessionid", "setgroups", "smaps", "smaps_rollup", "totmaps", "stack", "stat", "statm", "status", "syscall", "timers", "uid_map", "wchan", "map_files", "attr", "attr/current", "attr/exec", "attr/fscreate", "attr/keycreate", "attr/prev", "attr/sockcreate", "ns", "children", "task", "fd", "fd/3", "fd/4", "fdinfo", "fdinfo/3", "fdinfo/4", "net", "net/anycast6", "net/arp", "net/bnep", "net/connector", "net/dev", "net/dev_mcast", "net/dev_snmp6", "net/fib_trie", "net/fib_triestat", "net/hci", "net/icmp", "net/icmp6", "net/if_inet6", "net/igmp", "net/igmp6", "net/ip6_flowlabel", "net/ip6_mr_cache", "net/ip6_mr_vif", "net/ip6_tables_matches", "net/ip6_tables_names", "net/ip6_tables_targets", "net/ip_mr_cache", "net/ip_mr_vif", "net/ip_tables_matches", "net/ip_tables_names", "net/ip_tables_targets", "net/ipv6_route", "net/ipx", "net/l2cap", "net/llc/core", "net/llc/socket", "net/mcfilter", "net/mcfilter6", "net/netfilter", "net/netlink", "net/netstat", "net/nfsfs", "net/packet", "net/protocols", "net/psched", "net/ptype", "net/raw", "net/raw6", "net/rfcomm", "net/route", "net/rpc", "net/rt6_stats", "net/rt_acct", "net/rt_cache", "net/sco", "net/sctp", "net/snmp", "net/snmp6", "net/sockstat", "net/sockstat6", "net/softnet_stat", "net/stat", "net/tcp", "net/tcp6", "net/udp", "net/udp6", "net/udplite", "net/udplite6", "net/unix", "net/wireless", "net/xfrm_stat", "net/ip_vs", "net/ip_vs_stats", "net/ip_vs_stats_percpu", "net/nf_conntrack", "net/nf_conntrack_expect", "net/vlan/config", "net/vlan/vlan0", "net/vlan/vlan1", "net/kcm", "net/psched", "timerslack_ns"
 
 openat$procfs(fd const[AT_FDCWD], file ptr[in, string[procfs_file]], flags const[O_RDONLY], mode const[0]) fd
 
 procfs_file = "/proc/keys", "/proc/key-users", "/proc/crypto", "/proc/consoles", "/proc/cgroups", "/proc/zoneinfo", "/proc/vmstat", "/proc/vmallocinfo", "/proc/tty/drivers", "/proc/tty/ldiscs", "/proc/timer_list", "/proc/sysvipc/sem", "/proc/sysvipc/msg", "/proc/sysvipc/shm", "/proc/stat", "/proc/slabinfo", "/proc/schedstat", "/proc/partitions", "/proc/meminfo", "/proc/mdstat", "/proc/locks", "/proc/diskstats", "/proc/cpuinfo", "/proc/consoles", "/proc/bus/input/devices", "/proc/bus/input/handlers", "/proc/asound/seq/clients", "/proc/asound/seq/clients", "/proc/asound/seq/timer", "/proc/asound/timers"
+
+# Write into some interesting sysct's and sysfs/procfs files.
+resource fd_sysctl[fd]
+
+openat$sysctl(fd const[AT_FDCWD], file ptr[in, string[sysctl_file]], flags const[O_WRONLY], mode const[0]) fd_sysctl
+write$sysctl(fd fd_sysctl, val ptr[in, string[sysctl_value]], len len[val])
+
+sysctl_file = "/sys/kernel/mm/ksm/run", "/proc/sys/vm/compact_memory", "/proc/sys/vm/drop_caches", "/proc/sys/net/ipv4/tcp_timestamps", "/proc/sys/net/ipv4/tcp_sack", "/proc/sys/net/ipv4/tcp_dsack", "/proc/sys/net/ipv4/tcp_window_scaling", "/proc/sys/net/ipv4/tcp_syncookies", "/proc/sys/net/ipv4/tcp_recovery", "/proc/sys/net/ipv4/tcp_mtu_probing", "/proc/sys/net/ipv4/tcp_rfc1337", "/proc/self/clear_refs"
+# Most of these values are suitable for all sysctl_file files.
+sysctl_value = "0", "1", "2", "3", "4", "5", "6", "7"
+
+# Write to this file triggers khugepaged scan.
+# We don't want to write small values as we only want the explicitly triggered scan.
+resource fd_khugepaged_scan[fd]
+
+openat$khugepaged_scan(fd const[AT_FDCWD], file ptr[in, string["/sys/kernel/mm/transparent_hugepage/khugepaged/scan_sleep_millisecs"]], flags const[O_WRONLY], mode const[0]) fd_khugepaged_scan
+write$khugepaged_scan(fd fd_khugepaged_scan, val ptr[in, string["1000000"]], len len[val])
+
+resource fd_tcp_congestion[fd]
+
+openat$tcp_congestion(fd const[AT_FDCWD], file ptr[in, string["/proc/sys/net/ipv4/tcp_congestion_control"]], flags const[O_WRONLY], mode const[0]) fd_tcp_congestion
+write$tcp_congestion(fd fd_tcp_congestion, val ptr[in, string[tcp_congestion]], len len[val])
+
+tcp_congestion = "reno", "bbr", "bic", "cdg", "cubic", "dctcp", "westwood", "highspeed", "hybla", "htcp", "vegas", "nv", "veno", "scalable", "lp", "yeah", "illinois"
+
+resource fd_tcp_mem[fd]
+
+openat$tcp_mem(fd const[AT_FDCWD], file ptr[in, string[tcp_mem_files]], flags const[O_WRONLY], mode const[0]) fd_tcp_mem
+write$tcp_mem(fd fd_tcp_mem, val ptr[in, tcp_mem_values], len len[val])
+
+tcp_mem_files = "/proc/sys/net/ipv4/tcp_rmem", "/proc/sys/net/ipv4/tcp_wmem"
+
+tcp_mem_values {
+	v0	fmt[oct, int64]
+	sp0	const[' ', int8]
+	v1	fmt[oct, int64]
+	sp1	const[' ', int8]
+	v2	fmt[oct, int64]
+	z	const[0, int8]
+} [packed]
+
+# /proc/self/reclaim is ChromeOS-specific:
+# https://chromium.googlesource.com/chromiumos/third_party/kernel/+/4c3ad28b9c913%5E%21/
+resource fd_proc_reclaim[fd]
+
+openat$proc_reclaim(fd const[AT_FDCWD], file ptr[in, string["/proc/self/reclaim"]], flags const[O_WRONLY], mode const[0]) fd_proc_reclaim
+write$proc_reclaim(fd fd_proc_reclaim, val ptr[in, string[proc_reclaim_vals]], len len[val])
+
+proc_reclaim_vals = "file", "anon", "all"
 
 resource fd_pidfd[fd]
 
@@ -484,6 +576,8 @@ openat$thread_pidfd(fd const[AT_FDCWD], file ptr[in, string["/proc/thread-self"]
 pidfd_send_signal(fd fd_pidfd, sig signalno, info ptr[in, siginfo], flags const[0])
 pidfd_open(pid pid, flags const[0]) fd_pidfd
 pidfd_getfd(pidfd fd_pidfd, fd fd, flags const[0]) fd
+
+close_range(fd fd, max_fd fd, flags flags[close_range_flags])
 
 # Uncomment on your own account.
 #syz_open_dev$char(dev const[0xc], major intptr, minor intptr) fd
@@ -506,14 +600,11 @@ openat$vcsu(fd const[AT_FDCWD], file ptr[in, string["/dev/vcsu"]], flags flags[o
 syz_open_dev$vcsu(dev ptr[in, string["/dev/vcsu#"]], id intptr, flags flags[open_flags]) fd
 syz_open_dev$ircomm(dev ptr[in, string["/dev/ircomm#"]], id intptr, flags flags[open_flags]) fd
 syz_open_dev$audion(dev ptr[in, string["/dev/audio#"]], id intptr, flags flags[open_flags]) fd
-syz_open_dev$sndhw(dev ptr[in, string["/dev/snd/hwC#D#"]], id intptr, flags flags[open_flags]) fd
-syz_open_dev$media(dev ptr[in, string["/dev/media#"]], id intptr, flags flags[open_flags]) fd
+syz_open_dev$media(dev ptr[in, string["/dev/media#"]], id intptr, flags flags[open_flags]) fd_media
 
 openat$null(fd const[AT_FDCWD], file ptr[in, string["/dev/null"]], flags flags[open_flags], mode const[0]) fd
 openat$zero(fd const[AT_FDCWD], file ptr[in, string["/dev/zero"]], flags flags[open_flags], mode const[0]) fd
 openat$full(fd const[AT_FDCWD], file ptr[in, string["/dev/full"]], flags flags[open_flags], mode const[0]) fd
-openat$vga_arbiter(fd const[AT_FDCWD], file ptr[in, string["/dev/vga_arbiter"]], flags flags[open_flags], mode const[0]) fd
-openat$qat_adf_ctl(fd const[AT_FDCWD], file ptr[in, string["/dev/qat_adf_ctl"]], flags flags[open_flags], mode const[0]) fd
 openat$irnet(fd const[AT_FDCWD], file ptr[in, string["/dev/irnet"]], flags flags[open_flags], mode const[0]) fd
 openat$hwrng(fd const[AT_FDCWD], file ptr[in, string["/dev/hwrng"]], flags flags[open_flags], mode const[0]) fd
 openat$hpet(fd const[AT_FDCWD], file ptr[in, string["/dev/hpet"]], flags flags[open_flags], mode const[0]) fd
@@ -523,8 +614,6 @@ openat$zygote(fd const[AT_FDCWD], file ptr[in, string["/dev/socket/zygote"]], fl
 openat$sw_sync(fd const[AT_FDCWD], file ptr[in, string["/dev/sw_sync"]], flags flags[open_flags], mode const[0]) fd
 openat$pktcdvd(fd const[AT_FDCWD], file ptr[in, string["/dev/pktcdvd/control"]], flags flags[open_flags], mode const[0]) fd
 openat$lightnvm(fd const[AT_FDCWD], file ptr[in, string["/dev/lightnvm/control"]], flags flags[open_flags], mode const[0]) fd
-openat$sequencer(fd const[AT_FDCWD], file ptr[in, string["/dev/sequencer"]], flags flags[open_flags], mode const[0]) fd
-openat$sequencer2(fd const[AT_FDCWD], file ptr[in, string["/dev/sequencer2"]], flags flags[open_flags], mode const[0]) fd
 openat$xenevtchn(fd const[AT_FDCWD], file ptr[in, string["/dev/xen/evtchn"]], flags flags[open_flags], mode const[0]) fd
 openat$dlm_control(fd const[AT_FDCWD], file ptr[in, string["/dev/dlm-control"]], flags flags[open_flags], mode const[0]) fd
 openat$dlm_monitor(fd const[AT_FDCWD], file ptr[in, string["/dev/dlm-monitor"]], flags flags[open_flags], mode const[0]) fd
@@ -538,11 +627,6 @@ openat$nvram(fd const[AT_FDCWD], file ptr[in, string["/dev/nvram"]], flags flags
 openat$ocfs2_control(fd const[AT_FDCWD], file ptr[in, string["/dev/ocfs2_control"]], flags flags[open_flags], mode const[0]) fd
 openat$nvme_fabrics(fd const[AT_FDCWD], file ptr[in, string["/dev/nvme-fabrics"]], flags flags[open_flags], mode const[0]) fd
 openat$bsg(fd const[AT_FDCWD], file ptr[in, string["/dev/bsg"]], flags flags[open_flags], mode const[0]) fd
-
-openat$snapshot(fd const[AT_FDCWD], file ptr[in, string["/dev/snapshot"]], flags flags[open_flags], mode const[0]) fd
-
-# SNAPSHOT_FREEZE is disabled because it can easily kill the machine.
-ioctl$SNAPSHOT_FREEZE(fd fd, cmd const[SNAPSHOT_FREEZE]) (disabled)
 
 pipefd {
 	rfd	fd
@@ -723,11 +807,225 @@ sock_filter {
 	k	int32
 }
 
-file_handle {
-	bytes	len[parent, int32]
-	type	int32
-	handle	array[int8]
+file_handle [
+	raw				file_handle_raw
+	shmem				file_handle_t[1, fid_shmem]
+	fuse				file_handle_t[0x81, fid_fuse]
+	fuse_with_parent		file_handle_t[0x82, fid_fuse_with_parent]
+	nfs				file_handle_t[36, fid_nfs]
+	FILEID_INO32_GEN		file_handle_t[FILEID_INO32_GEN, fid_FILEID_INO32_GEN]
+	FILEID_INO32_GEN_PARENT		file_handle_t[FILEID_INO32_GEN_PARENT, fid_FILEID_INO32_GEN_PARENT]
+	FILEID_UDF_WITHOUT_PARENT	file_handle_t[FILEID_UDF_WITHOUT_PARENT, fid_FILEID_UDF_WITHOUT_PARENT]
+	FILEID_UDF_WITH_PARENT		file_handle_t[FILEID_UDF_WITH_PARENT, fid_FILEID_UDF_WITH_PARENT]
+	FILEID_BTRFS_WITH_PARENT	file_handle_t[FILEID_BTRFS_WITH_PARENT, btrfs_fid]
+	FILEID_BTRFS_WITH_PARENT_ROOT	file_handle_t[FILEID_BTRFS_WITH_PARENT, btrfs_fid]
+	FILEID_BTRFS_WITHOUT_PARENT	file_handle_t[FILEID_BTRFS_WITH_PARENT, btrfs_fid]
+	ceph_nfs_snapfh			file_handle_t[FILEID_BTRFS_WITH_PARENT, ceph_nfs_snapfh]
+	ceph_nfs_fh			file_handle_t[FILEID_INO32_GEN, ceph_nfs_fh]
+	ceph_nfs_confh			file_handle_t[FILEID_INO32_GEN_PARENT, ceph_nfs_confh]
+	GFS2_SMALL_FH_SIZE		file_handle_t[GFS2_SMALL_FH_SIZE, fid_GFS2_SMALL_FH_SIZE]
+	GFS2_LARGE_FH_SIZE		file_handle_t[GFS2_LARGE_FH_SIZE, fid_GFS2_LARGE_FH_SIZE]
+	OVL_FILEID_V0			file_handle_t[OVL_FILEID_V0, ovl_fb]
+	OVL_FILEID_V1			file_handle_t[OVL_FILEID_V1, ovl_fh]
+	FILEID_NILFS_WITHOUT_PARENT	file_handle_t[FILEID_NILFS_WITHOUT_PARENT, nilfs_fid]
+	FILEID_NILFS_WITH_PARENT	file_handle_t[FILEID_NILFS_WITH_PARENT, nilfs_fid]
+	reiserfs_2			file_handle_t[2, fid_reiserfs_2]
+	reiserfs_3			file_handle_t[3, fid_reiserfs_3]
+	reiserfs_4			file_handle_t[4, fid_reiserfs_4]
+	reiserfs_5			file_handle_t[5, fid_reiserfs_5]
+	reiserfs_6			file_handle_t[6, fid_reiserfs_6]
+	xfs				file_handle_t[0x81, xfs_fid64]
+	xfs_parent			file_handle_t[0x82, xfs_fid64]
+	orangefs			file_handle_t[1, fid_orangefs]
+	orangefs_parent			file_handle_t[2, fid_orangefs_parent]
+	isofs				file_handle_t[1, isofs_fid]
+	isofs_parent			file_handle_t[2, isofs_fid]
+	ocfs2				file_handle_t[1, fid_ocfs2]
+	ocfs2_parent			file_handle_t[2, fid_ocfs2_parent]
+] [varlen]
+
+file_handle_raw {
+	handle_bytes	bytesize[f_handle, int32]
+	handle_type	flags[fid_type, int32]
+	f_handle	align32[array[int8]]
 }
+
+type file_handle_t[TYPE, FID] {
+	handle_bytes	bytesize[f_handle, int32]
+	handle_type	const[TYPE, int32]
+	f_handle	FID
+}
+
+fid_shmem {
+	gen	int32
+	ino	int64
+} [packed]
+
+fid_fuse {
+	nodeid_hi	int32
+	nodeid_lo	int32
+	generation	int32
+}
+
+fid_fuse_with_parent {
+	base		fid_fuse
+	parent_fid	fid_fuse
+} [packed]
+
+fid_FILEID_INO32_GEN {
+	ino	int32
+	gen	int32
+}
+
+fid_FILEID_INO32_GEN_PARENT {
+	base		fid_FILEID_INO32_GEN
+	parent_ino	int32
+	parent_gen	int32
+}
+
+fid_FILEID_UDF_WITHOUT_PARENT {
+	block		int32
+	partref		int16
+	parent_partref	int16
+	generation	int32
+}
+
+fid_FILEID_UDF_WITH_PARENT {
+	base			fid_FILEID_UDF_WITHOUT_PARENT
+	parent_block		int32
+	parent_generation	int32
+}
+
+btrfs_fid {
+	objectid		int64
+	root_objectid		int64
+	gen			int32
+	parent_objectid		int64
+	parent_gen		int32
+	parent_root_objectid	int64
+} [packed]
+
+ceph_nfs_snapfh {
+	ino		int64
+	snapid		int64
+	parent_ino	int64
+	hash		int32
+} [packed]
+
+ceph_nfs_fh {
+	ino	int64
+}
+
+ceph_nfs_confh {
+	ino		int64
+	parent_ino	int64
+}
+
+fid_GFS2_SMALL_FH_SIZE {
+	no_formal_ino_hi	int32be
+	no_formal_ino_lo	int32be
+	no_addr_hi		int32be
+	no_addr_lo		int32be
+}
+
+fid_GFS2_LARGE_FH_SIZE {
+	base		fid_GFS2_SMALL_FH_SIZE
+	parent_fid	fid_GFS2_SMALL_FH_SIZE
+}
+
+define GFS2_SMALL_FH_SIZE	4
+define GFS2_LARGE_FH_SIZE	8
+
+fid_nfs {
+	fileid_hi	int32
+	fileid_lo	int32
+	type		int32
+# The total size is encoded in file_handle.handle_type, so we make this const size.
+	size		const[NFS_MAXFHSIZE, int16]
+	data		array[int8, NFS_MAXFHSIZE]
+} [align[4]]
+
+fid_reiserfs_2 {
+	objectid	int32
+	dir_id		int32
+}
+
+fid_reiserfs_3 {
+	objectid	int32
+	dir_id		int32
+	generation	int32
+}
+
+fid_reiserfs_4 {
+	objectid	int32
+	dir_id		int32
+	parent_objectid	int32
+	parent_dir_id	int32
+}
+
+fid_reiserfs_5 {
+	objectid	int32
+	dir_id		int32
+	generation	int32
+	parent_objectid	int32
+	parent_dir_id	int32
+}
+
+fid_reiserfs_6 {
+	objectid		int32
+	dir_id			int32
+	generation		int32
+	parent_objectid		int32
+	parent_dir_id		int32
+	parent_generation	int32
+}
+
+xfs_fid64 {
+	ino		int64
+	gen		int32
+	parent_ino	int64
+	parent_gen	int32
+} [align[4]]
+
+fid_orangefs {
+	khandle	array[int8, 16]
+	fs_id	int32
+}
+
+fid_orangefs_parent {
+	base		fid_orangefs
+	parent_fid	fid_orangefs
+}
+
+nilfs_fid {
+	cno		int64
+	ino		int64
+	gen		int32
+	parent_gen	int32
+	parent_ino	int64
+} [packed]
+
+isofs_fid {
+	block			int32
+	offset			int16
+	parent_offset		int16
+	generation		int32
+	parent_block		int32
+	parent_generation	int32
+}
+
+fid_ocfs2 {
+	blkno_hi	int32
+	blkno_lo	int32
+	generation	int32
+}
+
+fid_ocfs2_parent {
+	base		fid_ocfs2
+	parent_fid	fid_ocfs2
+}
+
+fid_type = FILEID_ROOT, FILEID_INO32_GEN, FILEID_INO32_GEN_PARENT, FILEID_BTRFS_WITHOUT_PARENT, FILEID_BTRFS_WITH_PARENT, FILEID_BTRFS_WITH_PARENT_ROOT, FILEID_UDF_WITHOUT_PARENT, FILEID_UDF_WITH_PARENT, FILEID_NILFS_WITHOUT_PARENT, FILEID_NILFS_WITH_PARENT, FILEID_FAT_WITHOUT_PARENT, FILEID_FAT_WITH_PARENT, FILEID_LUSTRE, FILEID_KERNFS
 
 mq_attr {
 	mq_flags	intptr
@@ -886,15 +1184,22 @@ kcmp_epoll_slot {
 	toff	int32
 }
 
+open_how {
+	flags	flags[open_flags, int64]
+	mode	flags[open_mode, int64]
+	resolve	flags[resolve_flags, int64]
+}
+
 open_flags = O_WRONLY, O_RDWR, O_APPEND, FASYNC, O_CLOEXEC, O_CREAT, O_DIRECT, O_DIRECTORY, O_EXCL, O_LARGEFILE, O_NOATIME, O_NOCTTY, O_NOFOLLOW, O_NONBLOCK, O_PATH, O_SYNC, O_TRUNC, __O_TMPFILE
 open_mode = S_IRUSR, S_IWUSR, S_IXUSR, S_IRGRP, S_IWGRP, S_IXGRP, S_IROTH, S_IWOTH, S_IXOTH
+resolve_flags = RESOLVE_BENEATH, RESOLVE_IN_ROOT, RESOLVE_NO_MAGICLINKS, RESOLVE_NO_SYMLINKS, RESOLVE_NO_XDEV
 madvise_flags = MADV_NORMAL, MADV_RANDOM, MADV_SEQUENTIAL, MADV_WILLNEED, MADV_DONTNEED, MADV_REMOVE, MADV_DONTFORK, MADV_DOFORK, MADV_HWPOISON, MADV_SOFT_OFFLINE, MADV_MERGEABLE, MADV_UNMERGEABLE, MADV_HUGEPAGE, MADV_NOHUGEPAGE, MADV_DONTDUMP, MADV_DODUMP, MADV_WIPEONFORK, MADV_KEEPONFORK, MADV_COLD, MADV_PAGEOUT
 fadvise_flags = POSIX_FADV_NORMAL, POSIX_FADV_SEQUENTIAL, POSIX_FADV_RANDOM, POSIX_FADV_NOREUSE, POSIX_FADV_WILLNEED, POSIX_FADV_DONTNEED
 move_pages_flags = MPOL_MF_MOVE, MPOL_MF_MOVE_ALL
 msync_flags = MS_ASYNC, MS_SYNC, MS_INVALIDATE
 mmap_prot = PROT_EXEC, PROT_READ, PROT_WRITE, PROT_SEM, PROT_GROWSDOWN, PROT_GROWSUP
 mmap_flags = MAP_SHARED, MAP_PRIVATE, MAP_32BIT, MAP_ANONYMOUS, MAP_DENYWRITE, MAP_EXECUTABLE, MAP_FILE, MAP_FIXED, MAP_GROWSDOWN, MAP_HUGETLB, MAP_LOCKED, MAP_NONBLOCK, MAP_NORESERVE, MAP_POPULATE, MAP_STACK, MAP_UNINITIALIZED, MAP_SHARED_VALIDATE, MAP_SYNC, MAP_FIXED_NOREPLACE
-mremap_flags = MREMAP_MAYMOVE, MREMAP_FIXED
+mremap_flags = MREMAP_MAYMOVE, MREMAP_FIXED, MREMAP_DONTUNMAP
 mbind_mode = MPOL_DEFAULT, MPOL_BIND, MPOL_INTERLEAVE, MPOL_PREFERRED, MPOL_F_STATIC_NODES, MPOL_F_RELATIVE_NODES
 mbind_flags = MPOL_MF_STRICT, MPOL_MF_MOVE, MPOL_MF_MOVE_ALL
 pipe_flags = O_NONBLOCK, O_CLOEXEC, O_DIRECT
@@ -921,13 +1226,13 @@ unlinkat_flags = AT_REMOVEDIR
 renameat2_flags = RENAME_EXCHANGE, RENAME_NOREPLACE, RENAME_WHITEOUT
 flock_op = LOCK_SH, LOCK_EX, LOCK_UN, LOCK_NB
 statx_flags = AT_SYMLINK_NOFOLLOW, AT_SYMLINK_FOLLOW, AT_NO_AUTOMOUNT, AT_EMPTY_PATH, AT_STATX_SYNC_TYPE, AT_STATX_SYNC_AS_STAT, AT_STATX_FORCE_SYNC, AT_STATX_DONT_SYNC
-statx_mask = STATX_TYPE, STATX_MODE, STATX_NLINK, STATX_UID, STATX_GID, STATX_ATIME, STATX_MTIME, STATX_CTIME, STATX_INO, STATX_SIZE, STATX_BLOCKS, STATX_BASIC_STATS, STATX_BTIME, STATX_ALL
+statx_mask = STATX_TYPE, STATX_MODE, STATX_NLINK, STATX_UID, STATX_GID, STATX_ATIME, STATX_MTIME, STATX_CTIME, STATX_INO, STATX_SIZE, STATX_BLOCKS, STATX_BASIC_STATS, STATX_BTIME
 name_to_handle_at_flags = AT_EMPTY_PATH, AT_SYMLINK_FOLLOW
 mq_open_flags = O_WRONLY, O_RDWR, O_NONBLOCK, O_CREAT, O_EXCL, O_CREAT
 finit_module_flags = MODULE_INIT_IGNORE_MODVERSIONS, MODULE_INIT_IGNORE_VERMAGIC
 delete_module_flags = O_NONBLOCK, O_TRUNC
 kexec_load_flags = KEXEC_ON_CRASH, KEXEC_PRESERVE_CONTEXT, KEXEC_ARCH_386, KEXEC_ARCH_X86_64, KEXEC_ARCH_PPC, KEXEC_ARCH_PPC64, KEXEC_ARCH_IA_64, KEXEC_ARCH_ARM, KEXEC_ARCH_S390, KEXEC_ARCH_SH, KEXEC_ARCH_MIPS, KEXEC_ARCH_MIPS_LE, KEXEC_ARCH_DEFAULT
-faccessat_flags = 0x100, 0x200, 0x400, 0x800, 0x1000
+faccessat_flags = AT_EACCESS, AT_SYMLINK_NOFOLLOW, AT_EMPTY_PATH
 sync_file_flags = SYNC_FILE_RANGE_WAIT_BEFORE, SYNC_FILE_RANGE_WRITE, SYNC_FILE_RANGE_WAIT_AFTER
 kcmp_flags = KCMP_FILE, KCMP_FILES, KCMP_FS, KCMP_IO, KCMP_SIGHAND, KCMP_SYSVSEM, KCMP_VM
 rusage_who = RUSAGE_SELF, RUSAGE_CHILDREN, RUSAGE_THREAD
@@ -972,7 +1277,9 @@ fiemap_flags = FIEMAP_FLAG_SYNC, FIEMAP_FLAG_XATTR, FIEMAP_FLAG_CACHE
 fiemap_extent_flags = FIEMAP_EXTENT_LAST, FIEMAP_EXTENT_UNKNOWN, FIEMAP_EXTENT_DELALLOC, FIEMAP_EXTENT_ENCODED, FIEMAP_EXTENT_DATA_ENCRYPTED, FIEMAP_EXTENT_NOT_ALIGNED, FIEMAP_EXTENT_DATA_INLINE, FIEMAP_EXTENT_DATA_TAIL, FIEMAP_EXTENT_UNWRITTEN, FIEMAP_EXTENT_MERGED, FIEMAP_EXTENT_SHARED
 getrandom_flags = GRND_NONBLOCK, GRND_RANDOM
 clone_flags = CLONE_VM, CLONE_FS, CLONE_FILES, CLONE_SIGHAND, CLONE_PTRACE, CLONE_VFORK, CLONE_PARENT, CLONE_THREAD, CLONE_NEWNS, CLONE_SYSVSEM, CLONE_SETTLS, CLONE_PARENT_SETTID, CLONE_CHILD_CLEARTID, CLONE_UNTRACED, CLONE_CHILD_SETTID, CLONE_NEWCGROUP, CLONE_NEWUTS, CLONE_NEWIPC, CLONE_NEWUSER, CLONE_NEWPID, CLONE_NEWNET, CLONE_IO, CLONE_PIDFD, CLONE_NEWTIME
+clone3_flags = CLONE_VM, CLONE_FS, CLONE_FILES, CLONE_SIGHAND, CLONE_PTRACE, CLONE_VFORK, CLONE_PARENT, CLONE_THREAD, CLONE_NEWNS, CLONE_SYSVSEM, CLONE_SETTLS, CLONE_PARENT_SETTID, CLONE_CHILD_CLEARTID, CLONE_UNTRACED, CLONE_CHILD_SETTID, CLONE_NEWCGROUP, CLONE_NEWUTS, CLONE_NEWIPC, CLONE_NEWUSER, CLONE_NEWPID, CLONE_NEWNET, CLONE_IO, CLONE_PIDFD, CLONE_NEWTIME, CLONE_CLEAR_SIGHAND, CLONE_INTO_CGROUP
 ptrace_peeksiginfo_flags = PTRACE_PEEKSIGINFO_SHARED
+close_range_flags = CLOSE_RANGE_UNSHARE
 
 # adjtimex flags.
 _ = STA_PLL, STA_PPSFREQ, STA_PPSTIME, STA_FLL, STA_INS, STA_DEL, STA_UNSYNC, STA_FREQHOLD, STA_PPSSIGNAL, STA_PPSJITTER, STA_PPSWANDER, STA_PPSERROR, STA_CLOCKERR, STA_NANO, STA_MODE, STA_CLK, STA_RONLY

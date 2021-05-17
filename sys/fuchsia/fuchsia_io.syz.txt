@@ -11,7 +11,8 @@ fuchsia_io_ServiceHandles {
 } [packed]
 
 fuchsia_io_FileObjectHandles {
-	event	zx_event
+	event	zx_handle
+	stream	zx_handle
 } [packed]
 
 fuchsia_io_DirectoryObjectHandles {
@@ -22,20 +23,24 @@ fuchsia_io_PipeHandles {
 	socket	zx_socket
 } [packed]
 
-fuchsia_io_SocketHandles {
-	socket	zx_socket
-} [packed]
-
 fuchsia_io_VmofileHandles {
 	vmo	zx_vmo
 } [packed]
 
 fuchsia_io_DeviceHandles {
-	event	zx_eventpair
+	event	zx_handle
 } [packed]
 
 fuchsia_io_TtyHandles {
-	event	zx_eventpair
+	event	zx_handle
+} [packed]
+
+fuchsia_io_DatagramSocketHandles {
+	event	zx_handle
+} [packed]
+
+fuchsia_io_StreamSocketHandles {
+	socket	zx_socket
 } [packed]
 
 fuchsia_io_NodeAttributesInLine {
@@ -68,7 +73,8 @@ fuchsia_io_NodeInfoHandles [
 	vmofile		fuchsia_io_VmofileHandles
 	device		fuchsia_io_DeviceHandles
 	tty		fuchsia_io_TtyHandles
-	socket		fuchsia_io_SocketHandles
+	datagram_socket	fuchsia_io_DatagramSocketHandles
+	stream_socket	fuchsia_io_StreamSocketHandles
 ] [varlen]
 
 fuchsia_io_NodeCloneRequest {

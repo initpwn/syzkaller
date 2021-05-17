@@ -4,6 +4,7 @@
 # AF_NETLINK/NETLINK_ROUTE SCHED support.
 
 include <linux/net.h>
+include <linux/mpls.h>
 include <uapi/linux/if.h>
 include <uapi/linux/netlink.h>
 include <uapi/linux/rtnetlink.h>
@@ -214,6 +215,8 @@ fq_policy [
 	TCA_FQ_FLOW_REFILL_DELAY	nlattr[TCA_FQ_FLOW_REFILL_DELAY, int32]
 	TCA_FQ_ORPHAN_MASK		nlattr[TCA_FQ_ORPHAN_MASK, int32]
 	TCA_FQ_LOW_RATE_THRESHOLD	nlattr[TCA_FQ_LOW_RATE_THRESHOLD, int32]
+	TCA_FQ_CE_THRESHOLD		nlattr[TCA_FQ_CE_THRESHOLD, int32]
+	TCA_FQ_TIMER_SLACK		nlattr[TCA_FQ_TIMER_SLACK, int32]
 ] [varlen]
 
 fq_codel_policy [
@@ -314,7 +317,10 @@ red_policy [
 	TCA_RED_PARMS	nlattr[TCA_RED_PARMS, tc_red_qopt]
 	TCA_RED_STAB	nlattr[TCA_RED_STAB, array[int8, 256]]
 	TCA_RED_MAX_P	nlattr[TCA_RED_MAX_P, int32]
+	TCA_RED_FLAGS	nlattr[TCA_RED_FLAGS, nla_bitfield32[red_supported_flags]]
 ] [varlen]
+
+red_supported_flags = TC_RED_HISTORIC_FLAGS, TC_RED_NODROP
 
 sfb_policy [
 	TCA_SFB_PARMS	nlattr[TCA_SFB_PARMS, tc_sfb_qopt]
@@ -759,6 +765,7 @@ fl_policy [
 	TCA_FLOWER_KEY_MPLS_BOS			nlattr[TCA_FLOWER_KEY_MPLS_BOS, int8]
 	TCA_FLOWER_KEY_MPLS_TC			nlattr[TCA_FLOWER_KEY_MPLS_TC, int8]
 	TCA_FLOWER_KEY_MPLS_LABEL		nlattr[TCA_FLOWER_KEY_MPLS_LABEL, int32]
+	TCA_FLOWER_KEY_MPLS_OPTS		nlnest[TCA_FLOWER_KEY_MPLS_OPTS, mpls_opts]
 	TCA_FLOWER_KEY_TCP_FLAGS		nlattr[TCA_FLOWER_KEY_TCP_FLAGS, int16]
 	TCA_FLOWER_KEY_TCP_FLAGS_MASK		nlattr[TCA_FLOWER_KEY_TCP_FLAGS_MASK, int16]
 	TCA_FLOWER_KEY_IP_TOS			nlattr[TCA_FLOWER_KEY_IP_TOS, int8]
@@ -809,6 +816,18 @@ erspan_opt_policy [
 	TCA_FLOWER_KEY_ENC_OPT_ERSPAN_INDEX	nlattr[TCA_FLOWER_KEY_ENC_OPT_ERSPAN_INDEX, int32]
 	TCA_FLOWER_KEY_ENC_OPT_ERSPAN_DIR	nlattr[TCA_FLOWER_KEY_ENC_OPT_ERSPAN_DIR, int8]
 	TCA_FLOWER_KEY_ENC_OPT_ERSPAN_HWID	nlattr[TCA_FLOWER_KEY_ENC_OPT_ERSPAN_HWID, int8]
+] [varlen]
+
+mpls_opts [
+	TCA_FLOWER_KEY_MPLS_OPTS_LSE	nlattr[TCA_FLOWER_KEY_MPLS_OPTS_LSE, mpls_opts_lse]
+] [varlen]
+
+mpls_opts_lse [
+	TCA_FLOWER_KEY_MPLS_OPT_LSE_DEPTH	nlattr[TCA_FLOWER_KEY_MPLS_OPT_LSE_DEPTH, int8[1:FLOW_DIS_MPLS_MAX]]
+	TCA_FLOWER_KEY_MPLS_OPT_LSE_TTL		nlattr[TCA_FLOWER_KEY_MPLS_OPT_LSE_TTL, int8]
+	TCA_FLOWER_KEY_MPLS_OPT_LSE_BOS		nlattr[TCA_FLOWER_KEY_MPLS_OPT_LSE_BOS, int8[0:MPLS_BOS_MASK]]
+	TCA_FLOWER_KEY_MPLS_OPT_LSE_TC		nlattr[TCA_FLOWER_KEY_MPLS_OPT_LSE_TC, int8[0:MPLS_TC_MASK]]
+	TCA_FLOWER_KEY_MPLS_OPT_LSE_LABEL	nlattr[TCA_FLOWER_KEY_MPLS_OPT_LSE_LABEL, mpls_label]
 ] [varlen]
 
 fw_policy [
@@ -936,10 +955,15 @@ tca_actions [
 ] [varlen]
 
 type tcf_action_policy[NAME, VALUES] {
-	TCA_ACT_KIND	nlattr[TCA_ACT_KIND, string[NAME]]
-	TCA_ACT_OPTIONS	nlnest[TCA_ACT_OPTIONS, array[VALUES]]
-	TCA_ACT_COOKIE	nlattr[TCA_ACT_COOKIE, array[int8]]
+	TCA_ACT_KIND		nlattr[TCA_ACT_KIND, string[NAME]]
+	TCA_ACT_OPTIONS		nlnest[TCA_ACT_OPTIONS, array[VALUES]]
+	TCA_ACT_COOKIE		nlattr[TCA_ACT_COOKIE, array[int8]]
+	TCA_ACT_FLAGS		nlattr[TCA_ACT_FLAGS, nla_bitfield32[tcf_action_policy_flags]]
+	TCA_ACT_HW_STATS	nlattr[TCA_ACT_HW_STATS, nla_bitfield32[tcf_action_policy_hw_stats]]
 } [packed, align[4]]
+
+tcf_action_policy_flags = TCA_ACT_FLAGS_NO_PERCPU_STATS
+tcf_action_policy_hw_stats = TCA_ACT_HW_STATS_IMMEDIATE, TCA_ACT_HW_STATS_DELAYED
 
 act_bpf_policy [
 	TCA_ACT_BPF_PARMS	nlattr[TCA_ACT_BPF_PARMS, tc_act_bpf]

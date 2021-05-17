@@ -13,6 +13,7 @@ import (
 	"io"
 	"io/ioutil"
 	"net/http"
+	"net/mail"
 	"net/url"
 	"reflect"
 	"strings"
@@ -77,7 +78,8 @@ type Commit struct {
 	Title      string
 	Author     string
 	AuthorName string
-	CC         []string
+	CC         []string // deprecated in favor of Recipients
+	Recipients Recipients
 	BugIDs     []string // ID's extracted from Reported-by tags
 	Date       time.Time
 }
@@ -180,6 +182,7 @@ const (
 	BisectResultMerge   JobDoneFlags = 1 << iota // bisected to a merge commit
 	BisectResultNoop                             // commit does not affect resulting kernel binary
 	BisectResultRelease                          // commit is a kernel release
+	BisectResultIgnore                           // this particular commit should be ignored, see syz-ci/jobs.go
 )
 
 func (dash *Dashboard) JobPoll(req *JobPollReq) (*JobPollResp, error) {
@@ -233,10 +236,14 @@ func (dash *Dashboard) UploadCommits(commits []Commit) error {
 type Crash struct {
 	BuildID     string // refers to Build.ID
 	Title       string
-	Corrupted   bool // report is corrupted (corrupted title, no stacks, etc)
-	Maintainers []string
+	AltTitles   []string // alternative titles, used for better deduplication
+	Corrupted   bool     // report is corrupted (corrupted title, no stacks, etc)
+	Suppressed  bool
+	Maintainers []string // deprecated in favor of Recipients
+	Recipients  Recipients
 	Log         []byte
 	Report      []byte
+	MachineInfo []byte
 	// The following is optional and is filled only after repro.
 	ReproOpts []byte
 	ReproSyz  []byte
@@ -255,9 +262,11 @@ func (dash *Dashboard) ReportCrash(crash *Crash) (*ReportCrashResp, error) {
 
 // CrashID is a short summary of a crash for repro queries.
 type CrashID struct {
-	BuildID   string
-	Title     string
-	Corrupted bool
+	BuildID      string
+	Title        string
+	Corrupted    bool
+	Suppressed   bool
+	MayBeMissing bool
 }
 
 type NeedReproResp struct {
@@ -294,6 +303,7 @@ func (dash *Dashboard) LogError(name, msg string, args ...interface{}) {
 // Used by dashboard external reporting.
 type BugReport struct {
 	Type              ReportType
+	BugStatus         BugStatus
 	Namespace         string
 	Config            []byte
 	ID                string
@@ -301,15 +311,19 @@ type BugReport struct {
 	ExtID             string // arbitrary reporting ID forwarded from BugUpdate.ExtID
 	First             bool   // Set for first report for this bug (Type == ReportNew).
 	Moderation        bool
+	NoRepro           bool // We don't expect repro (e.g. for build/boot errors).
 	Title             string
-	Link              string // link to the bug on dashboard
-	CreditEmail       string // email for the Reported-by tag
-	Maintainers       []string
-	CC                []string // additional CC emails
+	Link              string   // link to the bug on dashboard
+	CreditEmail       string   // email for the Reported-by tag
+	Maintainers       []string // deprecated in favor of Recipients
+	CC                []string // deprecated in favor of Recipients
+	Recipients        Recipients
 	OS                string
 	Arch              string
 	VMArch            string
 	UserSpaceArch     string // user-space arch as kernel developers know it (rather than Go names)
+	BuildID           string
+	BuildTime         time.Time
 	CompilerID        string
 	KernelRepo        string
 	KernelRepoAlias   string
@@ -319,6 +333,7 @@ type BugReport struct {
 	KernelCommitDate  time.Time
 	KernelConfig      []byte
 	KernelConfigLink  string
+	SyzkallerCommit   string
 	Log               []byte
 	LogLink           string
 	Report            []byte
@@ -327,7 +342,11 @@ type BugReport struct {
 	ReproCLink        string
 	ReproSyz          []byte
 	ReproSyzLink      string
+	ReproOpts         []byte
+	MachineInfo       []byte
+	MachineInfoLink   string
 	CrashID           int64 // returned back in BugUpdate
+	CrashTime         time.Time
 	NumCrashes        int64
 	HappenedOn        []string // list of kernel repo aliases
 
@@ -350,18 +369,19 @@ type BisectResult struct {
 }
 
 type BugUpdate struct {
-	ID           string // copied from BugReport
-	JobID        string // copied from BugReport
-	ExtID        string
-	Link         string
-	Status       BugStatus
-	ReproLevel   ReproLevel
-	DupOf        string
-	OnHold       bool     // If set for open bugs, don't upstream this bug.
-	Notification bool     // Reply to a notification.
-	FixCommits   []string // Titles of commits that fix this bug.
-	CC           []string // Additional emails to add to CC list in future emails.
-	CrashID      int64
+	ID              string // copied from BugReport
+	JobID           string // copied from BugReport
+	ExtID           string
+	Link            string
+	Status          BugStatus
+	ReproLevel      ReproLevel
+	DupOf           string
+	OnHold          bool     // If set for open bugs, don't upstream this bug.
+	Notification    bool     // Reply to a notification.
+	ResetFixCommits bool     // Remove all commits (empty FixCommits means leave intact).
+	FixCommits      []string // Titles of commits that fix this bug.
+	CC              []string // Additional emails to add to CC list in future emails.
+	CrashID         int64
 }
 
 type BugUpdateReply struct {
@@ -389,8 +409,9 @@ type BugNotification struct {
 	ExtID       string // arbitrary reporting ID forwarded from BugUpdate.ExtID
 	Title       string
 	Text        string   // meaning depends on Type
-	CC          []string // additional CC emails
-	Maintainers []string
+	CC          []string // deprecated in favor of Recipients
+	Maintainers []string // deprecated in favor of Recipients
+	Recipients  Recipients
 	// Public is what we want all involved people to see (e.g. if we notify about a wrong commit title,
 	// people need to see it and provide the right title). Not public is what we want to send only
 	// to a minimal set of recipients (our mailing list) (e.g. notification about an obsoleted bug
@@ -491,20 +512,9 @@ type LoadBugReq struct {
 	ID string
 }
 
-type LoadBugResp struct {
-	ID              string
-	Title           string
-	Status          string
-	SyzkallerCommit string
-	Arch            string
-	ReproOpts       []byte
-	ReproSyz        []byte
-	ReproC          []byte
-}
-
-func (dash *Dashboard) LoadBug(id string) (*LoadBugResp, error) {
+func (dash *Dashboard) LoadBug(id string) (*BugReport, error) {
 	req := LoadBugReq{id}
-	resp := new(LoadBugResp)
+	resp := new(BugReport)
 	err := dash.Query("load_bug", req, resp)
 	return resp, err
 }
@@ -523,6 +533,7 @@ const (
 	BugStatusDup
 	BugStatusUpdate // aux info update (i.e. ExtID/Link/CC)
 	BugStatusUnCC   // don't CC sender on any future communication
+	BugStatusFixed
 )
 
 const (
@@ -621,3 +632,25 @@ func (dash *Dashboard) queryImpl(method string, req, reply interface{}) error {
 	}
 	return nil
 }
+
+type RecipientType int
+
+const (
+	To RecipientType = iota
+	Cc
+)
+
+func (t RecipientType) String() string {
+	return [...]string{"To", "Cc"}[t]
+}
+
+type RecipientInfo struct {
+	Address mail.Address
+	Type    RecipientType
+}
+
+type Recipients []RecipientInfo
+
+func (r Recipients) Len() int           { return len(r) }
+func (r Recipients) Less(i, j int) bool { return r[i].Address.Address < r[j].Address.Address }
+func (r Recipients) Swap(i, j int)      { r[i], r[j] = r[j], r[i] }

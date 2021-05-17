@@ -9,7 +9,7 @@ import (
 
 type windows struct{}
 
-func (*windows) prepare(sourcedir string, build bool, arches []string) error {
+func (*windows) prepare(sourcedir string, build bool, arches []*Arch) error {
 	return nil
 }
 
@@ -20,6 +20,7 @@ func (*windows) prepareArch(arch *Arch) error {
 func (*windows) processFile(arch *Arch, info *compiler.ConstInfo) (map[string]uint64, map[string]bool, error) {
 	params := &extractParams{
 		DeclarePrintf: true,
+		TargetEndian:  arch.target.HostEndian,
 	}
 	return extract(info, "cl", nil, params)
 }

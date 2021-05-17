@@ -9,12 +9,15 @@ import (
 
 	"github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/pkg/symbolizer"
+	"github.com/google/syzkaller/sys/targets"
 )
 
 func TestLinuxIgnores(t *testing.T) {
 	cfg := &mgrconfig.Config{
-		TargetOS:   "linux",
-		TargetArch: "amd64",
+		Derived: mgrconfig.Derived{
+			TargetOS:   targets.Linux,
+			TargetArch: targets.AMD64,
+		},
 	}
 	reporter, err := NewReporter(cfg)
 	if err != nil {

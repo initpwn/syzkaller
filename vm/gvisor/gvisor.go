@@ -20,6 +20,7 @@ import (
 	"github.com/google/syzkaller/pkg/config"
 	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/pkg/osutil"
+	"github.com/google/syzkaller/pkg/report"
 	"github.com/google/syzkaller/vm/vmimpl"
 )
 
@@ -215,7 +216,9 @@ func (inst *instance) runscCmd(add ...string) *exec.Cmd {
 		"-watchdog-action=panic",
 		"-network=none",
 		"-debug",
-		"-alsologtostderr",
+		// Send debug logs to stderr, so that they will be picked up by
+		// syzkaller. Without this, debug logs are sent to /dev/null.
+		"-debug-log=/dev/stderr",
 	}
 	if inst.cfg.RunscArgs != "" {
 		args = append(args, strings.Split(inst.cfg.RunscArgs, " ")...)
@@ -350,7 +353,8 @@ func (inst *instance) guestProxy() (*os.File, error) {
 	return guestSock, nil
 }
 
-func (inst *instance) Diagnose() ([]byte, bool) {
+func (inst *instance) Diagnose(rep *report.Report) ([]byte, bool) {
+	// TODO: stacks and dmesg are mostly useful for hangs/stalls, so we could do this only sometimes based on rep.
 	b, err := osutil.Run(time.Minute, inst.runscCmd("debug", "-stacks", "--ps", inst.name))
 	if err != nil {
 		b = append(b, fmt.Sprintf("\n\nError collecting stacks: %v", err)...)

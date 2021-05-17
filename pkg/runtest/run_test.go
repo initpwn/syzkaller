@@ -4,6 +4,8 @@
 package runtest
 
 import (
+	"flag"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -11,17 +13,28 @@ import (
 
 	"github.com/google/syzkaller/pkg/csource"
 	"github.com/google/syzkaller/pkg/host"
+	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/prog"
 	"github.com/google/syzkaller/sys/targets"
 	_ "github.com/google/syzkaller/sys/test/gen" // pull in the test target
 )
 
+// Can be used as:
+// go test -v -run=Test/64_fork ./pkg/runtest -filter=nonfailing
+// to select a subset of tests to run.
+var flagFilter = flag.String("filter", "", "prefix to match test file names")
+
 func Test(t *testing.T) {
 	switch runtime.GOOS {
-	case "openbsd":
+	case targets.OpenBSD:
 		t.Skipf("broken on %v", runtime.GOOS)
 	}
-	for _, sysTarget := range targets.List["test"] {
+	// Test only one target in short mode (each takes 5+ seconds to run).
+	shortTarget := targets.Get(targets.TestOS, targets.TestArch64)
+	for _, sysTarget := range targets.List[targets.TestOS] {
+		if testing.Short() && sysTarget != shortTarget {
+			continue
+		}
 		sysTarget1 := targets.Get(sysTarget.OS, sysTarget.Arch)
 		t.Run(sysTarget1.Arch, func(t *testing.T) {
 			t.Parallel()
@@ -34,10 +47,6 @@ func test(t *testing.T, sysTarget *targets.Target) {
 	target, err := prog.GetTarget(sysTarget.OS, sysTarget.Arch)
 	if err != nil {
 		t.Fatal(err)
-	}
-	if testing.Short() && target.PtrSize == 4 {
-		// Building 32-bit binaries fails on travis (see comments in Makefile).
-		t.Skip("skipping in short mode")
 	}
 	executor, err := csource.BuildFile(target, filepath.FromSlash("../../executor/executor.cc"))
 	if err != nil {
@@ -71,8 +80,9 @@ func test(t *testing.T, sysTarget *targets.Target) {
 		}
 	}()
 	ctx := &Context{
-		Dir:          filepath.Join("..", "..", "sys", target.OS, "test"),
+		Dir:          filepath.Join("..", "..", "sys", target.OS, targets.TestOS),
 		Target:       target,
+		Tests:        *flagFilter,
 		Features:     features,
 		EnabledCalls: enabledCalls,
 		Requests:     requests,
@@ -85,5 +95,70 @@ func test(t *testing.T, sysTarget *targets.Target) {
 	}
 	if err := ctx.Run(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestParsing(t *testing.T) {
+	t.Parallel()
+	for OS, arches := range targets.List {
+		dir := filepath.Join("..", "..", "sys", OS, "test")
+		if !osutil.IsExist(dir) {
+			continue
+		}
+		files, err := progFileList(dir, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for arch := range arches {
+			target, err := prog.GetTarget(OS, arch)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sysTarget := targets.Get(target.OS, target.Arch)
+			t.Run(fmt.Sprintf("%v/%v", target.OS, target.Arch), func(t *testing.T) {
+				t.Parallel()
+				for _, file := range files {
+					p, requires, _, err := parseProg(target, dir, file)
+					if err != nil {
+						t.Errorf("failed to parse %v: %v", file, err)
+					}
+					if p == nil {
+						continue
+					}
+					if runtime.GOOS != sysTarget.BuildOS {
+						continue // we need at least preprocessor binary to generate sources
+					}
+					// syz_mount_image tests are very large and this test takes too long.
+					// syz-imagegen that generates does some of this testing (Deserialize/SerializeForExec).
+					if requires["manual"] {
+						continue
+					}
+					if _, err = csource.Write(p, csource.ExecutorOpts); err != nil {
+						t.Errorf("failed to generate C source for %v: %v", file, err)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestRequires(t *testing.T) {
+	{
+		requires := parseRequires([]byte("# requires: manual arch=amd64"))
+		if !checkArch(requires, "amd64") {
+			t.Fatalf("amd64 does not pass check")
+		}
+		if checkArch(requires, "riscv64") {
+			t.Fatalf("riscv64 passes check")
+		}
+	}
+	{
+		requires := parseRequires([]byte("# requires: -arch=arm64 manual -arch=riscv64"))
+		if !checkArch(requires, "amd64") {
+			t.Fatalf("amd64 does not pass check")
+		}
+		if checkArch(requires, "riscv64") {
+			t.Fatalf("riscv64 passes check")
+		}
 	}
 }

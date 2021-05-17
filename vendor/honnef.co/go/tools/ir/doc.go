@@ -126,4 +126,4 @@
 // domains of source locations, ast.Nodes, types.Objects,
 // ir.Values/Instructions.
 //
-package ir
+package ir // import "honnef.co/go/tools/ir"

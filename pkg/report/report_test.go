@@ -9,14 +9,16 @@ import (
 	"flag"
 	"fmt"
 	"io/ioutil"
-	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
+	"sort"
 	"strings"
 	"testing"
 
 	"github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/pkg/osutil"
+	"github.com/google/syzkaller/sys/targets"
 )
 
 var flagUpdate = flag.Bool("update", false, "update test files accordingly to current results")
@@ -29,6 +31,7 @@ type ParseTest struct {
 	FileName   string
 	Log        []byte
 	Title      string
+	AltTitles  []string
 	Type       Type
 	Frame      string
 	StartLine  string
@@ -40,11 +43,12 @@ type ParseTest struct {
 }
 
 func testParseFile(t *testing.T, reporter Reporter, fn string) {
-	input, err := os.Open(fn)
+	data, err := ioutil.ReadFile(fn)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer input.Close()
+	// Strip all \r from reports because the merger removes it.
+	data = bytes.ReplaceAll(data, []byte{'\r'}, nil)
 	const (
 		phaseHeaders = iota
 		phaseLog
@@ -55,7 +59,7 @@ func testParseFile(t *testing.T, reporter Reporter, fn string) {
 		FileName: fn,
 	}
 	prevEmptyLine := false
-	s := bufio.NewScanner(input)
+	s := bufio.NewScanner(bytes.NewReader(data))
 	for s.Scan() {
 		switch phase {
 		case phaseHeaders:
@@ -86,15 +90,12 @@ func testParseFile(t *testing.T, reporter Reporter, fn string) {
 		t.Fatalf("can't find log in input file")
 	}
 	testParseImpl(t, reporter, test)
-	// In some cases we get output with \r\n for line endings,
-	// ensure that regexps are not confused by this.
-	bytes.Replace(test.Log, []byte{'\n'}, []byte{'\r', '\n'}, -1)
-	testParseImpl(t, reporter, test)
 }
 
 func parseHeaderLine(t *testing.T, test *ParseTest, ln string) {
 	const (
 		titlePrefix      = "TITLE: "
+		altTitlePrefix   = "ALT: "
 		typePrefix       = "TYPE: "
 		framePrefix      = "FRAME: "
 		startPrefix      = "START: "
@@ -106,6 +107,8 @@ func parseHeaderLine(t *testing.T, test *ParseTest, ln string) {
 	case strings.HasPrefix(ln, "#"):
 	case strings.HasPrefix(ln, titlePrefix):
 		test.Title = ln[len(titlePrefix):]
+	case strings.HasPrefix(ln, altTitlePrefix):
+		test.AltTitles = append(test.AltTitles, ln[len(altTitlePrefix):])
 	case strings.HasPrefix(ln, typePrefix):
 		switch v := ln[len(typePrefix):]; v {
 		case Hang.String():
@@ -162,23 +165,34 @@ func testParseImpl(t *testing.T, reporter Reporter, test *ParseTest) {
 		t.Fatalf("found crash, but title is empty")
 	}
 	title, corrupted, corruptedReason, suppressed, typ, frame := "", false, "", false, Unknown, ""
+	var altTitles []string
 	if rep != nil {
 		title = rep.Title
+		altTitles = rep.AltTitles
 		corrupted = rep.Corrupted
 		corruptedReason = rep.CorruptedReason
 		suppressed = rep.Suppressed
 		typ = rep.Type
 		frame = rep.Frame
 	}
-	if title != test.Title || corrupted != test.Corrupted || suppressed != test.Suppressed ||
-		typ != test.Type || test.Frame != "" && frame != test.Frame {
+	sort.Strings(altTitles)
+	sort.Strings(test.AltTitles)
+	if title != test.Title || !reflect.DeepEqual(altTitles, test.AltTitles) || corrupted != test.Corrupted ||
+		suppressed != test.Suppressed || typ != test.Type || test.Frame != "" && frame != test.Frame {
 		if *flagUpdate && test.StartLine+test.EndLine == "" {
-			updateReportTest(t, test, title, corrupted, suppressed, typ, frame)
+			updateReportTest(t, test, title, altTitles, corrupted, suppressed, typ, frame)
 		}
-		t.Fatalf("want:\nTITLE: %s\nTYPE: %v\nFRAME: %v\nCORRUPTED: %v\nSUPPRESSED: %v\n"+
-			"got:\nTITLE: %s\nTYPE: %v\nFRAME: %v\nCORRUPTED: %v (%v)\nSUPPRESSED: %v\n",
-			test.Title, test.Type, test.Frame, test.Corrupted, test.Suppressed,
-			title, typ, frame, corrupted, corruptedReason, suppressed)
+		gotAltTitles, wantAltTitles := "", ""
+		for _, t := range altTitles {
+			gotAltTitles += "ALT: " + t + "\n"
+		}
+		for _, t := range test.AltTitles {
+			wantAltTitles += "ALT: " + t + "\n"
+		}
+		t.Fatalf("want:\nTITLE: %s\n%sTYPE: %v\nFRAME: %v\nCORRUPTED: %v\nSUPPRESSED: %v\n"+
+			"got:\nTITLE: %s\n%sTYPE: %v\nFRAME: %v\nCORRUPTED: %v (%v)\nSUPPRESSED: %v\n",
+			test.Title, wantAltTitles, test.Type, test.Frame, test.Corrupted, test.Suppressed,
+			title, gotAltTitles, typ, frame, corrupted, corruptedReason, suppressed)
 	}
 	if title != "" && len(rep.Report) == 0 {
 		t.Fatalf("found crash message but report is empty")
@@ -186,22 +200,10 @@ func testParseImpl(t *testing.T, reporter Reporter, test *ParseTest) {
 	if rep == nil {
 		return
 	}
-	checkReport(t, rep, test)
-	if rep.StartPos != 0 {
-		// If we parse from StartPos, we must find the same report.
-		rep1 := reporter.Parse(test.Log[rep.StartPos:])
-		if rep1 == nil || rep1.Title != rep.Title {
-			t.Fatalf("did not find the same report from rep.StartPos=%v", rep.StartPos)
-		}
-		// If we parse from EndPos, we must not find the same report.
-		rep2 := reporter.Parse(test.Log[rep.EndPos:])
-		if rep2 != nil && rep2.Title == rep.Title {
-			t.Fatalf("found the same report after rep.EndPos=%v", rep.EndPos)
-		}
-	}
+	checkReport(t, reporter, rep, test)
 }
 
-func checkReport(t *testing.T, rep *Report, test *ParseTest) {
+func checkReport(t *testing.T, reporter Reporter, rep *Report, test *ParseTest) {
 	if test.HasReport && !bytes.Equal(rep.Report, test.Report) {
 		t.Fatalf("extracted wrong report:\n%s\nwant:\n%s", rep.Report, test.Report)
 	}
@@ -213,6 +215,9 @@ func checkReport(t *testing.T, rep *Report, test *ParseTest) {
 	}
 	if rep.EndPos > len(rep.Output) {
 		t.Fatalf("EndPos=%v > len(Output)=%v", rep.EndPos, len(rep.Output))
+	}
+	if rep.SkipPos <= rep.StartPos || rep.SkipPos > rep.EndPos {
+		t.Fatalf("bad SkipPos=%v: StartPos=%v EndPos=%v", rep.SkipPos, rep.StartPos, rep.EndPos)
 	}
 	if test.StartLine != "" {
 		if test.EndLine == "" {
@@ -226,12 +231,27 @@ func checkReport(t *testing.T, rep *Report, test *ParseTest) {
 				string(test.Log[rep.StartPos:rep.EndPos]))
 		}
 	}
+	if rep.StartPos != 0 {
+		// If we parse from StartPos, we must find the same report.
+		rep1 := reporter.Parse(test.Log[rep.StartPos:])
+		if rep1 == nil || rep1.Title != rep.Title || rep1.StartPos != 0 {
+			t.Fatalf("did not find the same report from rep.StartPos=%v", rep.StartPos)
+		}
+		// If we parse from EndPos, we must not find the same report.
+		rep2 := reporter.Parse(test.Log[rep.EndPos:])
+		if rep2 != nil && rep2.Title == rep.Title {
+			t.Fatalf("found the same report after rep.EndPos=%v", rep.EndPos)
+		}
+	}
 }
 
-func updateReportTest(t *testing.T, test *ParseTest, title string, corrupted, suppressed bool,
+func updateReportTest(t *testing.T, test *ParseTest, title string, altTitles []string, corrupted, suppressed bool,
 	typ Type, frame string) {
 	buf := new(bytes.Buffer)
 	fmt.Fprintf(buf, "TITLE: %v\n", title)
+	for _, t := range altTitles {
+		fmt.Fprintf(buf, "ALT: %v\n", t)
+	}
 	if typ != Unknown {
 		fmt.Fprintf(buf, "TYPE: %v\n", typ)
 	}
@@ -304,12 +324,14 @@ func testGuiltyFile(t *testing.T, reporter Reporter, fn string) {
 
 func forEachFile(t *testing.T, dir string, fn func(t *testing.T, reporter Reporter, fn string)) {
 	for os := range ctors {
-		if os == "windows" {
+		if os == targets.Windows {
 			continue // not implemented
 		}
 		cfg := &mgrconfig.Config{
-			TargetOS:   os,
-			TargetArch: "amd64",
+			Derived: mgrconfig.Derived{
+				TargetOS:   os,
+				TargetArch: targets.AMD64,
+			},
 		}
 		reporter, err := NewReporter(cfg)
 		if err != nil {
@@ -385,8 +407,8 @@ func TestFuzz(t *testing.T) {
 		"BUG:Disabling lock debugging due to kernel taint",
 		"[0.0] WARNING: ? 0+0x0/0",
 		"BUG: login: [0.0] ",
-		"cleaned vnod\re",
-		"kernel\r:",
+		"cleaned vnode",
+		"kernel:",
 	} {
 		Fuzz([]byte(data)[:len(data):len(data)])
 	}

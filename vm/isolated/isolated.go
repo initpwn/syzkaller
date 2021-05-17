@@ -17,6 +17,7 @@ import (
 	"github.com/google/syzkaller/pkg/config"
 	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/pkg/osutil"
+	"github.com/google/syzkaller/pkg/report"
 	"github.com/google/syzkaller/vm/vmimpl"
 )
 
@@ -213,46 +214,6 @@ func (inst *instance) waitRebootAndSSH(rebootTimeout int, sshTimeout time.Durati
 	return nil
 }
 
-// Escapes double quotes(and nested double quote escapes). Ignores any other escapes.
-// Reference: https://www.gnu.org/software/bash/manual/html_node/Double-Quotes.html
-func escapeDoubleQuotes(inp string) string {
-	var ret strings.Builder
-	for pos := 0; pos < len(inp); pos++ {
-		// If inp[pos] is not a double quote or a backslash, just use
-		// as is.
-		if inp[pos] != '"' && inp[pos] != '\\' {
-			ret.WriteByte(inp[pos])
-			continue
-		}
-		// If it is a double quote, escape.
-		if inp[pos] == '"' {
-			ret.WriteString("\\\"")
-			continue
-		}
-		// If we detect a backslash, reescape only if what it's already escaping
-		// is a double-quotes.
-		temp := ""
-		j := pos
-		for ; j < len(inp); j++ {
-			if inp[j] == '\\' {
-				temp += string(inp[j])
-				continue
-			}
-			// If the escape corresponds to a double quotes, re-escape.
-			// Else, just use as is.
-			if inp[j] == '"' {
-				temp = temp + temp + "\\\""
-			} else {
-				temp += string(inp[j])
-			}
-			break
-		}
-		ret.WriteString(temp)
-		pos = j
-	}
-	return ret.String()
-}
-
 func (inst *instance) repair() error {
 	log.Logf(2, "isolated: trying to ssh")
 	if err := inst.waitForSSH(30 * time.Minute); err != nil {
@@ -274,10 +235,10 @@ func (inst *instance) repair() error {
 		} else {
 			log.Logf(2, "isolated: ssh succeeded, trying to reboot by ssh")
 			inst.ssh("reboot") // reboot will return an error, ignore it
+			if err := inst.waitRebootAndSSH(5*60, 30*time.Minute); err != nil {
+				return fmt.Errorf("waitRebootAndSSH failed: %v", err)
+			}
 		}
-	}
-	if err := inst.waitRebootAndSSH(5*60, 30*time.Minute); err != nil {
-		return fmt.Errorf("waitRebootAndSSH failed: %v", err)
 	}
 	if inst.cfg.StartupScript != "" {
 		log.Logf(2, "isolated: executing startup_script")
@@ -287,7 +248,7 @@ func (inst *instance) repair() error {
 			return fmt.Errorf("unable to read startup_script: %v", err)
 		}
 		c := string(contents)
-		if err := inst.ssh(fmt.Sprintf("bash -c \"%v\"", escapeDoubleQuotes(c))); err != nil {
+		if err := inst.ssh(fmt.Sprintf("bash -c \"%v\"", vmimpl.EscapeDoubleQuotes(c))); err != nil {
 			return fmt.Errorf("failed to execute startup_script: %v", err)
 		}
 		log.Logf(2, "isolated: done executing startup_script")
@@ -307,7 +268,7 @@ func (inst *instance) waitForReboot(timeout int) error {
 		if !vmimpl.SleepInterruptible(time.Second) {
 			return fmt.Errorf("shutdown in progress")
 		}
-		// If it fails, then the reboot started
+		// If it fails, then the reboot started.
 		if err = inst.ssh("pwd"); err != nil {
 			return nil
 		}
@@ -367,18 +328,12 @@ func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command strin
 		return nil, nil, err
 	}
 
-	args = vmimpl.SSHArgs(inst.debug, inst.sshKey, inst.targetPort)
-	// Forward target port as part of the ssh connection (reverse proxy)
-	if inst.forwardPort != 0 {
-		proxy := fmt.Sprintf("%v:127.0.0.1:%v", inst.forwardPort, inst.forwardPort)
-		args = append(args, "-R", proxy)
-	}
+	args = vmimpl.SSHArgsForward(inst.debug, inst.sshKey, inst.targetPort, inst.forwardPort)
 	if inst.cfg.Pstore {
 		args = append(args, "-o", "ServerAliveInterval=6")
 		args = append(args, "-o", "ServerAliveCountMax=5")
 	}
 	args = append(args, inst.sshUser+"@"+inst.targetAddr, "cd "+inst.cfg.TargetDir+" && exec "+command)
-	log.Logf(0, "running command: ssh %#v", args)
 	if inst.debug {
 		log.Logf(0, "running command: ssh %#v", args)
 	}
@@ -421,10 +376,12 @@ func (inst *instance) readPstoreContents() ([]byte, error) {
 	return stdout.Bytes(), nil
 }
 
-func (inst *instance) Diagnose() ([]byte, bool) {
+func (inst *instance) Diagnose(rep *report.Report) ([]byte, bool) {
 	if !inst.cfg.Pstore {
 		return nil, false
 	}
+	// TODO: kernel may not reboot after some errors.
+	// E.g. if panic_on_warn is not set, or some errors don't trigger reboot at all (e.g. LOCKDEP overflows).
 	log.Logf(2, "waiting for crashed DUT to come back up")
 	if err := inst.waitRebootAndSSH(5*60, 30*time.Minute); err != nil {
 		return []byte(fmt.Sprintf("unable to SSH into DUT after reboot: %v", err)), false

@@ -168,6 +168,14 @@ func (comp *compiler) checkStructFields(n *ast.Struct, typ, name string) {
 	if len(n.Fields) < 1 {
 		comp.error(n.Pos, "%v %v has no fields, need at least 1 field", typ, name)
 	}
+	for _, f := range n.Fields {
+		attrs := comp.parseAttrs(fieldAttrs, f, f.Attrs)
+
+		if attrs[attrIn]+attrs[attrOut]+attrs[attrInOut] > 1 {
+			_, typ, _ := f.Info()
+			comp.error(f.Pos, "%v has multiple direction attributes", typ)
+		}
+	}
 }
 
 func (comp *compiler) checkFieldGroup(fields []*ast.Field, what, ctx string) {
@@ -183,6 +191,8 @@ func (comp *compiler) checkFieldGroup(fields []*ast.Field, what, ctx string) {
 		existing[fn] = true
 	}
 }
+
+const argBase = "BASE"
 
 func (comp *compiler) checkTypedefs() {
 	for _, decl := range comp.desc.Nodes {
@@ -200,7 +210,7 @@ func (comp *compiler) checkTypedefs() {
 				// For templates we only do basic checks of arguments.
 				names := make(map[string]bool)
 				for i, arg := range n.Args {
-					if arg.Name == "BASE" && i != len(n.Args)-1 {
+					if arg.Name == argBase && i != len(n.Args)-1 {
 						comp.error(arg.Pos, "type argument BASE must be the last argument")
 					}
 					if names[arg.Name] {
@@ -238,7 +248,7 @@ func (comp *compiler) checkTypes() {
 
 func (comp *compiler) checkTypeValues() {
 	for _, decl := range comp.desc.Nodes {
-		switch decl.(type) {
+		switch n := decl.(type) {
 		case *ast.Call, *ast.Struct, *ast.Resource, *ast.TypeDef:
 			comp.foreachType(decl, func(t *ast.Type, desc *typeDesc,
 				args []*ast.Type, base prog.IntTypeCommon) {
@@ -251,6 +261,16 @@ func (comp *compiler) checkTypeValues() {
 					}
 				}
 			})
+		case *ast.IntFlags:
+			allEqual := len(n.Values) >= 2
+			for _, val := range n.Values {
+				if val.Value != n.Values[0].Value {
+					allEqual = false
+				}
+			}
+			if allEqual {
+				comp.error(n.Pos, "all %v values are equal %v", n.Name.Name, n.Values[0].Value)
+			}
 		}
 	}
 }
@@ -263,6 +283,16 @@ func (comp *compiler) checkAttributeValues() {
 				desc := structOrUnionAttrs(n)[attr.Ident]
 				if desc.CheckConsts != nil {
 					desc.CheckConsts(comp, n, attr)
+				}
+			}
+			// Check each field's attributes.
+			st := decl.(*ast.Struct)
+			for _, f := range st.Fields {
+				for _, attr := range f.Attrs {
+					desc := fieldAttrs[attr.Ident]
+					if desc.CheckConsts != nil {
+						desc.CheckConsts(comp, f, attr)
+					}
 				}
 			}
 		}
@@ -435,7 +465,6 @@ func (comp *compiler) collectUnused() []ast.Node {
 
 	comp.used, _, _ = comp.collectUsed(false)
 	structs, flags, strflags := comp.collectUsed(true)
-	_, _, _ = structs, flags, strflags
 
 	note := func(n ast.Node) {
 		if pos, _, _ := n.Info(); pos.Builtin() {
@@ -546,16 +575,17 @@ type structDir struct {
 }
 
 func (comp *compiler) checkConstructors() {
-	ctors := make(map[string]bool) // resources for which we have ctors
+	ctors := make(map[string]bool)  // resources for which we have ctors
+	inputs := make(map[string]bool) // resources which are used as inputs
 	checked := make(map[structDir]bool)
 	for _, decl := range comp.desc.Nodes {
 		switch n := decl.(type) {
 		case *ast.Call:
 			for _, arg := range n.Args {
-				comp.checkTypeCtors(arg.Type, prog.DirIn, true, ctors, checked)
+				comp.checkTypeCtors(arg.Type, prog.DirIn, true, ctors, inputs, checked)
 			}
 			if n.Ret != nil {
-				comp.checkTypeCtors(n.Ret, prog.DirOut, true, ctors, checked)
+				comp.checkTypeCtors(n.Ret, prog.DirOut, true, ctors, inputs, checked)
 			}
 		}
 	}
@@ -563,17 +593,23 @@ func (comp *compiler) checkConstructors() {
 		switch n := decl.(type) {
 		case *ast.Resource:
 			name := n.Name.Name
-			if !ctors[name] && comp.used[name] {
+			if !comp.used[name] {
+				continue
+			}
+			if !ctors[name] {
 				comp.error(n.Pos, "resource %v can't be created"+
-					" (never mentioned as a syscall return value or output argument/field)",
-					name)
+					" (never mentioned as a syscall return value or output argument/field)", name)
+			}
+			if !inputs[name] {
+				comp.error(n.Pos, "resource %v is never used as an input"+
+					"(such resources are not useful)", name)
 			}
 		}
 	}
 }
 
 func (comp *compiler) checkTypeCtors(t *ast.Type, dir prog.Dir, isArg bool,
-	ctors map[string]bool, checked map[structDir]bool) {
+	ctors, inputs map[string]bool, checked map[structDir]bool) {
 	desc := comp.getTypeDesc(t)
 	if desc == typeResource {
 		// TODO(dvyukov): consider changing this to "dir == prog.DirOut".
@@ -588,6 +624,13 @@ func (comp *compiler) checkTypeCtors(t *ast.Type, dir prog.Dir, isArg bool,
 				r = comp.resources[r.Base.Ident]
 			}
 		}
+		if dir != prog.DirOut {
+			r := comp.resources[t.Ident]
+			for r != nil && !inputs[r.Name.Name] {
+				inputs[r.Name.Name] = true
+				r = comp.resources[r.Base.Ident]
+			}
+		}
 		return
 	}
 	if desc == typeStruct {
@@ -599,7 +642,11 @@ func (comp *compiler) checkTypeCtors(t *ast.Type, dir prog.Dir, isArg bool,
 		}
 		checked[key] = true
 		for _, fld := range s.Fields {
-			comp.checkTypeCtors(fld.Type, dir, false, ctors, checked)
+			fldDir, fldHasDir := comp.genFieldDir(fld)
+			if !fldHasDir {
+				fldDir = dir
+			}
+			comp.checkTypeCtors(fld.Type, fldDir, false, ctors, inputs, checked)
 		}
 		return
 	}
@@ -609,7 +656,7 @@ func (comp *compiler) checkTypeCtors(t *ast.Type, dir prog.Dir, isArg bool,
 	_, args, _ := comp.getArgsBase(t, isArg)
 	for i, arg := range args {
 		if desc.Args[i].Type == typeArgType {
-			comp.checkTypeCtors(arg, dir, desc.Args[i].IsArg, ctors, checked)
+			comp.checkTypeCtors(arg, dir, desc.Args[i].IsArg, ctors, inputs, checked)
 		}
 	}
 }
@@ -858,7 +905,7 @@ func (comp *compiler) replaceTypedef(ctx *checkCtx, t *ast.Type, flags checkFlag
 	}
 	typedef := comp.typedefs[typedefName]
 	// Handling optional BASE argument.
-	if len(typedef.Args) > 0 && typedef.Args[len(typedef.Args)-1].Name == "BASE" {
+	if len(typedef.Args) > 0 && typedef.Args[len(typedef.Args)-1].Name == argBase {
 		if flags&checkIsArg != 0 && len(t.Args) == len(typedef.Args)-1 {
 			t.Args = append(t.Args, &ast.Type{
 				Pos:   t.Pos,
@@ -890,7 +937,7 @@ func (comp *compiler) replaceTypedef(ctx *checkCtx, t *ast.Type, flags checkFlag
 		if nargs == 0 {
 			comp.error(t.Pos, "type %v is not a template", typedefName)
 		} else {
-			if flags&checkIsArg != 0 && typedef.Args[len(typedef.Args)-1].Name == "BASE" {
+			if flags&checkIsArg != 0 && typedef.Args[len(typedef.Args)-1].Name == argBase {
 				nargs--
 			}
 			comp.error(t.Pos, "template %v needs %v arguments instead of %v",
@@ -920,13 +967,16 @@ func (comp *compiler) replaceTypedef(ctx *checkCtx, t *ast.Type, flags checkFlag
 		}
 	}
 	t.Pos = pos0
+	comp.maybeRemoveBase(t, flags)
+}
 
+func (comp *compiler) maybeRemoveBase(t *ast.Type, flags checkFlags) {
 	// Remove base type if it's not needed in this context.
 	// If desc is nil, will return an error later when we typecheck the result.
 	desc := comp.getTypeDesc(t)
-	if desc != nil && flags&checkIsArg != 0 && desc.NeedBase {
+	if desc != nil && flags&checkIsArg != 0 && desc.NeedBase && len(t.Args) != 0 {
 		baseTypePos := len(t.Args) - 1
-		if t.Args[baseTypePos].Ident == "opt" {
+		if t.Args[baseTypePos].Ident == "opt" && len(t.Args) >= 2 {
 			baseTypePos--
 		}
 		copy(t.Args[baseTypePos:], t.Args[baseTypePos+1:])
@@ -1058,7 +1108,7 @@ func expectedTypeArgs(desc *typeDesc, needBase bool) string {
 	return expect
 }
 
-func checkTypeKind(t *ast.Type, kind int) (unexpected string, expect string, ok bool) {
+func checkTypeKind(t *ast.Type, kind int) (unexpected, expect string, ok bool) {
 	switch {
 	case kind == kindAny:
 		ok = true

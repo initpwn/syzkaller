@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"reflect"
 	"testing"
+
+	"github.com/google/syzkaller/sys/targets"
 )
 
 func TestParseOptions(t *testing.T) {
-	for _, opts := range allOptionsSingle("linux") {
+	for _, opts := range allOptionsSingle(targets.Linux) {
 		data := opts.Serialize()
 		got, err := DeserializeOptions(data)
 		if err != nil {
@@ -35,6 +37,7 @@ func TestParseOptionsCanned(t *testing.T) {
 			Collide:      true,
 			Repeat:       true,
 			Procs:        10,
+			Slowdown:     1,
 			Sandbox:      "namespace",
 			Fault:        true,
 			FaultCall:    1,
@@ -57,6 +60,7 @@ func TestParseOptionsCanned(t *testing.T) {
 			Collide:      true,
 			Repeat:       true,
 			Procs:        10,
+			Slowdown:     1,
 			Sandbox:      "android",
 			Fault:        true,
 			FaultCall:    1,
@@ -76,6 +80,7 @@ func TestParseOptionsCanned(t *testing.T) {
 			Collide:      true,
 			Repeat:       true,
 			Procs:        1,
+			Slowdown:     1,
 			Sandbox:      "none",
 			Fault:        false,
 			FaultCall:    -1,
@@ -93,6 +98,7 @@ func TestParseOptionsCanned(t *testing.T) {
 			Collide:      true,
 			Repeat:       true,
 			Procs:        1,
+			Slowdown:     1,
 			Sandbox:      "",
 			Fault:        false,
 			FaultCall:    -1,
@@ -110,6 +116,7 @@ func TestParseOptionsCanned(t *testing.T) {
 			Collide:      true,
 			Repeat:       true,
 			Procs:        1,
+			Slowdown:     1,
 			Sandbox:      "namespace",
 			Fault:        false,
 			FaultCall:    -1,
@@ -145,10 +152,11 @@ func allOptionsSingle(OS string) []Options {
 			Repeat:    true,
 			Sandbox:   "none",
 			UseTmpDir: true,
+			Slowdown:  1,
 		}
 		opts = append(opts, enumerateField(OS, opt, i)...)
 	}
-	return opts
+	return dedup(opts)
 }
 
 func allOptionsPermutations(OS string) []Options {
@@ -161,7 +169,21 @@ func allOptionsPermutations(OS string) []Options {
 		}
 		opts = newOpts
 	}
-	return opts
+	return dedup(opts)
+}
+
+func dedup(opts []Options) []Options {
+	pos := 0
+	dedup := make(map[Options]bool)
+	for _, opt := range opts {
+		if dedup[opt] {
+			continue
+		}
+		dedup[opt] = true
+		opts[pos] = opt
+		pos++
+	}
+	return opts[:pos]
 }
 
 func enumerateField(OS string, opt Options, field int) []Options {
@@ -182,6 +204,11 @@ func enumerateField(OS string, opt Options, field int) []Options {
 	} else if fldName == "RepeatTimes" {
 		for _, times := range []int64{0, 10} {
 			fld.SetInt(times)
+			opts = append(opts, opt)
+		}
+	} else if fldName == "Slowdown" {
+		for _, val := range []int64{1, 10} {
+			fld.SetInt(val)
 			opts = append(opts, opt)
 		}
 	} else if fldName == "FaultCall" {
@@ -221,17 +248,12 @@ func TestParseFeaturesFlags(t *testing.T) {
 			"close_fds":   true,
 			"devlink_pci": true,
 			"usb":         true,
+			"vhci":        true,
+			"wifi":        true,
+			"ieee802154":  true,
+			"sysctl":      true,
 		}},
-		{"none", "none", false, map[string]bool{
-			"tun":         false,
-			"net_dev":     false,
-			"net_reset":   false,
-			"cgroups":     false,
-			"binfmt_misc": false,
-			"close_fds":   false,
-			"devlink_pci": false,
-			"usb":         false,
-		}},
+		{"none", "none", false, map[string]bool{}},
 		{"all", "none", true, map[string]bool{
 			"tun":         true,
 			"net_dev":     true,
@@ -241,27 +263,13 @@ func TestParseFeaturesFlags(t *testing.T) {
 			"close_fds":   true,
 			"devlink_pci": true,
 			"usb":         true,
+			"vhci":        true,
+			"wifi":        true,
+			"ieee802154":  true,
+			"sysctl":      true,
 		}},
-		{"", "none", true, map[string]bool{
-			"tun":         false,
-			"net_dev":     false,
-			"net_reset":   false,
-			"cgroups":     false,
-			"binfmt_misc": false,
-			"close_fds":   false,
-			"devlink_pci": false,
-			"usb":         false,
-		}},
-		{"none", "all", true, map[string]bool{
-			"tun":         false,
-			"net_dev":     false,
-			"net_reset":   false,
-			"cgroups":     false,
-			"binfmt_misc": false,
-			"close_fds":   false,
-			"devlink_pci": false,
-			"usb":         false,
-		}},
+		{"", "none", true, map[string]bool{}},
+		{"none", "all", true, map[string]bool{}},
 		{"none", "", true, map[string]bool{
 			"tun":         true,
 			"net_dev":     true,
@@ -271,36 +279,29 @@ func TestParseFeaturesFlags(t *testing.T) {
 			"close_fds":   true,
 			"devlink_pci": true,
 			"usb":         true,
+			"vhci":        true,
+			"wifi":        true,
+			"ieee802154":  true,
+			"sysctl":      true,
 		}},
 		{"tun,net_dev", "none", true, map[string]bool{
-			"tun":         true,
-			"net_dev":     true,
-			"net_reset":   false,
-			"cgroups":     false,
-			"binfmt_misc": false,
-			"close_fds":   false,
-			"devlink_pci": false,
-			"usb":         false,
+			"tun":     true,
+			"net_dev": true,
 		}},
 		{"none", "cgroups,net_dev", true, map[string]bool{
 			"tun":         true,
-			"net_dev":     false,
 			"net_reset":   true,
-			"cgroups":     false,
 			"binfmt_misc": true,
 			"close_fds":   true,
 			"devlink_pci": true,
 			"usb":         true,
+			"vhci":        true,
+			"wifi":        true,
+			"ieee802154":  true,
+			"sysctl":      true,
 		}},
 		{"close_fds", "none", true, map[string]bool{
-			"tun":         false,
-			"net_dev":     false,
-			"net_reset":   false,
-			"cgroups":     false,
-			"binfmt_misc": false,
-			"close_fds":   true,
-			"devlink_pci": false,
-			"usb":         false,
+			"close_fds": true,
 		}},
 	}
 	for i, test := range tests {

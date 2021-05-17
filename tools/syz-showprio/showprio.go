@@ -27,34 +27,34 @@ func main() {
 	flag.Parse()
 	target, err := prog.GetTarget(*flagOS, *flagArch)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "%v", err)
+		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
 	}
 	if *flagEnable == "" {
-		fmt.Fprintf(os.Stderr, "no syscalls enabled")
+		fmt.Fprintf(os.Stderr, "no syscalls enabled\n")
 		os.Exit(1)
 	}
 	enabled := strings.Split(*flagEnable, ",")
 	_, err = mgrconfig.ParseEnabledSyscalls(target, enabled, nil)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to parse enabled syscalls: %v", err)
+		fmt.Fprintf(os.Stderr, "failed to parse enabled syscalls: %v\n", err)
 		os.Exit(1)
 	}
 	corpus, err := db.ReadCorpus(*flagCorpus, target)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to read corpus: %v", err)
+		fmt.Fprintf(os.Stderr, "failed to read corpus: %v\n", err)
 		os.Exit(1)
 	}
 	showPriorities(enabled, target.CalculatePriorities(corpus), target)
 }
 
-func showPriorities(calls []string, prios [][]float32, target *prog.Target) {
+func showPriorities(calls []string, prios [][]int32, target *prog.Target) {
 	printLine(append([]string{"CALLS"}, calls...))
 	for _, callRow := range calls {
 		line := []string{callRow}
 		for _, callCol := range calls {
 			val := prios[target.SyscallMap[callRow].ID][target.SyscallMap[callCol].ID]
-			line = append(line, fmt.Sprintf("%.2f", val))
+			line = append(line, fmt.Sprintf("%v", val))
 		}
 		printLine(line)
 	}

@@ -31,9 +31,11 @@ options 	KCOV
 
 options 	KERN_TLS
 options 	TCPHPTS
+options 	RATELIMIT
 
 options 	DEBUG_VFS_LOCKS
 options 	DIAGNOSTIC
+options 	DEBUG_REDZONE
 `)
 	}
 	if err := osutil.WriteFile(filepath.Join(confDir, confFile), config); err != nil {
@@ -72,10 +74,31 @@ sudo mount /dev/${md}p${partn} $tmpdir
 
 sudo MAKEOBJDIRPREFIX=%s make -C %s installkernel WITH_EXTRA_TCP_STACKS= KERNCONF=%s DESTDIR=$tmpdir
 
-cat | sudo tee -a ${tmpdir}/boot/loader.conf <<__EOF__
+cat | sudo tee ${tmpdir}/boot/loader.conf.local <<__EOF__
+ipsec_load="YES"
 pf_load="YES"
+sctp_load="YES"
 tcp_bbr_load="YES"
 tcp_rack_load="YES"
+sem_load="YES"
+mqueuefs_load="YES"
+cryptodev_load="YES"
+cc_cdg_load="YES"
+cc_chd_load="YES"
+cc_cubic_load="YES"
+cc_dctcp_load="YES"
+cc_hd_load="YES"
+cc_htcp_load="YES"
+cc_vegas_load="YES"
+
+kern.ipc.tls.enable="1"
+vm.panic_on_oom="1"
+__EOF__
+
+cat | sudo tee -a ${tmpdir}/etc/sysctl.conf <<__EOF__
+net.inet.sctp.udp_tunneling_port=9899
+net.inet.tcp.udp_tunneling_port=9811
+vm.redzone.panic=1
 __EOF__
 
 sudo umount $tmpdir
@@ -93,7 +116,7 @@ func (ctx freebsd) clean(kernelDir, targetArch string) error {
 	return ctx.make(kernelDir, objPrefix, "cleanworld")
 }
 
-func (ctx freebsd) make(kernelDir string, objPrefix string, makeArgs ...string) error {
+func (ctx freebsd) make(kernelDir, objPrefix string, makeArgs ...string) error {
 	args := append([]string{
 		fmt.Sprintf("MAKEOBJDIRPREFIX=%v", objPrefix),
 		"make",

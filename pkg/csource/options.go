@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/google/syzkaller/pkg/mgrconfig"
+	"github.com/google/syzkaller/sys/targets"
 )
 
 // Options control various aspects of source generation.
@@ -22,6 +23,7 @@ type Options struct {
 	Repeat      bool   `json:"repeat,omitempty"`
 	RepeatTimes int    `json:"repeat_times,omitempty"` // if non-0, repeat that many times
 	Procs       int    `json:"procs"`
+	Slowdown    int    `json:"slowdown"`
 	Sandbox     string `json:"sandbox"`
 
 	Fault     bool `json:"fault,omitempty"` // inject fault into FaultCall/FaultNth
@@ -31,15 +33,19 @@ type Options struct {
 	Leak bool `json:"leak,omitempty"` // do leak checking
 
 	// These options allow for a more fine-tuned control over the generated C code.
-	NetInjection bool `json:"tun,omitempty"`
-	NetDevices   bool `json:"netdev,omitempty"`
-	NetReset     bool `json:"resetnet,omitempty"`
-	Cgroups      bool `json:"cgroups,omitempty"`
-	BinfmtMisc   bool `json:"binfmt_misc,omitempty"`
-	CloseFDs     bool `json:"close_fds"`
-	KCSAN        bool `json:"kcsan,omitempty"`
-	DevlinkPCI   bool `json:"devlinkpci,omitempty"`
-	USB          bool `json:"usb,omitempty"`
+	NetInjection  bool `json:"tun,omitempty"`
+	NetDevices    bool `json:"netdev,omitempty"`
+	NetReset      bool `json:"resetnet,omitempty"`
+	Cgroups       bool `json:"cgroups,omitempty"`
+	BinfmtMisc    bool `json:"binfmt_misc,omitempty"`
+	CloseFDs      bool `json:"close_fds"`
+	KCSAN         bool `json:"kcsan,omitempty"`
+	DevlinkPCI    bool `json:"devlinkpci,omitempty"`
+	USB           bool `json:"usb,omitempty"`
+	VhciInjection bool `json:"vhci,omitempty"`
+	Wifi          bool `json:"wifi,omitempty"`
+	IEEE802154    bool `json:"ieee802154,omitempty"`
+	Sysctl        bool `json:"sysctl,omitempty"`
 
 	UseTmpDir  bool `json:"tmpdir,omitempty"`
 	HandleSegv bool `json:"segv,omitempty"`
@@ -88,6 +94,12 @@ func (opts Options) Check(OS string) error {
 		if opts.BinfmtMisc {
 			return errors.New("option BinfmtMisc without sandbox")
 		}
+		if opts.VhciInjection {
+			return errors.New("option VhciInjection without sandbox")
+		}
+		if opts.Wifi {
+			return errors.New("option Wifi without sandbox")
+		}
 	}
 	if opts.Sandbox == sandboxNamespace && !opts.UseTmpDir {
 		// This is borken and never worked.
@@ -105,77 +117,65 @@ func (opts Options) Check(OS string) error {
 }
 
 func (opts Options) checkLinuxOnly(OS string) error {
-	if OS == linux {
+	if OS == targets.Linux {
 		return nil
 	}
-	if opts.NetInjection && !(OS == openbsd || OS == freebsd || OS == netbsd) {
+	if opts.NetInjection && !(OS == targets.OpenBSD || OS == targets.FreeBSD || OS == targets.NetBSD) {
 		return fmt.Errorf("option NetInjection is not supported on %v", OS)
 	}
-	if opts.NetDevices {
-		return fmt.Errorf("option NetDevices is not supported on %v", OS)
-	}
-	if opts.NetReset {
-		return fmt.Errorf("option NetReset is not supported on %v", OS)
-	}
-	if opts.Cgroups {
-		return fmt.Errorf("option Cgroups is not supported on %v", OS)
-	}
-	if opts.BinfmtMisc {
-		return fmt.Errorf("option BinfmtMisc is not supported on %v", OS)
-	}
-	if opts.CloseFDs {
-		return fmt.Errorf("option CloseFDs is not supported on %v", OS)
-	}
-	if opts.KCSAN {
-		return fmt.Errorf("option KCSAN is not supported on %v", OS)
-	}
-	if opts.DevlinkPCI {
-		return fmt.Errorf("option DevlinkPCI is not supported on %v", OS)
-	}
-	if opts.USB {
-		return fmt.Errorf("option USB is not supported on %v", OS)
-	}
 	if opts.Sandbox == sandboxNamespace ||
-		(opts.Sandbox == sandboxSetuid && !(OS == openbsd || OS == freebsd || OS == netbsd)) ||
+		(opts.Sandbox == sandboxSetuid && !(OS == targets.OpenBSD || OS == targets.FreeBSD || OS == targets.NetBSD)) ||
 		opts.Sandbox == sandboxAndroid {
 		return fmt.Errorf("option Sandbox=%v is not supported on %v", opts.Sandbox, OS)
 	}
-	if opts.Fault {
-		return fmt.Errorf("option Fault is not supported on %v", OS)
-	}
-	if opts.Leak {
-		return fmt.Errorf("option Leak is not supported on %v", OS)
+	for name, opt := range map[string]*bool{
+		"NetDevices":    &opts.NetDevices,
+		"NetReset":      &opts.NetReset,
+		"Cgroups":       &opts.Cgroups,
+		"BinfmtMisc":    &opts.BinfmtMisc,
+		"CloseFDs":      &opts.CloseFDs,
+		"KCSAN":         &opts.KCSAN,
+		"DevlinkPCI":    &opts.DevlinkPCI,
+		"USB":           &opts.USB,
+		"VhciInjection": &opts.VhciInjection,
+		"Wifi":          &opts.Wifi,
+		"ieee802154":    &opts.IEEE802154,
+		"Fault":         &opts.Fault,
+		"Leak":          &opts.Leak,
+		"Sysctl":        &opts.Sysctl,
+	} {
+		if *opt {
+			return fmt.Errorf("option %v is not supported on %v", name, OS)
+		}
 	}
 	return nil
 }
 
 func DefaultOpts(cfg *mgrconfig.Config) Options {
 	opts := Options{
-		Threaded:     true,
-		Collide:      true,
-		Repeat:       true,
-		Procs:        cfg.Procs,
-		Sandbox:      cfg.Sandbox,
-		NetInjection: true,
-		NetDevices:   true,
-		NetReset:     true,
-		Cgroups:      true,
-		BinfmtMisc:   true,
-		CloseFDs:     true,
-		DevlinkPCI:   true,
-		UseTmpDir:    true,
-		HandleSegv:   true,
-		Repro:        true,
+		Threaded:   true,
+		Collide:    true,
+		Repeat:     true,
+		Procs:      cfg.Procs,
+		Slowdown:   cfg.Timeouts.Slowdown,
+		Sandbox:    cfg.Sandbox,
+		UseTmpDir:  true,
+		HandleSegv: true,
+		Repro:      true,
 	}
-	if cfg.TargetOS != linux {
-		opts.NetInjection = false
-		opts.NetDevices = false
-		opts.NetReset = false
-		opts.Cgroups = false
-		opts.BinfmtMisc = false
-		opts.CloseFDs = false
-		opts.DevlinkPCI = false
-		opts.USB = false
+	if cfg.TargetOS == targets.Linux {
+		opts.NetInjection = true
+		opts.NetDevices = true
+		opts.NetReset = true
+		opts.Cgroups = true
+		opts.BinfmtMisc = true
+		opts.CloseFDs = true
+		opts.DevlinkPCI = true
+		opts.USB = true
+		opts.VhciInjection = true
+		opts.Wifi = true
+		opts.IEEE802154 = true
+		opts.Sysctl = true
 	}
 	if cfg.Sandbox == "" || cfg.Sandbox == "setuid" {
 		opts.NetReset = false
@@ -195,9 +195,11 @@ func (opts Options) Serialize() []byte {
 }
 
 func DeserializeOptions(data []byte) (Options, error) {
-	var opts Options
-	// Before CloseFDs was added, close_fds() was always called, so default to true.
-	opts.CloseFDs = true
+	opts := Options{
+		Slowdown: 1,
+		// Before CloseFDs was added, close_fds() was always called, so default to true.
+		CloseFDs: true,
+	}
 	if err := json.Unmarshal(data, &opts); err == nil {
 		return opts, nil
 	}
@@ -256,25 +258,33 @@ func defaultFeatures(value bool) Features {
 		"close_fds":   {"close fds after each program", value},
 		"devlink_pci": {"setup devlink PCI device", value},
 		"usb":         {"setup and use /dev/raw-gadget for USB emulation", value},
+		"vhci":        {"setup and use /dev/vhci for hci packet injection", value},
+		"wifi":        {"setup and use mac80211_hwsim for wifi emulation", value},
+		"ieee802154":  {"setup and use mac802154_hwsim for emulation", value},
+		"sysctl":      {"setup sysctl's for fuzzing", value},
 	}
 }
 
-func ParseFeaturesFlags(enable string, disable string, defaultValue bool) (Features, error) {
-	if enable == "none" && disable == "none" {
+func ParseFeaturesFlags(enable, disable string, defaultValue bool) (Features, error) {
+	const (
+		none = "none"
+		all  = "all"
+	)
+	if enable == none && disable == none {
 		return defaultFeatures(defaultValue), nil
 	}
-	if enable != "none" && disable != "none" {
+	if enable != none && disable != none {
 		return nil, fmt.Errorf("can't use -enable and -disable flags at the same time")
 	}
-	if enable == "all" || disable == "" {
+	if enable == all || disable == "" {
 		return defaultFeatures(true), nil
 	}
-	if disable == "all" || enable == "" {
+	if disable == all || enable == "" {
 		return defaultFeatures(false), nil
 	}
 	var items []string
 	var features Features
-	if enable != "none" {
+	if enable != none {
 		items = strings.Split(enable, ",")
 		features = defaultFeatures(false)
 	} else {
@@ -286,14 +296,14 @@ func ParseFeaturesFlags(enable string, disable string, defaultValue bool) (Featu
 			return nil, fmt.Errorf("unknown feature specified: %s", item)
 		}
 		feature := features[item]
-		feature.Enabled = (enable != "none")
+		feature.Enabled = enable != none
 		features[item] = feature
 	}
 	return features, nil
 }
 
 func PrintAvailableFeaturesFlags() {
-	fmt.Printf("Available features for -enable and -disable:\n")
+	fmt.Printf("available features for -enable and -disable:\n")
 	features := defaultFeatures(false)
 	var names []string
 	for name := range features {
@@ -303,4 +313,16 @@ func PrintAvailableFeaturesFlags() {
 	for _, name := range names {
 		fmt.Printf("  %s - %s\n", name, features[name].Description)
 	}
+}
+
+// This is the main configuration used by executor, only for testing.
+var ExecutorOpts = Options{
+	Threaded:  true,
+	Collide:   true,
+	Repeat:    true,
+	Procs:     2,
+	Slowdown:  1,
+	Sandbox:   "none",
+	Repro:     true,
+	UseTmpDir: true,
 }

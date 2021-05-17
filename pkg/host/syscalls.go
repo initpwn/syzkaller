@@ -6,7 +6,6 @@ package host
 import (
 	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/prog"
-	"github.com/google/syzkaller/sys/targets"
 )
 
 // DetectSupportedSyscalls returns list on supported and unsupported syscalls on the host.
@@ -18,7 +17,7 @@ func DetectSupportedSyscalls(target *prog.Target, sandbox string) (
 	unsupported := make(map[*prog.Syscall]string)
 	const disabledAttribute = "has disabled attribute in descriptions"
 	// These do not have own host and parasitize on some other OS.
-	if targets.Get(target.OS, target.Arch).HostFuzzer {
+	if noHostChecks(target) {
 		for _, c := range target.Syscalls {
 			if c.Attrs.Disabled {
 				unsupported[c] = disabledAttribute
@@ -35,7 +34,7 @@ func DetectSupportedSyscalls(target *prog.Target, sandbox string) (
 				reason = disabledAttribute
 			case c.CallName == "syz_execute_func":
 				// syz_execute_func caused multiple problems:
-				// 1. First it lead to corpus exploision. The program used existing values in registers
+				// 1. First it lead to corpus explosion. The program used existing values in registers
 				// to pollute output area. We tried to zero registers (though, not reliably).
 				// 2. It lead to explosion again. The exact mechanics are unknown, here is one sample:
 				// syz_execute_func(&(0x7f0000000440)="f2af91930f0124eda133fa20430fbafce842f66188d0d4

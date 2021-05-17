@@ -5,7 +5,7 @@
 // https://developers.google.com/open-source/licenses/bsd.
 
 // Package lint contains a linter for Go source code.
-package lint
+package lint // import "golang.org/x/lint"
 
 import (
 	"bufio"
@@ -839,6 +839,7 @@ var commonMethods = map[string]bool{
 	"ServeHTTP": true,
 	"String":    true,
 	"Write":     true,
+	"Unwrap":    true,
 }
 
 // lintFuncDoc examines doc comments on functions and methods.

@@ -24,6 +24,7 @@ type extractParams struct {
 	DeclarePrintf  bool
 	DefineGlibcUse bool // workaround for incorrect flags to clang for fuchsia.
 	ExtractFromELF bool
+	TargetEndian   binary.ByteOrder
 }
 
 func extract(info *compiler.ConstInfo, cc string, args []string, params *extractParams) (
@@ -47,6 +48,7 @@ func extract(info *compiler.ConstInfo, cc string, args []string, params *extract
 		for _, errMsg := range []string{
 			`error: [‘']([a-zA-Z0-9_]+)[’'] undeclared`,
 			`note: in expansion of macro [‘']([a-zA-Z0-9_]+)[’']`,
+			`note: expanded from macro [‘']([a-zA-Z0-9_]+)[’']`,
 			`error: use of undeclared identifier [‘']([a-zA-Z0-9_]+)[’']`,
 		} {
 			re := regexp.MustCompile(errMsg)
@@ -75,7 +77,7 @@ func extract(info *compiler.ConstInfo, cc string, args []string, params *extract
 
 	var flagVals []uint64
 	if data.ExtractFromELF {
-		flagVals, err = extractFromELF(bin)
+		flagVals, err = extractFromELF(bin, params.TargetEndian)
 	} else {
 		flagVals, err = extractFromExecutable(bin)
 	}
@@ -145,7 +147,7 @@ func extractFromExecutable(binFile string) ([]uint64, error) {
 	return vals, nil
 }
 
-func extractFromELF(binFile string) ([]uint64, error) {
+func extractFromELF(binFile string, targetEndian binary.ByteOrder) ([]uint64, error) {
 	f, err := os.Open(binFile)
 	if err != nil {
 		return nil, err
@@ -163,7 +165,7 @@ func extractFromELF(binFile string) ([]uint64, error) {
 			return nil, err
 		}
 		vals := make([]uint64, len(data)/8)
-		if err := binary.Read(bytes.NewReader(data), binary.LittleEndian, &vals); err != nil {
+		if err := binary.Read(bytes.NewReader(data), targetEndian, &vals); err != nil {
 			return nil, err
 		}
 		return vals, nil
