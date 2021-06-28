@@ -201,6 +201,13 @@ var archConfigs = map[string]*archConfig{
 		NetDev:   "e1000",
 		RngDev:   "virtio-rng-pci",
 	},
+	"darwin/amd64": {
+		Qemu:      "qemu-system-x86_64",
+		QemuArgs:  "-enable-kvm -machine q35 -cpu host,migratable=off",
+		TargetDir: "/tmp",
+		NetDev:    "e1000-82545em",
+		RngDev:    "virtio-rng-pci",
+	},
 	"netbsd/amd64": {
 		Qemu:     "qemu-system-x86_64",
 		QemuArgs: "-enable-kvm",
@@ -389,7 +396,7 @@ func (inst *instance) boot() error {
 	args := []string{
 		"-m", strconv.Itoa(inst.cfg.Mem),
 		"-smp", strconv.Itoa(inst.cfg.CPU),
-		"-chardev", fmt.Sprintf("socket,id=SOCKSYZ,server,nowait,host=localhost,port=%v", inst.monport),
+		"-chardev", fmt.Sprintf("socket,id=SOCKSYZ,server=on,nowait,host=localhost,port=%v", inst.monport),
 		"-mon", "chardev=SOCKSYZ,mode=control",
 		"-display", "none",
 		"-serial", "stdio",

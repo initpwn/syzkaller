@@ -176,7 +176,8 @@ func RunManager(cfg *mgrconfig.Config) {
 	}
 
 	mgr.preloadCorpus()
-	mgr.initHTTP() // Creates HTTP server.
+	mgr.initStats() // Initializes prometheus variables.
+	mgr.initHTTP()  // Creates HTTP server.
 	mgr.collectUsedFiles()
 
 	// Create RPC server for fuzzers.
@@ -1088,6 +1089,7 @@ func (mgr *Manager) machineChecked(a *rpctype.CheckArgs, enabledSyscalls map[*pr
 	defer mgr.mu.Unlock()
 	mgr.checkResult = a
 	mgr.targetEnabledSyscalls = enabledSyscalls
+	mgr.target.UpdateGlobs(a.GlobFiles)
 	mgr.loadCorpus()
 	mgr.firstConnect = time.Now()
 }

@@ -179,14 +179,7 @@ func main() {
 		return
 	}
 
-	machineInfo, err := host.CollectMachineInfo()
-	if err != nil {
-		log.Fatalf("failed to collect machine information: %v", err)
-	}
-	modules, err := host.CollectModulesInfo()
-	if err != nil {
-		log.Fatalf("failed to collect modules info: %v", err)
-	}
+	machineInfo, modules := collectMachineInfos(target)
 
 	log.Logf(0, "dialing manager at %v", *flagManager)
 	manager, err := rpctype.NewRPCClient(*flagManager, timeouts.Scale)
@@ -234,6 +227,7 @@ func main() {
 			log.Fatalf("%v", r.CheckResult.Error)
 		}
 	} else {
+		target.UpdateGlobs(r.CheckResult.GlobFiles)
 		if err = host.Setup(target, r.CheckResult.Features, featureFlags, config.Executor); err != nil {
 			log.Fatal(err)
 		}
@@ -296,6 +290,18 @@ func main() {
 	}
 
 	fuzzer.pollLoop()
+}
+
+func collectMachineInfos(target *prog.Target) ([]byte, []host.KernelModule) {
+	machineInfo, err := host.CollectMachineInfo()
+	if err != nil {
+		log.Fatalf("failed to collect machine information: %v", err)
+	}
+	modules, err := host.CollectModulesInfo()
+	if err != nil {
+		log.Fatalf("failed to collect modules info: %v", err)
+	}
+	return machineInfo, modules
 }
 
 // Returns gateCallback for leak checking if enabled.

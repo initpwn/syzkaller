@@ -598,10 +598,11 @@ func genTextType(t *ast.Type) prog.TextKind {
 
 const (
 	stringnoz = "stringnoz"
+	glob      = "glob"
 )
 
 var typeString = &typeDesc{
-	Names:        []string{"string", stringnoz},
+	Names:        []string{"string", glob, stringnoz},
 	CanBeTypedef: true,
 	OptArgs:      2,
 	Args: []namedArg{
@@ -611,6 +612,9 @@ var typeString = &typeDesc{
 	Check: func(comp *compiler, t *ast.Type, args []*ast.Type, base prog.IntTypeCommon) {
 		if t.Ident == stringnoz && len(args) > 1 {
 			comp.error(args[0].Pos, "fixed-size string can't be non-zero-terminated")
+		}
+		if t.Ident == glob && len(args) != 1 {
+			comp.error(t.Pos, "glob only accepts 1 arg, provided %v", len(args))
 		}
 	},
 	CheckConsts: func(comp *compiler, t *ast.Type, args []*ast.Type, base prog.IntTypeCommon) {
@@ -626,6 +630,9 @@ var typeString = &typeDesc{
 		}
 	},
 	Varlen: func(comp *compiler, t *ast.Type, args []*ast.Type) bool {
+		if t.Ident == glob {
+			return true
+		}
 		return comp.stringSize(t, args) == varlenString
 	},
 	ZeroSize: func(comp *compiler, t *ast.Type, args []*ast.Type) bool {
@@ -643,6 +650,15 @@ var typeString = &typeDesc{
 				TypeCommon: base.TypeCommon,
 				Kind:       prog.BufferFilename,
 				NoZ:        t.Ident == stringnoz,
+			}
+		}
+		if len(args) > 0 && t.Ident == glob {
+			base.TypeSize = 0
+			return &prog.BufferType{
+				TypeCommon: base.TypeCommon,
+				Kind:       prog.BufferGlob,
+				SubKind:    args[0].String,
+				NoZ:        false,
 			}
 		}
 		subkind := ""
